@@ -575,11 +575,10 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
             return result
         stocks = df_member["con_code"].tolist()
 
-        # 2. 只取前50只权重股行情（减少API调用，避免超时）
-        top_stocks = stocks[:50]
+        # 2. 批量获取全部成分股今日行情（O/H/L/C/涨跌幅/成交量）
         all_daily = []
-        for i in range(0, len(top_stocks), 50):
-            batch = top_stocks[i:i + 50]
+        for i in range(0, len(stocks), 50):
+            batch = stocks[i:i + 50]
             try:
                 df = pro.daily(ts_code=",".join(batch), trade_date=date)
                 if df is not None and not df.empty:
