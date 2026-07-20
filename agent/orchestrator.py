@@ -349,7 +349,7 @@ class MarketReviewAgent:
                 model=self.model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=12000,
+                max_tokens=8192,
             )
             raw = completion.choices[0].message.content
             disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
@@ -364,7 +364,7 @@ class MarketReviewAgent:
             model=self.model,
             messages=messages,
             temperature=0.2,
-            max_tokens=12000,
+            max_tokens=8192,
             stream=True,
         )
         async for chunk in stream:

@@ -1183,7 +1183,7 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     sina = snapshot.news_items.get("sina", [])
     if sina:
         lines.append(f"### 新浪财经历史新闻（交易日+前日，共{len(sina)}条，覆盖48小时）")
-        for item in sina[:30]:
+        for item in sina[:15]:
             lines.append(f"- [{item['time']}] {item['title']}")
 
     # ── 东方财富实时（补充最新）──
