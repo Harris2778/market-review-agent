@@ -169,13 +169,17 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
-    # 直接提行业名 + 问怎么样/复盘/回顾/相关新闻/情况
+    # 直接提行业名 → 板块聚焦（不强制要求问句）
     for kw, sw_name in SECTOR_NAME_MAP.items():
-        if kw in msg and any(w in msg for w in [
-            "怎么样", "复盘", "分析", "走势", "行情", "表现",
-            "回顾", "情况", "相关", "新闻", "动态", "看看",
-        ]):
+        if kw in msg:
             return ("sector_deep_dive", sw_name)
+
+    # 提板块/行业 + 任何疑问词 → 板块聚焦
+    for pattern in [r"(板块|行业|赛道).*(怎么样|如何|分析|复盘|表现|走势|情况|新闻|回顾)", r"(怎么看|分析一下|回顾一下).*(板块|行业|市场)"]:
+        if re.search(pattern, msg):
+            sector = _extract_sector(msg)
+            if sector:
+                return ("sector_deep_dive", sector)
 
     return ("general_chat", None)
 
