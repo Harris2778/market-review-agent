@@ -451,6 +451,33 @@ SW_INDEX_MAP = {
 }
 
 
+# 股票代码→名称缓存（一次加载，全局复用）
+_stock_name_cache: dict = {}
+
+def _load_stock_names():
+    """加载全部A股代码→名称映射。"""
+    global _stock_name_cache
+    if _stock_name_cache:
+        return
+    pro = _get_pro()
+    if not pro:
+        return
+    try:
+        df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                _stock_name_cache[row["ts_code"]] = row["name"]
+    except Exception:
+        pass
+
+
+def _stock_name(code: str) -> str:
+    """获取股票名称，LLM 兜底。"""
+    if code in _stock_name_cache:
+        return _stock_name_cache[code]
+    return code
+
+
 def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
     """
     获取板块成分股当日行情：领涨/领跌、主力资金、盘中节奏。
@@ -463,6 +490,9 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
     idx_code = SW_INDEX_MAP.get(sector_name)
     if not idx_code:
         return {}
+
+    # 确保股票名称缓存已加载
+    _load_stock_names()
 
     result = {"sector": sector_name, "stocks": [], "top_gainers": [], "top_losers": []}
 
@@ -502,17 +532,36 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         result["flat_count"] = int((daily_df["pct_chg"] == 0).sum())
 
         result["top_gainers"] = [
-            {"code": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2),
+            {"code": r["ts_code"], "name": _stock_name(r["ts_code"]),
+             "pct_chg": round(float(r["pct_chg"]), 2),
              "close": round(float(r["close"]), 2),
+             "open": round(float(r.get("open", 0)), 2),
+             "high": round(float(r.get("high", 0)), 2),
+             "low": round(float(r.get("low", 0)), 2),
              "vol": round(float(r.get("vol", 0)) / 10000, 2)}
             for _, r in top5.iterrows()
         ]
         result["top_losers"] = [
-            {"code": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2),
+            {"code": r["ts_code"], "name": _stock_name(r["ts_code"]),
+             "pct_chg": round(float(r["pct_chg"]), 2),
              "close": round(float(r["close"]), 2),
+             "open": round(float(r.get("open", 0)), 2),
+             "high": round(float(r.get("high", 0)), 2),
+             "low": round(float(r.get("low", 0)), 2),
              "vol": round(float(r.get("vol", 0)) / 10000, 2)}
             for _, r in bottom5.iterrows()
         ]
+
+        # 日内振幅统计
+        daily_df["amplitude"] = (daily_df["high"] - daily_df["low"]) / daily_df["pre_close"] * 100
+        high_amp = daily_df[daily_df["amplitude"] > 5]
+        if len(high_amp) > 0:
+            result["high_amplitude"] = [
+                {"code": r["ts_code"], "name": _stock_name(r["ts_code"]),
+                 "amplitude": round(float(r["amplitude"]), 1),
+                 "pct_chg": round(float(r["pct_chg"]), 2)}
+                for _, r in high_amp.head(5).iterrows()
+            ]
 
         # 3. 资金流向（前10只股票）
         top10_codes = daily_df.head(10)["ts_code"].tolist()
@@ -909,14 +958,24 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append(f"成分股总数: {total}只  上涨: {up}只  下跌: {down}只  平盘: {flat}只")
 
         if stock_detail.get("top_gainers"):
-            lines.append("领涨前5：")
+            lines.append("领涨前5（含日内四价）：")
             for s in stock_detail["top_gainers"]:
-                lines.append(f"  {s['code']} 收盘{s['close']}  {s['pct_chg']:+.2f}%  成交量{s['vol']}万手")
+                name = s.get("name", s["code"])
+                o, h, l = s.get("open", 0), s.get("high", 0), s.get("low", 0)
+                lines.append(f"  {name}({s['code']}) 收{s['close']} {s['pct_chg']:+.2f}% 开{o} 高{h} 低{l} 振幅{abs(s.get('high',0)-s.get('low',0)):.2f} 量{s['vol']}万手")
 
         if stock_detail.get("top_losers"):
-            lines.append("领跌前5：")
+            lines.append("领跌前5（含日内四价）：")
             for s in stock_detail["top_losers"]:
-                lines.append(f"  {s['code']} 收盘{s['close']}  {s['pct_chg']:+.2f}%  成交量{s['vol']}万手")
+                name = s.get("name", s["code"])
+                o, h, l = s.get("open", 0), s.get("high", 0), s.get("low", 0)
+                lines.append(f"  {name}({s['code']}) 收{s['close']} {s['pct_chg']:+.2f}% 开{o} 高{h} 低{l} 振幅{abs(s.get('high',0)-s.get('low',0)):.2f} 量{s['vol']}万手")
+
+        if stock_detail.get("high_amplitude"):
+            lines.append("高振幅异动（振幅>5%）：")
+            for s in stock_detail["high_amplitude"]:
+                name = s.get("name", s["code"])
+                lines.append(f"  {name}({s['code']}) 振幅{s['amplitude']}% 涨跌{s['pct_chg']:+.2f}%")
 
         if stock_detail.get("fund_flow"):
             ff = stock_detail["fund_flow"]
