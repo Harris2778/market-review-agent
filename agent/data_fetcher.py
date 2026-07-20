@@ -149,12 +149,12 @@ def fetch_shenwan_sectors(date: str) -> list:
     if not pro:
         return []
 
-    start_10d = (datetime.strptime(date, "%Y%m%d") - timedelta(days=15)).strftime("%Y%m%d")
+    start_30d = (datetime.strptime(date, "%Y%m%d") - timedelta(days=45)).strftime("%Y%m%d")
     sectors = []
 
     for code, name in SW_SECTOR_CODES.items():
         try:
-            df = pro.index_daily(ts_code=code, start_date=start_10d, end_date=date)
+            df = pro.index_daily(ts_code=code, start_date=start_30d, end_date=date)
             if df is None or df.empty:
                 continue
             df = df.sort_values("trade_date")
@@ -162,50 +162,50 @@ def fetch_shenwan_sectors(date: str) -> list:
             pct = round(float(row["pct_chg"]), 2)
 
             # 标签
-            if pct > 2:
-                tag = "强势"
-            elif pct > 1:
-                tag = "偏强"
-            elif pct >= -1:
-                tag = "中性"
-            elif pct >= -2:
-                tag = "偏弱"
-            else:
-                tag = "弱势"
+            if pct > 2: tag = "强势"
+            elif pct > 1: tag = "偏强"
+            elif pct >= -1: tag = "中性"
+            elif pct >= -2: tag = "偏弱"
+            else: tag = "弱势"
 
-            # 5日趋势
             closes = df["close"].astype(float)
-            chg_5d = None
-            if len(closes) > 5:
-                prev_5 = float(closes.iloc[-6])
-                chg_5d = round((float(closes.iloc[-1]) - prev_5) / prev_5 * 100, 2)
 
-            # 连续涨跌天数
+            def _chg(days):
+                if len(closes) > days:
+                    prev = float(closes.iloc[-(days+1)])
+                    return round((float(closes.iloc[-1]) - prev) / prev * 100, 2)
+                return None
+
+            chg_5d = _chg(5)
+            chg_10d = _chg(10)
+            chg_20d = _chg(20)
+
+            # 均线
+            ma5 = round(float(closes.tail(5).mean()), 2) if len(closes) >= 5 else None
+            ma10 = round(float(closes.tail(10).mean()), 2) if len(closes) >= 10 else None
+            ma20 = round(float(closes.tail(20).mean()), 2) if len(closes) >= 20 else None
+
+            # 连续涨跌
             streak = 0
             streak_dir = ""
             for i in range(len(df) - 1, 0, -1):
                 if float(df.iloc[i]["pct_chg"]) > 0:
-                    if streak_dir == "":
-                        streak_dir = "涨"
-                    if streak_dir == "涨":
-                        streak += 1
-                    else:
-                        break
+                    if streak_dir == "": streak_dir = "涨"
+                    if streak_dir == "涨": streak += 1
+                    else: break
                 elif float(df.iloc[i]["pct_chg"]) < 0:
-                    if streak_dir == "":
-                        streak_dir = "跌"
-                    if streak_dir == "跌":
-                        streak += 1
-                    else:
-                        break
-                else:
-                    break
+                    if streak_dir == "": streak_dir = "跌"
+                    if streak_dir == "跌": streak += 1
+                    else: break
+                else: break
 
             streak_str = f"连{streak_dir}{streak}天" if streak >= 2 else "—"
 
             sectors.append({
                 "name": name, "pct_chg": pct, "tag": tag,
-                "chg_5d": chg_5d, "streak": streak_str,
+                "chg_5d": chg_5d, "chg_10d": chg_10d, "chg_20d": chg_20d,
+                "ma5": ma5, "ma10": ma10, "ma20": ma20, "close": round(float(row["close"]), 2),
+                "streak": streak_str,
             })
         except Exception:
             pass
@@ -663,8 +663,14 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("完整列表：")
         for s in snapshot.sectors:
             streak = f" [{s['streak']}]" if s.get("streak") and s["streak"] != "—" else ""
-            chg5 = f" 5日{s['chg_5d']:+.2f}%" if s.get("chg_5d") is not None else ""
-            lines.append(f"  {s['name']}: {s['pct_chg']:+.2f}% [{s['tag']}]{streak}{chg5}")
+            parts = [f"  {s['name']}: {s['pct_chg']:+.2f}% [{s['tag']}]{streak}"]
+            if s.get("chg_5d") is not None: parts.append(f"5日{s['chg_5d']:+.2f}%")
+            if s.get("chg_10d") is not None: parts.append(f"10日{s['chg_10d']:+.2f}%")
+            if s.get("chg_20d") is not None: parts.append(f"20日{s['chg_20d']:+.2f}%")
+            if s.get("ma5") and s.get("close"):
+                above = sum(1 for m in [s.get("ma5"), s.get("ma10"), s.get("ma20")] if m and s["close"] > m)
+                parts.append(f"站上{above}/3均线")
+            lines.append("  ".join(parts))
     else:
         lines.append("### 申万行业\n[Tushare未配置]")
 
