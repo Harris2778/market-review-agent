@@ -221,20 +221,28 @@ def fetch_fund_flows(date: str) -> dict:
         return {}
 
     result = {}
-    # 北向/南向
+    # 北向/南向（万元 → 亿）
     try:
-        df = pro.moneyflow_hsgt(trade_date=date)
+        df = pro.moneyflow_hsgt(start_date=date, end_date=date)
         if df is not None and not df.empty:
             row = df.iloc[0]
-            result["north_bound"] = round(float(row.get("north_net_inflow", 0)), 2)
-            result["south_bound"] = round(float(row.get("south_net_inflow", 0)), 2)
+            nm = float(row.get("north_money", 0))
+            sm = float(row.get("south_money", 0))
+            if nm > 0:
+                result["north_bound"] = round(nm / 10000, 2)
+            if sm > 0:
+                result["south_bound"] = round(sm / 10000, 2)
     except Exception:
         try:
-            df = pro.moneyflow_hsgt(start_date=date, end_date=date)
+            df = pro.moneyflow_hsgt(trade_date=date)
             if df is not None and not df.empty:
                 row = df.iloc[0]
-                result["north_bound"] = round(float(row.get("north_net_inflow", 0)), 2)
-                result["south_bound"] = round(float(row.get("south_net_inflow", 0)), 2)
+                nm = float(row.get("north_money", 0))
+                sm = float(row.get("south_money", 0))
+                if nm > 0:
+                    result["north_bound"] = round(nm / 10000, 2)
+                if sm > 0:
+                    result["south_bound"] = round(sm / 10000, 2)
         except Exception:
             pass
 
