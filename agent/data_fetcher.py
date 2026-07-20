@@ -447,27 +447,23 @@ def fetch_eastmoney_news_page2(limit: int = 80) -> list:
     return items
 
 
-def fetch_sina_news(limit: int = 20) -> list:
-    """新浪财经滚动新闻（备用）。"""
+def fetch_sina_news(limit: int = 20, date_str: str = "") -> list:
+    """新浪财经历史新闻（支持按日期查询）。"""
     items = []
     try:
         import re
         url = "https://feed.mix.sina.com.cn/api/roll/get"
         params = {"pageid": 153, "lid": 2509, "k": "", "num": limit, "page": 1}
+        if date_str:
+            params["date"] = date_str
         resp = requests.get(url, params=params, timeout=15,
                           headers={"User-Agent": "Mozilla/5.0"})
         data = resp.json()
         for item in data.get("result", {}).get("data", [])[:limit]:
             title = re.sub(r'<[^>]+>', '', item.get("title", ""))
-            ctime_raw = item.get("ctime", "")
-            try:
-                ts = int(ctime_raw)
-                time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
-            except Exception:
-                time_str = str(ctime_raw)
             items.append({
                 "source": "新浪财经",
-                "time": time_str,
+                "time": date_str if date_str else item.get("ctime", ""),
                 "title": title[:150],
             })
     except Exception:
@@ -1034,7 +1030,12 @@ async def collect_market_snapshot(
 
     snapshot = MarketSnapshot(date=date)
 
-    # 全部并行执行（从串行 15s → 并行 3s）
+    # 新浪历史日期
+    trade_dt = datetime.strptime(date, "%Y%m%d")
+    d1 = trade_dt.strftime("%Y-%m-%d")
+    d2 = (trade_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 全部并行执行
     tasks = {
         "indices": loop.run_in_executor(None, fetch_a_share_indices, date),
         "sectors": loop.run_in_executor(None, fetch_shenwan_sectors, date),
@@ -1049,6 +1050,8 @@ async def collect_market_snapshot(
         "us_macro": loop.run_in_executor(None, fetch_us_macro),
         "em_p1": loop.run_in_executor(None, fetch_eastmoney_news, 80),
         "em_p2": loop.run_in_executor(None, fetch_eastmoney_news_page2, 80),
+        "sina": loop.run_in_executor(None, fetch_sina_news, 30, d1),
+        "sina2": loop.run_in_executor(None, fetch_sina_news, 30, d2),
         "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
         "calendar": loop.run_in_executor(None, fetch_economic_calendar),
     }
@@ -1080,10 +1083,13 @@ async def collect_market_snapshot(
         "us": safe(results_raw.get("us_macro"), {}),
     }
     all_em = safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), [])
+    all_sina = safe(results_raw.get("sina"), []) + safe(results_raw.get("sina2"), [])
     if sector_focus:
         all_em = filter_news_by_sector(all_em, sector_focus)
+        all_sina = filter_news_by_sector(all_sina, sector_focus)
     snapshot.news_items = {
         "eastmoney": all_em,
+        "sina": all_sina,
         "global": safe(results_raw.get("fh_news"), []),
     }
     snapshot.calendar = safe(results_raw.get("calendar"), [])
@@ -1187,9 +1193,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
 
     # ── 新浪新闻（备用）──
     sina = snapshot.news_items.get("sina", [])
-    if sina and not em:
-        lines.append(f"### 新浪财经新闻（共{len(sina)}条）")
-        for item in sina[:15]:
+    if sina:
+        lines.append(f"### 新浪财经历史新闻（交易日+前日，共{len(sina)}条）")
+        for item in sina[:40]:
             lines.append(f"- [{item['time']}] {item['title']}")
 
     # ── Tushare 新闻 ──
