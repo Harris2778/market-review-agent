@@ -422,8 +422,8 @@ def fetch_china_macro() -> dict:
         df = pro.cn_cpi(start_m="202601", end_m=this_month)
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            result["CPI同比"] = f"{float(row['cpi']):.2f}%"
-            result["CPI月环比"] = f"{float(row.get('cpi_month', row.get('nt_val', 0))):.2f}%"
+            result["CPI同比"] = f"{float(row['nt_yoy']):.2f}%"
+            result["CPI环比"] = f"{float(row['nt_mom']):.2f}%"
     except Exception:
         pass
 
@@ -432,7 +432,7 @@ def fetch_china_macro() -> dict:
         df = pro.cn_ppi(start_m="202601", end_m=this_month)
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            result["PPI同比"] = f"{float(row['ppi']):.2f}%"
+            result["PPI同比"] = f"{float(row['ppi_yoy']):.2f}%"
     except Exception:
         pass
 
@@ -441,8 +441,8 @@ def fetch_china_macro() -> dict:
         df = pro.cn_pmi(start_m="202601", end_m=this_month)
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            result["制造业PMI"] = f"{float(row['pmi']):.1f}"
-            result["非制造业PMI"] = f"{float(row.get('nmi', 0)):.1f}"
+            col0 = df.columns[0]
+            result["制造业PMI"] = f"{float(row[col0]):.1f}"
     except Exception:
         pass
 
@@ -451,7 +451,8 @@ def fetch_china_macro() -> dict:
         df = pro.cn_m(start_m="202601", end_m=this_month)
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            result["M2同比"] = f"{float(row['m2']):.2f}%"
+            result["M2同比"] = f"{float(row['m2_yoy']):.2f}%"
+            result["M2余额"] = f"{float(row['m2']):.2f}万亿"  # M2绝对值作为背景
     except Exception:
         pass
 
@@ -460,7 +461,7 @@ def fetch_china_macro() -> dict:
         df = pro.cn_gdp(start_q="2025Q1", end_q="2026Q2")
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            result["GDP同比"] = f"{float(row['gdp']):.2f}%"
+            result["GDP同比"] = f"{float(row['gdp_yoy']):.2f}%"
             result["GDP季度"] = str(row.get("quarter", ""))
     except Exception:
         pass
@@ -470,8 +471,8 @@ def fetch_china_macro() -> dict:
         df = pro.sf_month(start_m="202601", end_m=this_month)
         if df is not None and not df.empty:
             row = df.iloc[-1]
-            val = float(row.get("aggregate", 0))
-            result["社会融资规模"] = f"{val / 10000:.2f}万亿" if val > 10000 else f"{val:.2f}亿"
+            val = float(row.get("inc_month", 0))
+            result["社融当月新增"] = f"{val / 10000:.2f}万亿" if val > 10000 else f"{val:.2f}亿"
     except Exception:
         pass
 
