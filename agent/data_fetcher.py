@@ -53,7 +53,7 @@ def _get_tushare_pro():
 
 
 def fetch_a_share_indices(date: str) -> dict:
-    """获取A股主要指数行情。"""
+    """获取A股主要指数行情。逐个指数查询（Tushare不支持逗号分隔多代码）。"""
     pro = _get_tushare_pro()
     if not pro:
         return {}
@@ -65,19 +65,18 @@ def fetch_a_share_indices(date: str) -> dict:
         "000852.SH": "中证1000",
     }
     result = {}
-    try:
-        df = pro.index_daily(ts_code=",".join(index_codes.keys()),
-                             start_date=date, end_date=date)
-        if df is not None and not df.empty:
-            for _, row in df.iterrows():
-                name = index_codes.get(row["ts_code"], row["ts_code"])
+    for code, name in index_codes.items():
+        try:
+            df = pro.index_daily(ts_code=code, start_date=date, end_date=date)
+            if df is not None and not df.empty:
+                row = df.iloc[-1]  # 最新一行
                 result[name] = {
                     "close": round(float(row["close"]), 2),
                     "pct_chg": round(float(row["pct_chg"]), 2),
                     "vol": round(float(row.get("vol", 0)) / 10000, 2),
                 }
-    except Exception:
-        pass
+        except Exception:
+            pass
     return result
 
 
@@ -103,26 +102,21 @@ def fetch_shenwan_sectors(date: str) -> list:
     if not pro:
         return []
 
-    # 方式1: 用 index_daily 批量查申万行业指数（单次调用）
+    # 方式1: 逐个查询申万行业指数（单次查全部31个）
     try:
-        all_codes = ",".join(SW_SECTOR_CODES.keys())
-        df = pro.index_daily(ts_code=all_codes, start_date=date, end_date=date)
-        if df is not None and not df.empty:
-            sectors = []
-            for _, row in df.iterrows():
-                name = SW_SECTOR_CODES.get(row["ts_code"], row["ts_code"])
-                pct = round(float(row["pct_chg"]), 2)
-                if pct > 2:
-                    tag = "强势"
-                elif pct > 1:
-                    tag = "偏强"
-                elif pct >= -1:
-                    tag = "中性"
-                elif pct >= -2:
-                    tag = "偏弱"
-                else:
-                    tag = "弱势"
-                sectors.append({"name": name, "pct_chg": pct, "tag": tag})
+        sectors = []
+        for code, name in SW_SECTOR_CODES.items():
+            try:
+                df = pro.index_daily(ts_code=code, start_date=date, end_date=date)
+                if df is not None and not df.empty:
+                    row = df.iloc[-1]
+                    pct = round(float(row["pct_chg"]), 2)
+                    tag = ("强势" if pct > 2 else "偏强" if pct > 1 else
+                           "中性" if pct >= -1 else "偏弱" if pct >= -2 else "弱势")
+                    sectors.append({"name": name, "pct_chg": pct, "tag": tag})
+            except Exception:
+                pass
+        if sectors:
             sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
             return sectors
     except Exception:
