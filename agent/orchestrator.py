@@ -160,6 +160,7 @@ class MarketReviewAgent:
             base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
         )
         self.model = "deepseek-chat"
+        self._cache: dict = {}  # 行情数据缓存
 
     async def process_message(
         self, message: str, stream: bool = False
@@ -194,8 +195,13 @@ class MarketReviewAgent:
         is_today = trade_date.strftime("%Y%m%d") == today.strftime("%Y%m%d")
         date_note = "今日" if is_today else f"（今日为{today.strftime('%Y年%m月%d日')}，最新可用交易日数据为{date_display}）"
 
-        # 2. 采集数据
-        snapshot = await collect_market_snapshot(date=date_str)
+        # 2. 采集数据（带缓存：同一交易日只采集一次）
+        cache_key = f"snapshot_{date_str}"
+        if cache_key in self._cache:
+            snapshot = self._cache[cache_key]
+        else:
+            snapshot = await collect_market_snapshot(date=date_str)
+            self._cache = {cache_key: snapshot}  # 每天只保留最新
         market_data = format_market_data_for_prompt(snapshot)
 
         # 3. 构建 prompt
@@ -225,8 +231,13 @@ class MarketReviewAgent:
         weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][trade_date.weekday()]
         date_display = trade_date.strftime("%Y年%m月%d日")
 
-        # 采集全市场数据 + 板块深度数据
-        snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
+        # 采集全市场数据 + 板块深度数据（带缓存）
+        cache_key = f"snapshot_{date_str}"
+        if cache_key in self._cache:
+            snapshot = self._cache[cache_key]
+        else:
+            snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
+            self._cache = {cache_key: snapshot}
         market_data = format_market_data_for_prompt(snapshot)
 
         # 额外板块数据
