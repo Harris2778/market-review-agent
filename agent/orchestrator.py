@@ -232,6 +232,29 @@ def _clean_markdown(text: str) -> str:
     return text
 
 
+def _format_multi_day_news(snapshot, sector, date_str) -> str:
+    """预格式化多日新闻，LLM无法跳过，直接注入prompt。"""
+    from datetime import datetime, timedelta
+    lines = ["【预格式化新闻（48小时覆盖，请全部列出）】"]
+
+    # 新浪历史（交易日+前日）
+    sina = snapshot.news_items.get("sina", [])
+    if sina:
+        lines.append(f"新浪历史({len(sina)}条):")
+        for item in sina[:15]:
+            lines.append(f"- [{item['time']}] {item['title']}")
+
+    # 东方财富实时
+    em = snapshot.news_items.get("eastmoney", [])
+    if em:
+        em_sorted = sorted(em, key=lambda x: x.get("time", ""), reverse=True)[:10]
+        lines.append(f"东方财富实时({len(em_sorted)}条):")
+        for item in em_sorted:
+            lines.append(f"- [{item['time']}] {item['title']}")
+
+    return "\n".join(lines)
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -320,16 +343,18 @@ class MarketReviewAgent:
             snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
             self._cache = {cache_key: snapshot}
         market_data = format_market_data_for_prompt(snapshot)
+        news_block = _format_multi_day_news(snapshot, sector, date_str)
 
         system = get_system_prompt("sector_deep_dive", sector)
-        # 注入日期和板块名
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
         user_prompt = f"""交易日：{date_display} {weekday} | 行业：{sector}
 
 {market_data}
 
-深度分析{sector}板块。按系统提示词框架展开。所有新闻必须列出。"""
+{news_block}
+
+深度分析{sector}板块。以上预格式化新闻全部列在相关新闻节，不许跳过任何一条。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
