@@ -603,7 +603,7 @@ async def collect_market_snapshot(
     }
 
     # 新闻：东方财富（主力）→ 新浪（备用）→ Tushare → Finnhub
-    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 80)
+    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 50)
     sina = await loop.run_in_executor(None, fetch_sina_news, 20)
     ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
     fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 15)
@@ -698,10 +698,11 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     em = snapshot.news_items.get("eastmoney", [])
     if em:
         lines.append(f"### 东方财富 7x24 实时快讯（共{len(em)}条）")
-        for item in em[:20]:
+        for item in em[:40]:
+            summary = item.get("summary", "")[:120]
             lines.append(f"- [{item['time']}] {item['title']}")
-            if item.get("summary"):
-                lines.append(f"  {item['summary'][:250]}")
+            if summary:
+                lines.append(f"  {summary}")
 
     # ── 新浪新闻（备用）──
     sina = snapshot.news_items.get("sina", [])
