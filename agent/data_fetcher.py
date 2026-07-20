@@ -204,7 +204,13 @@ def fetch_shenwan_sectors(date: str) -> list:
             sectors.append({
                 "name": name, "pct_chg": pct, "tag": tag,
                 "chg_5d": chg_5d, "chg_10d": chg_10d, "chg_20d": chg_20d,
-                "ma5": ma5, "ma10": ma10, "ma20": ma20, "close": round(float(row["close"]), 2),
+                "ma5": ma5, "ma10": ma10, "ma20": ma20,
+                "close": round(float(row["close"]), 2),
+                "open": round(float(row.get("open", 0)), 2),
+                "high": round(float(row.get("high", 0)), 2),
+                "low": round(float(row.get("low", 0)), 2),
+                "vol": round(float(row.get("vol", 0)) / 10000, 2),
+                "amount": round(float(row.get("amount", 0)) / 1e8, 2),
                 "streak": streak_str,
             })
         except Exception:
@@ -333,6 +339,34 @@ def fetch_eastmoney_news(limit: int = 25) -> list:
         params = {
             "client": "web", "biz": "fastnews", "fastColumn": "102",
             "sortEnd": "", "pageSize": limit, "pageIndex": 1,
+            "req_trace": str(_uuid.uuid4()).replace("-", "")[:32],
+        }
+        resp = requests.get(url, params=params, timeout=15,
+                          headers={"User-Agent": "Mozilla/5.0",
+                                   "Referer": "https://www.eastmoney.com/"})
+        data = resp.json()
+        news_list = data.get("data", {}).get("fastNewsList", [])
+        for item in news_list[:limit]:
+            items.append({
+                "source": "东方财富",
+                "time": item.get("showTime", ""),
+                "title": item.get("title", "")[:150],
+                "summary": item.get("summary", "")[:300] if item.get("summary") else "",
+            })
+    except Exception:
+        pass
+    return items
+
+
+def fetch_eastmoney_news_page2(limit: int = 80) -> list:
+    """东方财富第2页新闻（覆盖前24-48小时）。"""
+    items = []
+    try:
+        import uuid as _uuid
+        url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+        params = {
+            "client": "web", "biz": "fastnews", "fastColumn": "102",
+            "sortEnd": "", "pageSize": limit, "pageIndex": 2,
             "req_trace": str(_uuid.uuid4()).replace("-", "")[:32],
         }
         resp = requests.get(url, params=params, timeout=15,
@@ -892,7 +926,8 @@ async def collect_market_snapshot(
         "toplist": loop.run_in_executor(None, fetch_top_list, date),
         "cn_macro": loop.run_in_executor(None, fetch_china_macro),
         "us_macro": loop.run_in_executor(None, fetch_us_macro),
-        "em_news": loop.run_in_executor(None, fetch_eastmoney_news, 80),
+        "em_p1": loop.run_in_executor(None, fetch_eastmoney_news, 80),
+        "em_p2": loop.run_in_executor(None, fetch_eastmoney_news_page2, 80),
         "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
         "calendar": loop.run_in_executor(None, fetch_economic_calendar),
     }
@@ -922,7 +957,7 @@ async def collect_market_snapshot(
         "us": safe(results_raw.get("us_macro"), {}),
     }
     snapshot.news_items = {
-        "eastmoney": safe(results_raw.get("em_news"), []),
+        "eastmoney": safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), []),
         "global": safe(results_raw.get("fh_news"), []),
     }
     snapshot.calendar = safe(results_raw.get("calendar"), [])
@@ -982,6 +1017,10 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             if s.get("ma5") and s.get("close"):
                 above = sum(1 for m in [s.get("ma5"), s.get("ma10"), s.get("ma20")] if m and s["close"] > m)
                 parts.append(f"站上{above}/3均线")
+            if s.get("open") and s["open"] > 0:
+                parts.append(f"开{s['open']:.2f}高{s.get('high',0):.2f}低{s.get('low',0):.2f}")
+            if s.get("vol") and s["vol"] > 0:
+                parts.append(f"量{s['vol']:.0f}万手")
             lines.append("  ".join(parts))
     else:
         lines.append("### 申万行业\n[Tushare未配置]")
@@ -1010,7 +1049,7 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     em = snapshot.news_items.get("eastmoney", [])
     if em:
         lines.append(f"### 东方财富 7x24 实时快讯（共{len(em)}条）")
-        for item in em[:60]:
+        for item in em[:120]:
             summary = item.get("summary", "")[:120]
             lines.append(f"- [{item['time']}] {item['title']}")
             if summary:
