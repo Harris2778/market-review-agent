@@ -568,13 +568,18 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         try:
             df_flow = pro.moneyflow(ts_code=",".join(top10_codes), trade_date=date)
             if df_flow is not None and not df_flow.empty:
-                total_buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
-                total_sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
-                result["fund_flow"] = {
-                    "main_buy": round(total_buy_lg / 1e8, 2),
-                    "main_sell": round(total_sell_lg / 1e8, 2),
-                    "net": round((total_buy_lg - total_sell_lg) / 1e8, 2),
-                }
+                # 大单/中单/小单拆解
+            buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
+            sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
+            buy_md = float(df_flow["buy_md_amount"].sum()) if "buy_md_amount" in df_flow.columns else 0
+            sell_md = float(df_flow["sell_md_amount"].sum()) if "sell_md_amount" in df_flow.columns else 0
+            buy_sm = float(df_flow["buy_sm_amount"].sum()) if "buy_sm_amount" in df_flow.columns else 0
+            sell_sm = float(df_flow["sell_sm_amount"].sum()) if "sell_sm_amount" in df_flow.columns else 0
+            result["fund_flow"] = {
+                "lg_net": round((buy_lg - sell_lg) / 1e8, 2),
+                "md_net": round((buy_md - sell_md) / 1e8, 2),
+                "sm_net": round((buy_sm - sell_sm) / 1e8, 2),
+            }
         except Exception:
             pass
 
@@ -656,6 +661,35 @@ def fetch_china_macro() -> dict:
     except Exception:
         pass
 
+    return result
+
+
+# ═══════════════════════════════════════════
+# 商品期货 + 汇率（yfinance）
+# ═══════════════════════════════════════════
+
+def fetch_commodities_and_fx() -> dict:
+    """商品期货 + 人民币汇率（yfinance 免费）。"""
+    result = {}
+    tickers = {
+        "CL=F": "WTI原油", "GC=F": "黄金", "HG=F": "铜",
+        "USDCNY=X": "在岸人民币", "CNH=X": "离岸人民币",
+    }
+    try:
+        import yfinance as yf
+        for sym, name in tickers.items():
+            try:
+                t = yf.Ticker(sym)
+                hist = t.history(period="3d")
+                if hist is not None and len(hist) >= 2:
+                    close = round(float(hist["Close"].iloc[-1]), 2)
+                    prev = round(float(hist["Close"].iloc[-2]), 2)
+                    pct = round((close - prev) / prev * 100, 2) if prev else 0.0
+                    result[name] = {"close": close, "pct_chg": pct}
+            except Exception:
+                pass
+    except Exception:
+        pass
     return result
 
 
@@ -777,6 +811,10 @@ async def collect_market_snapshot(
 
     broker_recs = await loop.run_in_executor(None, fetch_broker_recommendations)
     snapshot._broker_recs = broker_recs
+
+    # 商品期货 + 汇率
+    comm = await loop.run_in_executor(None, fetch_commodities_and_fx)
+    snapshot._commodities = comm
 
     # 板块个股数据（仅板块聚焦模式）
     stock_detail = None
@@ -939,6 +977,14 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- {name}: {val}")
         lines.append("")
 
+    # ── 商品 + 汇率 ──
+    comm = getattr(snapshot, "_commodities", {})
+    if comm:
+        lines.append("### 商品期货与汇率")
+        for name, d in comm.items():
+            lines.append(f"- {name}: {d['close']} {d['pct_chg']:+.2f}%")
+        lines.append("")
+
     # ── 美国宏观 ──
     us = snapshot.macro_data.get("us", {})
     if us:
@@ -979,7 +1025,7 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
 
         if stock_detail.get("fund_flow"):
             ff = stock_detail["fund_flow"]
-            lines.append(f"主力资金（前10大权重股）：买入{ff['main_buy']}亿 卖出{ff['main_sell']}亿 净{'流入' if ff['net'] > 0 else '流出'}{abs(ff['net'])}亿")
+            lines.append(f"资金拆解（前10权重股）：大单净额{ff['lg_net']:+.2f}亿（机构） 中单净额{ff['md_net']:+.2f}亿（游资） 小单净额{ff['sm_net']:+.2f}亿（散户）")
         lines.append("")
 
     # ── 券商推荐 ──
