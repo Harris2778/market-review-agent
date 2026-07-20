@@ -405,7 +405,81 @@ def fetch_cls_telegraph(limit: int = 20) -> list:
 
 
 # ═══════════════════════════════════════════
-# 全球指数 + 宏观
+# 中国宏观数据
+# ═══════════════════════════════════════════
+
+def fetch_china_macro() -> dict:
+    """中国宏观数据：CPI/PPI/PMI/M2/GDP/社融（Tushare）。"""
+    pro = _get_pro()
+    if not pro:
+        return {}
+
+    result = {}
+    this_month = datetime.now().strftime("%Y%m")
+
+    # CPI
+    try:
+        df = pro.cn_cpi(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["CPI同比"] = f"{float(row['cpi']):.2f}%"
+            result["CPI月环比"] = f"{float(row.get('cpi_month', row.get('nt_val', 0))):.2f}%"
+    except Exception:
+        pass
+
+    # PPI
+    try:
+        df = pro.cn_ppi(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["PPI同比"] = f"{float(row['ppi']):.2f}%"
+    except Exception:
+        pass
+
+    # PMI
+    try:
+        df = pro.cn_pmi(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["制造业PMI"] = f"{float(row['pmi']):.1f}"
+            result["非制造业PMI"] = f"{float(row.get('nmi', 0)):.1f}"
+    except Exception:
+        pass
+
+    # M2
+    try:
+        df = pro.cn_m(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["M2同比"] = f"{float(row['m2']):.2f}%"
+    except Exception:
+        pass
+
+    # GDP
+    try:
+        df = pro.cn_gdp(start_q="2025Q1", end_q="2026Q2")
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["GDP同比"] = f"{float(row['gdp']):.2f}%"
+            result["GDP季度"] = str(row.get("quarter", ""))
+    except Exception:
+        pass
+
+    # 社融
+    try:
+        df = pro.sf_month(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            val = float(row.get("aggregate", 0))
+            result["社会融资规模"] = f"{val / 10000:.2f}万亿" if val > 10000 else f"{val:.2f}亿"
+    except Exception:
+        pass
+
+    return result
+
+
+# ═══════════════════════════════════════════
+# 全球指数 + 美国宏观
 # ═══════════════════════════════════════════
 
 def fetch_global_indices() -> dict:
@@ -520,8 +594,12 @@ async def collect_market_snapshot(
     gidx = await loop.run_in_executor(None, fetch_global_indices)
     snapshot.global_indices = gidx
 
-    macro = await loop.run_in_executor(None, fetch_us_macro)
-    snapshot.macro_data = macro
+    china_macro = await loop.run_in_executor(None, fetch_china_macro)
+    us_macro = await loop.run_in_executor(None, fetch_us_macro)
+    snapshot.macro_data = {
+        "china": china_macro,
+        "us": us_macro,
+    }
 
     # 新闻：东方财富（主力）→ 新浪（备用）→ Tushare → Finnhub
     em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 25)
@@ -654,10 +732,19 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
 
     lines.append("")
 
-    # ── 宏观 ──
-    if snapshot.macro_data:
+    # ── 中国宏观 ──
+    china = snapshot.macro_data.get("china", {})
+    if china:
+        lines.append("### 中国宏观数据（Tushare）")
+        for name, val in china.items():
+            lines.append(f"- {name}: {val}")
+        lines.append("")
+
+    # ── 美国宏观 ──
+    us = snapshot.macro_data.get("us", {})
+    if us:
         lines.append("### 美国宏观数据（FRED）")
-        for name, val in snapshot.macro_data.items():
+        for name, val in us.items():
             lines.append(f"- {name}: {val}")
     lines.append("")
 
