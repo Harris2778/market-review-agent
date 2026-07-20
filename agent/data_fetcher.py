@@ -1179,24 +1179,22 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- 融资余额: {snapshot.fund_flows['margin_bal']:.2f}亿")
     lines.append("")
 
-    # ── 东方财富新闻 ──
+    # ── 新浪历史新闻（放前面，覆盖48h）──
+    sina = snapshot.news_items.get("sina", [])
+    if sina:
+        lines.append(f"### 新浪财经历史新闻（交易日+前日，共{len(sina)}条，覆盖48小时）")
+        for item in sina[:40]:
+            lines.append(f"- [{item['time']}] {item['title']}")
+
+    # ── 东方财富实时（补充最新）──
     em = snapshot.news_items.get("eastmoney", [])
     if em:
-        lines.append(f"### 东方财富 7x24 实时快讯（共{len(em)}条）")
-        # 反转顺序：旧新闻在前，覆盖48小时全窗口
-        em_reversed = list(reversed(em))
-        for item in em_reversed[:120]:
+        lines.append(f"### 东方财富7x24实时快讯（共{len(em)}条）")
+        for item in em[:30]:
             summary = item.get("summary", "")[:120]
             lines.append(f"- [{item['time']}] {item['title']}")
             if summary:
                 lines.append(f"  {summary}")
-
-    # ── 新浪新闻（备用）──
-    sina = snapshot.news_items.get("sina", [])
-    if sina:
-        lines.append(f"### 新浪财经历史新闻（交易日+前日，共{len(sina)}条）")
-        for item in sina[:40]:
-            lines.append(f"- [{item['time']}] {item['title']}")
 
     # ── Tushare 新闻 ──
     ts_news = snapshot.news_items.get("ts_news", [])
