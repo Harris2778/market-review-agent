@@ -356,7 +356,10 @@ class MarketReviewAgent:
 
 深度分析{sector}板块。以上预格式化新闻全部列在相关新闻节，不许跳过任何一条。"""
 
-        return await self._call_llm(system, user_prompt, stream)
+        result = await self._call_llm(system, user_prompt, stream)
+        if not stream and isinstance(result, dict):
+            result["content"] = news_block + "\n\n" + result["content"]
+        return result
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False
