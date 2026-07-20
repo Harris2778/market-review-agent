@@ -414,9 +414,9 @@ def filter_news_by_sector(news_items: list, sector: str) -> list:
             if is_macro:
                 indirect.append(item)
 
-    # 直接相关 + 重要宏观（各取25条）
-    result = direct[:25] + indirect[:25]
-    return result[:50]  # 最多50条
+    # 直接相关全取 + 重要宏观只取5条
+    result = direct + indirect[:5]
+    return result
 
 
 def fetch_eastmoney_news_page2(limit: int = 80) -> list:
