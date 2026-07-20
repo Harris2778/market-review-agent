@@ -292,19 +292,13 @@ class MarketReviewAgent:
         # 3. 构建 prompt
         system = get_system_prompt("market_review")
 
-        user_prompt = f"""今日日期：{today.strftime('%Y年%m月%d日')} {['周一','周二','周三','周四','周五','周六','周日'][today.weekday()]}
-数据日期：{date_display} {weekday}（最近可用交易日）{date_note}
+        user_prompt = f"""最新交易日：{date_display} {weekday}{date_note}
 
 {market_data}
 
-请根据以上实时市场数据，生成今日A股市场每日复盘报告。严格按照系统提示词中指定的格式输出。
+请根据以上数据生成A股市场复盘报告。报告日期使用{date_display}（数据对应的交易日），不要使用其他日期。严格按照系统提示词中的格式输出。
 
-注意事项：
-- 如果某项数据标记为"不可用"，在报告中标注[UNSOURCED]而不是编造
-- 今天是{'交易日（正常复盘）' if weekday not in ['周六', '周日'] else '周末，请告知用户今日休市'}
-- 如果今天是周一，需要说明使用的是上周五的数据
-- 新闻按S/A/B/C四级分类，级别标注要准确
-- 31个行业全部列出，不要只列前几名"""
+注意：数据缺失处标[UNSOURCED]不编造。新闻全部呈现并附分析。31行业全部列出。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -327,12 +321,13 @@ class MarketReviewAgent:
 
         system = get_system_prompt("sector_deep_dive", sector)
 
-        user_prompt = f"""数据日期：{date_display} {weekday}（最近可用交易日）。
-用户要求聚焦分析：{sector}板块。
+        user_prompt = f"""数据对应交易日：{date_display} {weekday}。
+
+聚焦分析行业：{sector}
 
 {market_data}
 
-请对{sector}板块进行深度分析。按照系统提示词中的框架逐一展开，特别要充分利用提供的成分股数据、主力资金流向数据进行个股级别的分析。"""
+请对{sector}板块深度分析。按系统提示词框架展开，充分利用成分股数据、资金流向数据。报告日期使用{date_display}。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -352,7 +347,7 @@ class MarketReviewAgent:
                 model=self.model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=12288,
+                max_tokens=16384,
             )
             raw = completion.choices[0].message.content
             disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
@@ -367,7 +362,7 @@ class MarketReviewAgent:
             model=self.model,
             messages=messages,
             temperature=0.2,
-            max_tokens=12288,
+            max_tokens=16384,
             stream=True,
         )
         async for chunk in stream:
