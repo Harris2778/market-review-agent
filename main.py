@@ -226,6 +226,15 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/sector-stocks")
+async def debug_sector_stocks(sector: str = "食品饮料"):
+    """测试板块成分股数据获取。"""
+    from agent.data_fetcher import fetch_sector_stock_detail
+    today = datetime.now().strftime("%Y%m%d")
+    detail = fetch_sector_stock_detail(sector, today)
+    return {"sector": sector, "detail": detail}
+
+
 @app.get("/debug/derivatives")
 async def debug_derivatives():
     """测试衍生品数据权限。"""
