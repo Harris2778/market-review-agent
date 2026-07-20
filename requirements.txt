@@ -18,10 +18,9 @@ levistock>=0.1.0
 beautifulsoup4>=4.12.0
 lxml>=5.3.0
 
-# Data Processing & Charts
+# Data Processing
 pandas>=2.2.0
 numpy>=1.26.0
-matplotlib>=3.8.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 

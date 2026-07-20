@@ -2,11 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# 安装系统依赖 + 中文字体（matplotlib 图表用）
+# 安装系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ fonts-wqy-microhei && \
-    rm -rf /var/lib/apt/lists/* && \
-    fc-cache -fv
+    gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
 
 # 安装 Python 依赖
 COPY requirements.txt .
