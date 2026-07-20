@@ -202,7 +202,67 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
         yield "data: [DONE]\n\n"
 
 
-# ── 健康检查 ──
+# ── 调试端点 ──
+
+@app.get("/debug/tushare")
+async def debug_tushare():
+    """测试 Tushare API 连通性，返回详细错误信息。"""
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if not token:
+        return {"status": "no_token", "error": "TUSHARE_TOKEN 未设置"}
+
+    results = {}
+    try:
+        import tushare as ts
+        ts.set_token(token)
+        pro = ts.pro_api()
+
+        # 交易日历（最简单的接口）
+        try:
+            df = pro.trade_cal(exchange="SSE", start_date="20260720", end_date="20260724")
+            results["trade_cal"] = {
+                "status": "ok",
+                "rows": len(df) if df is not None else 0,
+            }
+        except Exception as e:
+            results["trade_cal"] = {"status": "fail", "error": str(e)[:200]}
+
+        # 指数行情
+        try:
+            df = pro.index_daily(ts_code="000001.SH", start_date="20260717", end_date="20260720")
+            results["index_daily"] = {
+                "status": "ok",
+                "rows": len(df) if df is not None else 0,
+            }
+        except Exception as e:
+            results["index_daily"] = {"status": "fail", "error": str(e)[:200]}
+
+        # 申万行业
+        try:
+            df = pro.sw_daily(trade_date="20260717")
+            results["sw_daily"] = {
+                "status": "ok",
+                "rows": len(df) if df is not None else 0,
+            }
+        except Exception as e:
+            results["sw_daily"] = {"status": "fail", "error": str(e)[:200]}
+
+        # 资金流向
+        try:
+            df = pro.moneyflow_hsgt(start_date="20260717", end_date="20260718")
+            results["moneyflow"] = {
+                "status": "ok",
+                "rows": len(df) if df is not None else 0,
+            }
+        except Exception as e:
+            results["moneyflow"] = {"status": "fail", "error": str(e)[:200]}
+
+    except Exception as e:
+        results["init"] = {"status": "fail", "error": str(e)[:200]}
+
+    return {"tushare": results, "proxy_env": {
+        k: os.environ.get(k) for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"]
+    }}
 
 @app.get("/health")
 async def health_check():
