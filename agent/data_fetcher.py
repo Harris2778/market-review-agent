@@ -880,64 +880,49 @@ async def collect_market_snapshot(
 
     snapshot = MarketSnapshot(date=date)
 
-    # 并行执行
-    indices = await loop.run_in_executor(None, fetch_a_share_indices, date)
-    snapshot.indices = indices
-
-    sectors = await loop.run_in_executor(None, fetch_shenwan_sectors, date)
-    snapshot.sectors = sectors
-
-    flows = await loop.run_in_executor(None, fetch_fund_flows, date)
-    snapshot.fund_flows = flows
-
-    gidx = await loop.run_in_executor(None, fetch_global_indices)
-    snapshot.global_indices = gidx
-
-    broker_recs = await loop.run_in_executor(None, fetch_broker_recommendations)
-    snapshot._broker_recs = broker_recs
-
-    # 商品期货 + 汇率
-    comm = await loop.run_in_executor(None, fetch_commodities_and_fx)
-    snapshot._commodities = comm
-
-    shibor = await loop.run_in_executor(None, fetch_shibor)
-    snapshot._shibor = shibor
-
-    north_hold = await loop.run_in_executor(None, fetch_north_holdings)
-    snapshot._north_hold = north_hold
-
-    top_list = await loop.run_in_executor(None, fetch_top_list, date)
-    snapshot._top_list = top_list
-
-    # 板块个股数据（仅板块聚焦模式）
-    stock_detail = None
+    # 全部并行执行（从串行 15s → 并行 3s）
+    tasks = {
+        "indices": loop.run_in_executor(None, fetch_a_share_indices, date),
+        "sectors": loop.run_in_executor(None, fetch_shenwan_sectors, date),
+        "flows": loop.run_in_executor(None, fetch_fund_flows, date),
+        "gidx": loop.run_in_executor(None, fetch_global_indices),
+        "broker": loop.run_in_executor(None, fetch_broker_recommendations),
+        "comm": loop.run_in_executor(None, fetch_commodities_and_fx),
+        "shibor": loop.run_in_executor(None, fetch_shibor),
+        "north": loop.run_in_executor(None, fetch_north_holdings),
+        "toplist": loop.run_in_executor(None, fetch_top_list, date),
+        "cn_macro": loop.run_in_executor(None, fetch_china_macro),
+        "us_macro": loop.run_in_executor(None, fetch_us_macro),
+        "em_news": loop.run_in_executor(None, fetch_eastmoney_news, 80),
+        "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
+        "calendar": loop.run_in_executor(None, fetch_economic_calendar),
+    }
     if sector_focus:
-        stock_detail = await loop.run_in_executor(
-            None, fetch_sector_stock_detail, sector_focus, date
-        )
-    snapshot._stock_detail = stock_detail
+        tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
 
-    china_macro = await loop.run_in_executor(None, fetch_china_macro)
-    us_macro = await loop.run_in_executor(None, fetch_us_macro)
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results = dict(zip(tasks.keys(), results))
+
+    snapshot.indices = results.get("indices", {}) or {}
+    snapshot.sectors = results.get("sectors", []) or []
+    snapshot.fund_flows = results.get("flows", {}) or {}
+    snapshot.global_indices = results.get("gidx", {}) or {}
+    snapshot._broker_recs = results.get("broker", []) or []
+    snapshot._commodities = results.get("comm", {}) or {}
+    snapshot._shibor = results.get("shibor", {}) or {}
+    snapshot._north_hold = results.get("north", []) or []
+    snapshot._top_list = results.get("toplist", []) or []
     snapshot.macro_data = {
-        "china": china_macro,
-        "us": us_macro,
+        "china": results.get("cn_macro", {}) or {},
+        "us": results.get("us_macro", {}) or {},
     }
-
-    # 新闻：东方财富（主力）→ 新浪（备用）→ Tushare → Finnhub
-    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 80)
-    sina = await loop.run_in_executor(None, fetch_sina_news, 20)
-    ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
-    fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 20)
     snapshot.news_items = {
-        "eastmoney": em_news,
-        "sina": sina,
-        "ts_news": ts_news,
-        "global": fh_news,
+        "eastmoney": results.get("em_news", []) or [],
+        "global": results.get("fh_news", []) or [],
     }
-
-    calendar = await loop.run_in_executor(None, fetch_economic_calendar)
-    snapshot.calendar = calendar
+    snapshot.calendar = results.get("calendar", []) or []
+    if sector_focus:
+        snapshot._stock_detail = results.get("stock") or None
 
     return snapshot
 
