@@ -733,6 +733,19 @@ def fetch_china_macro() -> dict:
     except Exception:
         pass
 
+    # PPI产业链子项（上游→中游→下游传导）
+    try:
+        df = pro.cn_ppi(start_m="202601", end_m=this_month)
+        if df is not None and not df.empty:
+            row = df.iloc[-1]
+            result["PPI_采掘上游"] = f"{float(row['ppi_mp_qm_yoy']):.1f}%"
+            result["PPI_原材料中游"] = f"{float(row['ppi_mp_rm_yoy']):.1f}%"
+            result["PPI_加工中游"] = f"{float(row['ppi_mp_p_yoy']):.1f}%"
+            result["PPI_生活资料下游"] = f"{float(row['ppi_cg_yoy']):.1f}%"
+            result["PPI_食品终端"] = f"{float(row['ppi_cg_f_yoy']):.1f}%"
+    except Exception:
+        pass
+
     return result
 
 
