@@ -603,10 +603,10 @@ async def collect_market_snapshot(
     }
 
     # 新闻：东方财富（主力）→ 新浪（备用）→ Tushare → Finnhub
-    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 25)
+    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 80)
     sina = await loop.run_in_executor(None, fetch_sina_news, 20)
     ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
-    fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 8)
+    fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 15)
     snapshot.news_items = {
         "eastmoney": em_news,
         "sina": sina,
