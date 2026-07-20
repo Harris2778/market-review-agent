@@ -1177,7 +1177,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     em = snapshot.news_items.get("eastmoney", [])
     if em:
         lines.append(f"### 东方财富 7x24 实时快讯（共{len(em)}条）")
-        for item in em[:120]:
+        # 反转顺序：旧新闻在前，覆盖48小时全窗口
+        em_reversed = list(reversed(em))
+        for item in em_reversed[:120]:
             summary = item.get("summary", "")[:120]
             lines.append(f"- [{item['time']}] {item['title']}")
             if summary:
