@@ -325,37 +325,14 @@ class MarketReviewAgent:
             self._cache = {cache_key: snapshot}
         market_data = format_market_data_for_prompt(snapshot)
 
-        # 额外板块数据
-        sector_extra = ""
-        if hasattr(snapshot, "_sector_detail") and snapshot._sector_detail:
-            sd = snapshot._sector_detail
-            sector_extra = f"""
-## 板块深度数据：{sector}
-
-### 成分股表现
-- 板块内上涨: {sd.get('up_count', 'N/A')}家
-- 板块内下跌: {sd.get('down_count', 'N/A')}家
-- 板块内平盘: {sd.get('flat_count', 'N/A')}家
-
-### 领涨个股
-"""
-            for s in sd.get("top_gainers", []):
-                sector_extra += f"- {s['name']}: {s['pct_chg']:+.2f}%\n"
-
-            sector_extra += "\n### 领跌个股\n"
-            for s in sd.get("top_losers", []):
-                sector_extra += f"- {s['name']}: {s['pct_chg']:+.2f}%\n"
-
         system = get_system_prompt("sector_deep_dive", sector)
 
         user_prompt = f"""数据日期：{date_display} {weekday}（最近可用交易日）。
-用户要求聚焦分析：**{sector}**板块。
+用户要求聚焦分析：{sector}板块。
 
 {market_data}
 
-{sector_extra}
-
-请对{sector}板块进行7维度深度分析。先给出全市场概览（1-2句话+行业热力图），再按A-G七个维度逐一展开。"""
+请对{sector}板块进行深度分析。按照系统提示词中的框架逐一展开，特别要充分利用提供的成分股数据、主力资金流向数据进行个股级别的分析。"""
 
         return await self._call_llm(system, user_prompt, stream)
 

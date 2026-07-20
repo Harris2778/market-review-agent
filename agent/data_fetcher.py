@@ -432,6 +432,110 @@ def fetch_broker_recommendations() -> list:
 
 
 # ═══════════════════════════════════════════
+# 个股级别数据（板块聚焦专用）
+# ═══════════════════════════════════════════
+
+# 申万行业 → 指数代码
+SW_INDEX_MAP = {
+    "农林牧渔": "801010.SI", "采掘": "801020.SI", "化工": "801030.SI",
+    "钢铁": "801040.SI", "有色金属": "801050.SI", "电子": "801080.SI",
+    "家用电器": "801110.SI", "食品饮料": "801120.SI", "纺织服装": "801130.SI",
+    "轻工制造": "801140.SI", "医药生物": "801150.SI", "公用事业": "801160.SI",
+    "交通运输": "801170.SI", "房地产": "801180.SI", "商业贸易": "801200.SI",
+    "休闲服务": "801210.SI", "综合": "801230.SI", "建筑材料": "801710.SI",
+    "建筑装饰": "801720.SI", "电气设备": "801730.SI", "国防军工": "801740.SI",
+    "计算机": "801750.SI", "传媒": "801760.SI", "通信": "801770.SI",
+    "银行": "801780.SI", "非银金融": "801790.SI", "汽车": "801880.SI",
+    "机械设备": "801890.SI", "煤炭": "801950.SI", "石油石化": "801960.SI",
+    "环保": "801970.SI",
+}
+
+
+def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
+    """
+    获取板块成分股当日行情：领涨/领跌、主力资金、盘中节奏。
+    返回给 LLM 的格式化文本。
+    """
+    pro = _get_pro()
+    if not pro:
+        return {}
+
+    idx_code = SW_INDEX_MAP.get(sector_name)
+    if not idx_code:
+        return {}
+
+    result = {"sector": sector_name, "stocks": [], "top_gainers": [], "top_losers": []}
+
+    try:
+        # 1. 获取成分股列表
+        df_member = pro.index_member(index_code=idx_code)
+        if df_member is None or df_member.empty:
+            return result
+        stocks = df_member["con_code"].tolist()
+
+        # 2. 批量获取成分股今日行情（O/H/L/C/涨跌幅/成交量）
+        # 分批处理，每批 50 只
+        all_daily = []
+        for i in range(0, len(stocks), 50):
+            batch = stocks[i:i + 50]
+            try:
+                df = pro.daily(ts_code=",".join(batch), trade_date=date)
+                if df is not None and not df.empty:
+                    all_daily.append(df)
+            except Exception:
+                pass
+
+        if not all_daily:
+            return result
+
+        import pandas as pd
+        daily_df = pd.concat(all_daily, ignore_index=True)
+        # 按涨幅排序
+        daily_df = daily_df.sort_values("pct_chg", ascending=False)
+
+        top5 = daily_df.head(5)
+        bottom5 = daily_df.tail(5)
+
+        result["total_stocks"] = len(daily_df)
+        result["up_count"] = int((daily_df["pct_chg"] > 0).sum())
+        result["down_count"] = int((daily_df["pct_chg"] < 0).sum())
+        result["flat_count"] = int((daily_df["pct_chg"] == 0).sum())
+
+        result["top_gainers"] = [
+            {"code": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2),
+             "close": round(float(r["close"]), 2),
+             "vol": round(float(r.get("vol", 0)) / 10000, 2)}
+            for _, r in top5.iterrows()
+        ]
+        result["top_losers"] = [
+            {"code": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2),
+             "close": round(float(r["close"]), 2),
+             "vol": round(float(r.get("vol", 0)) / 10000, 2)}
+            for _, r in bottom5.iterrows()
+        ]
+
+        # 3. 资金流向（前10只股票）
+        top10_codes = daily_df.head(10)["ts_code"].tolist()
+        try:
+            df_flow = pro.moneyflow(ts_code=",".join(top10_codes), trade_date=date)
+            if df_flow is not None and not df_flow.empty:
+                total_buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
+                total_sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
+                result["fund_flow"] = {
+                    "main_buy": round(total_buy_lg / 1e8, 2),
+                    "main_sell": round(total_sell_lg / 1e8, 2),
+                    "net": round((total_buy_lg - total_sell_lg) / 1e8, 2),
+                }
+        except Exception:
+            pass
+
+        return result
+
+    except Exception:
+        return result
+
+
+# ═══════════════════════════════════════════
 # 中国宏观数据
 # ═══════════════════════════════════════════
 
@@ -625,6 +729,14 @@ async def collect_market_snapshot(
     broker_recs = await loop.run_in_executor(None, fetch_broker_recommendations)
     snapshot._broker_recs = broker_recs
 
+    # 板块个股数据（仅板块聚焦模式）
+    stock_detail = None
+    if sector_focus:
+        stock_detail = await loop.run_in_executor(
+            None, fetch_sector_stock_detail, sector_focus, date
+        )
+    snapshot._stock_detail = stock_detail
+
     china_macro = await loop.run_in_executor(None, fetch_china_macro)
     us_macro = await loop.run_in_executor(None, fetch_us_macro)
     snapshot.macro_data = {
@@ -785,6 +897,31 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         for name, val in us.items():
             lines.append(f"- {name}: {val}")
     lines.append("")
+
+    # ── 板块个股详情 ──
+    stock_detail = getattr(snapshot, "_stock_detail", None)
+    if stock_detail:
+        lines.append("### 板块成分股数据（个股级别）")
+        total = stock_detail.get("total_stocks", 0)
+        up = stock_detail.get("up_count", 0)
+        down = stock_detail.get("down_count", 0)
+        flat = stock_detail.get("flat_count", 0)
+        lines.append(f"成分股总数: {total}只  上涨: {up}只  下跌: {down}只  平盘: {flat}只")
+
+        if stock_detail.get("top_gainers"):
+            lines.append("领涨前5：")
+            for s in stock_detail["top_gainers"]:
+                lines.append(f"  {s['code']} 收盘{s['close']}  {s['pct_chg']:+.2f}%  成交量{s['vol']}万手")
+
+        if stock_detail.get("top_losers"):
+            lines.append("领跌前5：")
+            for s in stock_detail["top_losers"]:
+                lines.append(f"  {s['code']} 收盘{s['close']}  {s['pct_chg']:+.2f}%  成交量{s['vol']}万手")
+
+        if stock_detail.get("fund_flow"):
+            ff = stock_detail["fund_flow"]
+            lines.append(f"主力资金（前10大权重股）：买入{ff['main_buy']}亿 卖出{ff['main_sell']}亿 净{'流入' if ff['net'] > 0 else '流出'}{abs(ff['net'])}亿")
+        lines.append("")
 
     # ── 券商推荐 ──
     recs = getattr(snapshot, "_broker_recs", [])
