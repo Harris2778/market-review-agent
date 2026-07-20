@@ -369,7 +369,7 @@ class MarketReviewAgent:
                 model=self.model,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=8192,
+                max_tokens=16384,
             )
             raw = completion.choices[0].message.content
             return {
@@ -383,7 +383,7 @@ class MarketReviewAgent:
             model=self.model,
             messages=messages,
             temperature=0.3,
-            max_tokens=8192,
+            max_tokens=16384,
             stream=True,
         )
         async for chunk in stream:
