@@ -190,6 +190,44 @@ def _extract_sector(msg: str) -> Optional[str]:
     return None
 
 
+# ── Markdown 清理 ──
+
+def _clean_markdown(text: str) -> str:
+    """后处理：强制清除 LLM 输出的所有 markdown 格式标记。"""
+    import re
+
+    # 1. 管道表格 → 缩进纯文本
+    lines = text.split("\n")
+    cleaned = []
+    in_table = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            if "---" in stripped:
+                in_table = True
+                continue
+            if in_table:
+                cells = [c.strip() for c in stripped.split("|")[1:-1]]
+                cleaned.append("  " + "  ".join(cells))
+            continue
+        in_table = False
+        cleaned.append(line)
+
+    text = "\n".join(cleaned)
+
+    # 2. **加粗** → 去掉星号
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+
+    # 3. # → 空行替代
+    text = re.sub(r"^###?\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n###?\s+", "\n", text)
+
+    # 4. * 列表 → - 列表
+    text = re.sub(r"^\* ", "- ", text, flags=re.MULTILINE)
+
+    return text
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -331,20 +369,21 @@ class MarketReviewAgent:
                 model=self.model,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=8192,
             )
+            raw = completion.choices[0].message.content
             return {
                 "role": "assistant",
-                "content": completion.choices[0].message.content,
+                "content": _clean_markdown(raw),
             }
 
     async def _stream_response(self, messages: list) -> AsyncGenerator:
-        """流式响应生成器。"""
+        """流式响应生成器。注意：流式不清理markdown，但非流式会清理。"""
         stream = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=0.3,
-            max_tokens=4096,
+            max_tokens=8192,
             stream=True,
         )
         async for chunk in stream:
