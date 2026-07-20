@@ -204,6 +204,42 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/macro")
+async def debug_macro():
+    """测试 Tushare 宏观数据 + 个股基本面接口权限。"""
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if not token:
+        return {"status": "no_token"}
+
+    import tushare as ts
+    ts.set_token(token)
+    pro = ts.pro_api()
+    results = {}
+
+    # 宏观数据
+    macro_tests = [
+        ("cn_cpi", lambda: pro.cn_cpi(start_m="202606", end_m="202607")),
+        ("cn_ppi", lambda: pro.cn_ppi(start_m="202606", end_m="202607")),
+        ("cn_pmi", lambda: pro.cn_pmi(start_m="202606", end_m="202607")),
+        ("cn_m", lambda: pro.cn_m(start_m="202606", end_m="202607")),
+        ("cn_gdp", lambda: pro.cn_gdp(start_q="2025Q1", end_q="2026Q1")),
+        ("sf_month", lambda: pro.sf_month(start_m="202606", end_m="202607")),
+        ("daily_basic", lambda: pro.daily_basic(ts_code="000001.SZ", trade_date="20260718")),
+    ]
+
+    for name, fn in macro_tests:
+        try:
+            df = fn()
+            if df is not None and not df.empty:
+                results[name] = {"status": "ok", "rows": len(df), "columns": list(df.columns)[:8]}
+            else:
+                results[name] = {"status": "empty"}
+        except Exception as e:
+            results[name] = {"status": "fail", "error": str(e)[:120]}
+
+    return {"macro_test": results}
+
+
 @app.get("/debug/pipeline")
 async def debug_pipeline():
     """测试完整数据采集管线。"""
