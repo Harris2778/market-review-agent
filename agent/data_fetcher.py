@@ -550,6 +550,20 @@ def fetch_north_holdings() -> list:
     return items
 
 
+def aggregate_northbound_by_sector(holdings: list) -> dict:
+    """将北向持仓按行业聚合，返回各行业持仓市值(亿)排名。"""
+    _load_stock_names()
+    sector_holdings = {}
+    for h in holdings:
+        sector = _stock_sector_cache.get(h["code"], "")
+        if not sector:
+            continue
+        sector_holdings[sector] = sector_holdings.get(sector, 0) + h["vol"]
+    # 按持仓市值排序
+    sorted_sectors = sorted(sector_holdings.items(), key=lambda x: x[1], reverse=True)
+    return dict(sorted_sectors[:15])
+
+
 def fetch_shibor() -> dict:
     """SHIBOR利率（国内流动性指标）。"""
     pro = _get_pro()
@@ -618,12 +632,13 @@ SW_INDEX_MAP = {
 }
 
 
-# 股票代码→名称缓存（一次加载，全局复用）
+# 股票代码→名称+行业缓存
 _stock_name_cache: dict = {}
+_stock_sector_cache: dict = {}
 
 def _load_stock_names():
-    """加载全部A股代码→名称映射。"""
-    global _stock_name_cache
+    """加载全部A股代码→名称+行业映射。"""
+    global _stock_name_cache, _stock_sector_cache
     if _stock_name_cache:
         return
     pro = _get_pro()
@@ -633,7 +648,8 @@ def _load_stock_names():
         df = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name,industry")
         if df is not None and not df.empty:
             for _, row in df.iterrows():
-                _stock_name_cache[row["ts_code"]] = row["name"]
+                _stock_name_cache[row["ts_code"]] = row.get("name", "")
+                _stock_sector_cache[row["ts_code"]] = row.get("industry", "")
     except Exception:
         pass
 
@@ -693,6 +709,12 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         bottom5 = daily_df.tail(5)
 
         result["total_stocks"] = len(daily_df)
+        # 板块合计成交额（成分股口径）
+        total_amount = float(daily_df["amount"].sum()) if "amount" in daily_df.columns else 0
+        total_vol = float(daily_df["vol"].sum()) if "vol" in daily_df.columns else 0
+        result["total_amount"] = round(total_amount / 1e8, 2)  # 元→亿
+        result["total_vol"] = round(total_vol / 10000, 2)      # 手→万手
+
         result["up_count"] = int((daily_df["pct_chg"] > 0).sum())
         result["down_count"] = int((daily_df["pct_chg"] < 0).sum())
         result["flat_count"] = int((daily_df["pct_chg"] == 0).sum())
@@ -1012,6 +1034,7 @@ async def collect_market_snapshot(
     snapshot._commodities = safe(results_raw.get("comm"), {})
     snapshot._shibor = safe(results_raw.get("shibor"), {})
     snapshot._north_hold = safe(results_raw.get("north"), [])
+    snapshot._north_sector = aggregate_northbound_by_sector(snapshot._north_hold)
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1192,12 +1215,18 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"机构净卖出: {names}")
         lines.append("")
 
-    # ── 北向持仓TOP ──
+    # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
     if north_h:
         lines.append("### 北向资金持仓TOP20")
         for h in north_h[:15]:
             lines.append(f"- {h['name']}({h['code']}) 持仓{h['vol']}亿 占比{h['ratio']}%")
+        # 北向行业分布
+        north_sec = getattr(snapshot, "_north_sector", {})
+        if north_sec:
+            lines.append("北向持仓行业分布（市值排名）:")
+            for sec, val in list(north_sec.items())[:10]:
+                lines.append(f"  {sec}: {val:.0f}亿")
         lines.append("")
 
     # ── 美国宏观 ──
@@ -1217,6 +1246,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         down = stock_detail.get("down_count", 0)
         flat = stock_detail.get("flat_count", 0)
         lines.append(f"成分股总数: {total}只  上涨: {up}只  下跌: {down}只  平盘: {flat}只")
+
+        if stock_detail.get("total_amount"):
+            lines.append(f"板块合计成交额: {stock_detail['total_amount']}亿（成分股口径） 成交量: {stock_detail['total_vol']}万手")
 
         if stock_detail.get("top_gainers"):
             lines.append("领涨前5（含日内四价）：")
