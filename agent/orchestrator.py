@@ -7,12 +7,37 @@ import json
 import os
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncGenerator, Optional
 
 from openai import AsyncOpenAI
 from .data_fetcher import collect_market_snapshot, format_market_data_for_prompt
 from .system_prompts import get_system_prompt
+
+
+def _get_latest_trade_date(ref_date: datetime) -> datetime:
+    """获取最近一个交易日。用 Tushare 交易日历，失败则用周末规则兜底。"""
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if token:
+        try:
+            import tushare as ts
+            ts.set_token(token)
+            pro = ts.pro_api()
+            start = (ref_date - timedelta(days=10)).strftime("%Y%m%d")
+            end = ref_date.strftime("%Y%m%d")
+            df = pro.trade_cal(exchange="SSE", start_date=start, end_date=end)
+            if df is not None and not df.empty:
+                trading_days = df[df["is_open"] == 1]["cal_date"].sort_values(ascending=False)
+                if len(trading_days) > 0:
+                    return datetime.strptime(str(trading_days.iloc[0]), "%Y%m%d")
+        except Exception:
+            pass
+
+    # 兜底：按周末规则
+    d = ref_date
+    while d.weekday() >= 5:  # 周六=5, 周日=6
+        d = d - timedelta(days=1)
+    return d
 
 # ── 意图关键词 ──
 
@@ -158,18 +183,26 @@ class MarketReviewAgent:
 
     async def _market_review(self, stream: bool):
         """全市场复盘。"""
-        # 1. 采集数据
-        today_str = datetime.now().strftime("%Y%m%d")
-        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
+        # 1. 确定有效的交易日期
+        today = datetime.now()
+        trade_date = _get_latest_trade_date(today)
 
-        snapshot = await collect_market_snapshot(date=today_str)
+        date_str = trade_date.strftime("%Y%m%d")
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][trade_date.weekday()]
+        date_display = trade_date.strftime("%Y年%m月%d日")
+
+        is_today = trade_date.strftime("%Y%m%d") == today.strftime("%Y%m%d")
+        date_note = "今日" if is_today else f"（今日为{today.strftime('%Y年%m月%d日')}，最新可用交易日数据为{date_display}）"
+
+        # 2. 采集数据
+        snapshot = await collect_market_snapshot(date=date_str)
         market_data = format_market_data_for_prompt(snapshot)
 
-        # 2. 构建 prompt
+        # 3. 构建 prompt
         system = get_system_prompt("market_review")
-        date_display = datetime.now().strftime("%Y年%m月%d日")
 
-        user_prompt = f"""今天是{date_display} {weekday}。
+        user_prompt = f"""今日日期：{today.strftime('%Y年%m月%d日')} {['周一','周二','周三','周四','周五','周六','周日'][today.weekday()]}
+数据日期：{date_display} {weekday}（最近可用交易日）{date_note}
 
 {market_data}
 
@@ -186,11 +219,14 @@ class MarketReviewAgent:
 
     async def _sector_deep_dive(self, sector: str, stream: bool):
         """单板块深度聚焦。"""
-        today_str = datetime.now().strftime("%Y%m%d")
-        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
+        today = datetime.now()
+        trade_date = _get_latest_trade_date(today)
+        date_str = trade_date.strftime("%Y%m%d")
+        weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][trade_date.weekday()]
+        date_display = trade_date.strftime("%Y年%m月%d日")
 
         # 采集全市场数据 + 板块深度数据
-        snapshot = await collect_market_snapshot(date=today_str, sector_focus=sector)
+        snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
         market_data = format_market_data_for_prompt(snapshot)
 
         # 额外板块数据
@@ -215,9 +251,8 @@ class MarketReviewAgent:
                 sector_extra += f"- {s['name']}: {s['pct_chg']:+.2f}%\n"
 
         system = get_system_prompt("sector_deep_dive", sector)
-        date_display = datetime.now().strftime("%Y年%m月%d日")
 
-        user_prompt = f"""今天是{date_display} {weekday}。
+        user_prompt = f"""数据日期：{date_display} {weekday}（最近可用交易日）。
 用户要求聚焦分析：**{sector}**板块。
 
 {market_data}
