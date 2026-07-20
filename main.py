@@ -204,6 +204,68 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/pipeline")
+async def debug_pipeline():
+    """测试完整数据采集管线。"""
+    from agent.orchestrator import _get_latest_trade_date
+    from datetime import datetime
+
+    today = datetime.now()
+    trade_date = _get_latest_trade_date(today)
+    date_str = trade_date.strftime("%Y%m%d")
+
+    # 运行实际数据采集
+    from agent.data_fetcher import (
+        fetch_a_share_indices, fetch_shenwan_sectors,
+        fetch_fund_flows, fetch_global_indices,
+        fetch_us_macro, fetch_cls_news,
+    )
+
+    results = {}
+
+    # A股指数
+    idx = fetch_a_share_indices(date_str)
+    results["indices"] = {
+        "date_used": date_str,
+        "count": len(idx),
+        "sample": dict(list(idx.items())[:3]) if idx else "EMPTY",
+    }
+
+    # 行业
+    sec = fetch_shenwan_sectors(date_str)
+    results["sectors"] = {
+        "count": len(sec),
+        "sample": sec[:3] if sec else "EMPTY",
+    }
+
+    # 资金
+    flow = fetch_fund_flows(date_str)
+    results["fund_flows"] = flow if flow else "EMPTY"
+
+    # 全球
+    gidx = fetch_global_indices()
+    results["global"] = {
+        "count": len(gidx),
+        "sample": dict(list(gidx.items())[:3]) if gidx else "EMPTY",
+    }
+
+    # 宏观
+    macro = fetch_us_macro()
+    results["macro"] = macro if macro else "EMPTY"
+
+    # 新闻
+    news = fetch_cls_news(5)
+    results["news_cls"] = f"{len(news)} items" if news else "EMPTY"
+
+    return {
+        "pipeline_test": results,
+        "dates": {
+            "today": today.strftime("%Y%m%d"),
+            "trade_date_used": date_str,
+        },
+    }
+
+
 @app.get("/debug/tushare")
 async def debug_tushare():
     """测试 Tushare API 连通性，返回详细错误信息。"""
