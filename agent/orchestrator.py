@@ -241,6 +241,12 @@ class MarketReviewAgent:
         self.model = "deepseek-chat"
         self._cache: dict = {}  # 行情数据缓存
 
+    @property
+    def cache_warm(self) -> bool:
+        """检查今日数据是否已缓存。"""
+        today = datetime.now().strftime("%Y%m%d")
+        return f"snapshot_{today}" in self._cache
+
     async def process_message(
         self, message: str, stream: bool = False
     ) -> dict | AsyncGenerator:
