@@ -289,21 +289,14 @@ class MarketReviewAgent:
             self._cache = {cache_key: snapshot}  # 每天只保留最新
         market_data = format_market_data_for_prompt(snapshot)
 
-        # 3. 构建 prompt
-        system = get_system_prompt("market_review")
+        # 3. 构建 prompt（日期注入系统提示词）
+        system = get_system_prompt("market_review").replace("[日期]", date_display)
 
-        user_prompt = f"""最新交易日：{date_display} {weekday}{date_note}
+        user_prompt = f"""交易日：{date_display} {weekday}{date_note}
 
 {market_data}
 
-请根据以上数据生成A股市场复盘报告。
-
-强制要求：
-- 报告标题日期必须用{date_display}，禁止用任何其他日期！
-- 提示词中所有新闻必须全部列出，一条不许漏，每条附原始时间+影响分析。
-- 31行业全部列出。
-
-数据缺失处标[UNSOURCED]，不编造。"""
+生成A股市场复盘。所有新闻全部列出。31行业全部列出。数据缺失标[UNSOURCED]。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -325,18 +318,14 @@ class MarketReviewAgent:
         market_data = format_market_data_for_prompt(snapshot)
 
         system = get_system_prompt("sector_deep_dive", sector)
+        # 把日期直接注入系统提示词，LLM无法忽略
+        system = system.replace("[日期]", date_display)
 
-        user_prompt = f"""数据对应交易日：{date_display} {weekday}。
-
-聚焦分析行业：{sector}
+        user_prompt = f"""交易日：{date_display} {weekday} | 行业：{sector}
 
 {market_data}
 
-请对{sector}板块深度分析。按系统提示词框架展开，充分利用成分股数据、资金流向数据。
-
-强制要求：
-- 报告标题日期必须用{date_display}，禁止使用任何其他日期
-- 相关新闻必须全部列出！不许筛选！不许省略！提示词里有多少条新闻就列多少条。每条附原始时间。"""
+深度分析{sector}板块。按系统提示词框架展开。所有新闻必须列出。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
