@@ -634,6 +634,25 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
                 for _, r in high_amp.head(5).iterrows()
             ]
 
+        # 3. 个股资金流向（top10，非阻塞：失败不影响主数据）
+        try:
+            top10 = daily_df.head(10)["ts_code"].tolist()
+            df_flow = pro.moneyflow(ts_code=",".join(top10), trade_date=date)
+            if df_flow is not None and not df_flow.empty:
+                buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
+                sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
+                buy_md = float(df_flow["buy_md_amount"].sum()) if "buy_md_amount" in df_flow.columns else 0
+                sell_md = float(df_flow["sell_md_amount"].sum()) if "sell_md_amount" in df_flow.columns else 0
+                buy_sm = float(df_flow["buy_sm_amount"].sum()) if "buy_sm_amount" in df_flow.columns else 0
+                sell_sm = float(df_flow["sell_sm_amount"].sum()) if "sell_sm_amount" in df_flow.columns else 0
+                result["fund_flow"] = {
+                    "lg_net": round((buy_lg - sell_lg) / 1e8, 2),
+                    "md_net": round((buy_md - sell_md) / 1e8, 2),
+                    "sm_net": round((buy_sm - sell_sm) / 1e8, 2),
+                }
+        except Exception:
+            pass
+
         return result
 
     except Exception:
@@ -1116,6 +1135,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
                 name = s.get("name", s["code"])
                 lines.append(f"  {name}({s['code']}) 振幅{s['amplitude']}% 涨跌{s['pct_chg']:+.2f}%")
 
+        if stock_detail.get("fund_flow"):
+            ff = stock_detail["fund_flow"]
+            lines.append(f"资金拆解（前10权重股）：大单净额{ff['lg_net']:+.2f}亿（机构） 中单净额{ff['md_net']:+.2f}亿（游资） 小单净额{ff['sm_net']:+.2f}亿（散户）")
         lines.append("")
 
     # ── 券商推荐 ──
