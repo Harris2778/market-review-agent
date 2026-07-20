@@ -171,8 +171,11 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
 
-        # 发送第一个 chunk（role）
+        # 立即发送 role chunk，防止连接超时
         yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+
+        # 发送"正在整理数据"提示
+        yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': '正在采集市场数据并生成分析报告，请稍候...\n\n'}, 'finish_reason': None}]})}\n\n"
 
         # 流式输出内容
         async for content_chunk in await agent.process_message(user_message, stream=True):
