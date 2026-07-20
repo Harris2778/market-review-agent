@@ -322,6 +322,30 @@ async def debug_macro():
     return {"macro_test": results}
 
 
+@app.get("/debug/news-count")
+async def debug_news_count():
+    """检查新闻数据是否进入了snapshot。"""
+    import asyncio
+    from datetime import datetime
+    from agent.data_fetcher import (
+        fetch_eastmoney_news, fetch_sina_news, fetch_eastmoney_news_page2
+    )
+    loop = asyncio.get_event_loop()
+    d1 = "2026-07-20"
+    d2 = "2026-07-19"
+    em1 = await loop.run_in_executor(None, fetch_eastmoney_news, 80)
+    em2 = await loop.run_in_executor(None, fetch_eastmoney_news_page2, 80)
+    sina1 = await loop.run_in_executor(None, fetch_sina_news, 30, d1)
+    sina2 = await loop.run_in_executor(None, fetch_sina_news, 30, d2)
+    return {
+        "em_p1": len(em1 or []),
+        "em_p2": len(em2 or []),
+        "sina_d1": len(sina1 or []),
+        "sina_d2": len(sina2 or []),
+        "total_sina": len(sina1 or []) + len(sina2 or []),
+    }
+
+
 @app.get("/debug/pipeline")
 async def debug_pipeline():
     """测试完整数据采集管线。"""
