@@ -313,7 +313,7 @@ class MarketReviewAgent:
         date_display = trade_date.strftime("%Y年%m月%d日")
 
         # 采集全市场数据 + 板块深度数据（带缓存）
-        cache_key = f"snapshot_{date_str}"
+        cache_key = f"snapshot_{date_str}_{sector}"
         if cache_key in self._cache:
             snapshot = self._cache[cache_key]
         else:
