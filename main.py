@@ -202,26 +202,6 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
         yield "data: [DONE]\n\n"
 
 
-# ── 图表端点 ──
-
-@app.get("/chart/sector-heatmap")
-async def chart_sector_heatmap():
-    """申万行业热力图。QuickChart.io 生成，零服务器开销。"""
-    from datetime import datetime
-    from agent.data_fetcher import fetch_shenwan_sectors
-    from agent.charts import sector_heatmap_url
-
-    date = datetime.now().strftime("%Y%m%d")
-    sectors = fetch_shenwan_sectors(date)
-    if not sectors:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"error": "行业数据不可用"}, status_code=503)
-
-    url = sector_heatmap_url(sectors, date)
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=url, status_code=302)
-
-
 # ── 调试端点 ──
 
 @app.get("/debug/macro")
