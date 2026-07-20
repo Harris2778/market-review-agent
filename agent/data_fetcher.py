@@ -405,6 +405,33 @@ def fetch_cls_telegraph(limit: int = 20) -> list:
 
 
 # ═══════════════════════════════════════════
+# 机构数据
+# ═══════════════════════════════════════════
+
+def fetch_broker_recommendations() -> list:
+    """获取本月券商推荐热度排名（前20只股票）。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+
+    this_month = datetime.now().strftime("%Y%m")
+    try:
+        df = pro.broker_recommend(month=this_month)
+        if df is not None and not df.empty:
+            # 统计每只股票被推荐次数
+            counts = df.groupby(["ts_code", "name"]).size().reset_index(name="count")
+            counts = counts.sort_values("count", ascending=False)
+            top = counts.head(20)
+            return [
+                {"code": r["ts_code"], "name": r["name"], "brokers": int(r["count"])}
+                for _, r in top.iterrows()
+            ]
+    except Exception:
+        pass
+    return []
+
+
+# ═══════════════════════════════════════════
 # 中国宏观数据
 # ═══════════════════════════════════════════
 
@@ -595,6 +622,9 @@ async def collect_market_snapshot(
     gidx = await loop.run_in_executor(None, fetch_global_indices)
     snapshot.global_indices = gidx
 
+    broker_recs = await loop.run_in_executor(None, fetch_broker_recommendations)
+    snapshot._broker_recs = broker_recs
+
     china_macro = await loop.run_in_executor(None, fetch_china_macro)
     us_macro = await loop.run_in_executor(None, fetch_us_macro)
     snapshot.macro_data = {
@@ -755,6 +785,14 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         for name, val in us.items():
             lines.append(f"- {name}: {val}")
     lines.append("")
+
+    # ── 券商推荐 ──
+    recs = getattr(snapshot, "_broker_recs", [])
+    if recs:
+        lines.append(f"### 本月券商推荐热度TOP20（共32家券商，{len(recs)}只最热股票）")
+        for r in recs:
+            lines.append(f"- {r['name']}({r['code']}) {r['brokers']}家券商推荐")
+        lines.append("")
 
     # ── 日历 ──
     if snapshot.calendar:
