@@ -1082,11 +1082,22 @@ async def collect_market_snapshot(
         "china": safe(results_raw.get("cn_macro"), {}),
         "us": safe(results_raw.get("us_macro"), {}),
     }
-    all_em = safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), [])
-    all_sina = safe(results_raw.get("sina"), []) + safe(results_raw.get("sina2"), [])
+    # 去重（用标题前60字做key）
+    def _dedup(items):
+        seen = set()
+        out = []
+        for it in items:
+            key = it.get("title", "")[:60]
+            if key not in seen:
+                seen.add(key)
+                out.append(it)
+        return out
+
+    all_em = _dedup(safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), []))
+    all_sina = _dedup(safe(results_raw.get("sina"), []) + safe(results_raw.get("sina2"), []))
     if sector_focus:
         all_em = filter_news_by_sector(all_em, sector_focus)
-        all_sina = filter_news_by_sector(all_sina, sector_focus)
+        # Sina已按日期过滤，不再按行业过滤，保留全部
     snapshot.news_items = {
         "eastmoney": all_em,
         "sina": all_sina,
