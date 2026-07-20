@@ -300,7 +300,10 @@ class MarketReviewAgent:
 - 新闻按S/A/B/C四级分类，级别标注要准确
 - 31个行业全部列出，不要只列前几名"""
 
-        return await self._call_llm(system, user_prompt, stream)
+        result = await self._call_llm(system, user_prompt, stream)
+        if not stream and isinstance(result, dict):
+            result["content"] += f"\n\n[行业热力图] https://market-review-agent-production.up.railway.app/chart/sector-heatmap"
+        return result
 
     async def _sector_deep_dive(self, sector: str, stream: bool):
         """单板块深度聚焦。"""
@@ -351,7 +354,10 @@ class MarketReviewAgent:
 
 请对{sector}板块进行7维度深度分析。先给出全市场概览（1-2句话+行业热力图），再按A-G七个维度逐一展开。"""
 
-        return await self._call_llm(system, user_prompt, stream)
+        result = await self._call_llm(system, user_prompt, stream)
+        if not stream and isinstance(result, dict):
+            result["content"] += f"\n\n[行业热力图] https://market-review-agent-production.up.railway.app/chart/sector-heatmap"
+        return result
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False
