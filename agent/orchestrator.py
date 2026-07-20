@@ -322,8 +322,8 @@ class MarketReviewAgent:
         market_data = format_market_data_for_prompt(snapshot)
 
         system = get_system_prompt("sector_deep_dive", sector)
-        # 把日期直接注入系统提示词，LLM无法忽略
-        system = system.replace("[日期]", date_display)
+        # 注入日期和板块名
+        system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
         user_prompt = f"""交易日：{date_display} {weekday} | 行业：{sector}
 
