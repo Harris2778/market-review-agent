@@ -368,8 +368,8 @@ class MarketReviewAgent:
             completion = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0.3,
-                max_tokens=16384,
+                temperature=0.2,
+                max_tokens=8192,
             )
             raw = completion.choices[0].message.content
             return {
@@ -382,8 +382,8 @@ class MarketReviewAgent:
         stream = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.3,
-            max_tokens=16384,
+            temperature=0.2,
+            max_tokens=8192,
             stream=True,
         )
         async for chunk in stream:
