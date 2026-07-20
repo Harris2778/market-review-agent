@@ -33,7 +33,17 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.orchestrator import get_agent, detect_intent
+import traceback
+
+try:
+    from agent.orchestrator import get_agent, detect_intent
+    _agent_loaded = True
+    _agent_error = None
+except Exception as e:
+    _agent_loaded = False
+    _agent_error = traceback.format_exc()
+    get_agent = None
+    detect_intent = None
 
 # ── 配置 ──
 
@@ -82,12 +92,15 @@ def verify_api_key(request: Request) -> None:
 @app.get("/")
 async def root():
     """服务健康检查。"""
-    return {
+    result = {
         "service": AGENT_NAME,
         "version": AGENT_VERSION,
-        "status": "running",
+        "status": "running" if _agent_loaded else "error",
         "time": datetime.now().isoformat(),
     }
+    if not _agent_loaded:
+        result["error"] = _agent_error[-500:] if _agent_error else "unknown"
+    return result
 
 
 @app.get("/v1/models")
@@ -131,6 +144,9 @@ async def chat_completions(request: Request):
 
     user_message = messages[-1].get("content", "") if messages else ""
     stream = body.get("stream", False)
+
+    if not _agent_loaded:
+        raise HTTPException(status_code=503, detail=f"智能体加载失败: {_agent_error[-200:] if _agent_error else 'unknown'}")
 
     agent = get_agent()
 
