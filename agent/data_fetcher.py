@@ -564,6 +564,44 @@ def aggregate_northbound_by_sector(holdings: list) -> dict:
     return dict(sorted_sectors[:15])
 
 
+def fetch_sector_volume_all(date: str) -> dict:
+    """全市场31行业成交额（成分股合计口径）。一次API拉全部个股。"""
+    pro = _get_pro()
+    if not pro:
+        return {}
+
+    _load_stock_names()
+    result = {}
+
+    try:
+        # 一次拉全部个股日线
+        df = pro.daily(trade_date=date)
+        if df is None or df.empty:
+            return result
+
+        # 按行业聚合
+        sector_amount = {}
+        sector_vol = {}
+        for _, row in df.iterrows():
+            code = row["ts_code"]
+            sector = _stock_sector_cache.get(code, "")
+            if not sector:
+                continue
+            amt = float(row.get("amount", 0) or 0) / 1e8  # 元→亿
+            vol = float(row.get("vol", 0) or 0) / 10000    # 手→万手
+            sector_amount[sector] = sector_amount.get(sector, 0) + amt
+            sector_vol[sector] = sector_vol.get(sector, 0) + vol
+
+        for sector in sector_amount:
+            result[sector] = {
+                "amount": round(sector_amount[sector], 2),
+                "vol": round(sector_vol[sector], 2),
+            }
+    except Exception:
+        pass
+    return result
+
+
 def fetch_shibor() -> dict:
     """SHIBOR利率（国内流动性指标）。"""
     pro = _get_pro()
@@ -1035,6 +1073,7 @@ async def collect_market_snapshot(
     snapshot._shibor = safe(results_raw.get("shibor"), {})
     snapshot._north_hold = safe(results_raw.get("north"), [])
     snapshot._north_sector = aggregate_northbound_by_sector(snapshot._north_hold)
+    snapshot._sector_volumes = await loop.run_in_executor(None, fetch_sector_volume_all, date)
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1106,8 +1145,10 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
                 parts.append(f"站上{above}/3均线")
             if s.get("open") and s["open"] > 0:
                 parts.append(f"开{s['open']:.2f}高{s.get('high',0):.2f}低{s.get('low',0):.2f}")
-            if s.get("vol") and s["vol"] > 0:
-                parts.append(f"量{s['vol']:.0f}万手")
+            # 成分股合计成交额
+            sec_vols = getattr(snapshot, "_sector_volumes", {})
+            if s["name"] in sec_vols:
+                parts.append(f"成交{sec_vols[s['name']]['amount']:.0f}亿")
             lines.append("  ".join(parts))
     else:
         lines.append("### 申万行业\n[Tushare未配置]")
