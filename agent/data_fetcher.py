@@ -83,17 +83,36 @@ def fetch_a_share_indices(date: str) -> dict:
     return result
 
 
+# 申万一级31行业指数代码
+SW_SECTOR_CODES = {
+    "801010.SI": "农林牧渔", "801020.SI": "采掘", "801030.SI": "化工",
+    "801040.SI": "钢铁", "801050.SI": "有色金属", "801080.SI": "电子",
+    "801110.SI": "家用电器", "801120.SI": "食品饮料", "801130.SI": "纺织服装",
+    "801140.SI": "轻工制造", "801150.SI": "医药生物", "801160.SI": "公用事业",
+    "801170.SI": "交通运输", "801180.SI": "房地产", "801200.SI": "商业贸易",
+    "801210.SI": "休闲服务", "801230.SI": "综合", "801710.SI": "建筑材料",
+    "801720.SI": "建筑装饰", "801730.SI": "电气设备", "801740.SI": "国防军工",
+    "801750.SI": "计算机", "801760.SI": "传媒", "801770.SI": "通信",
+    "801780.SI": "银行", "801790.SI": "非银金融", "801880.SI": "汽车",
+    "801890.SI": "机械设备", "801950.SI": "煤炭", "801960.SI": "石油石化",
+    "801970.SI": "环保",
+}
+
+
 def fetch_shenwan_sectors(date: str) -> list:
-    """获取申万一级31行业涨跌幅。"""
+    """获取申万一级31行业涨跌幅。用 index_daily 接口（免费版也可用）。"""
     pro = _get_tushare_pro()
     if not pro:
         return []
 
+    # 方式1: 用 index_daily 批量查申万行业指数（单次调用）
     try:
-        df = pro.sw_daily(trade_date=date)
+        all_codes = ",".join(SW_SECTOR_CODES.keys())
+        df = pro.index_daily(ts_code=all_codes, start_date=date, end_date=date)
         if df is not None and not df.empty:
             sectors = []
             for _, row in df.iterrows():
+                name = SW_SECTOR_CODES.get(row["ts_code"], row["ts_code"])
                 pct = round(float(row["pct_chg"]), 2)
                 if pct > 2:
                     tag = "强势"
@@ -105,11 +124,26 @@ def fetch_shenwan_sectors(date: str) -> list:
                     tag = "偏弱"
                 else:
                     tag = "弱势"
+                sectors.append({"name": name, "pct_chg": pct, "tag": tag})
+            sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
+            return sectors
+    except Exception:
+        pass
+
+    # 方式2: 尝试 sw_daily（需要更高权限）
+    try:
+        df = pro.sw_daily(trade_date=date)
+        if df is not None and not df.empty:
+            sectors = []
+            for _, row in df.iterrows():
+                pct = round(float(row["pct_chg"]), 2)
+                tag = "强势" if pct > 2 else "偏强" if pct > 1 else "中性" if pct >= -1 else "偏弱" if pct >= -2 else "弱势"
                 sectors.append({"name": row["sw_name"], "pct_chg": pct, "tag": tag})
             sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
             return sectors
     except Exception:
         pass
+
     return []
 
 
