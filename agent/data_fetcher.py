@@ -640,18 +640,17 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         try:
             df_flow = pro.moneyflow(ts_code=",".join(top10_codes), trade_date=date)
             if df_flow is not None and not df_flow.empty:
-                # 大单/中单/小单拆解
-            buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
-            sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
-            buy_md = float(df_flow["buy_md_amount"].sum()) if "buy_md_amount" in df_flow.columns else 0
-            sell_md = float(df_flow["sell_md_amount"].sum()) if "sell_md_amount" in df_flow.columns else 0
-            buy_sm = float(df_flow["buy_sm_amount"].sum()) if "buy_sm_amount" in df_flow.columns else 0
-            sell_sm = float(df_flow["sell_sm_amount"].sum()) if "sell_sm_amount" in df_flow.columns else 0
-            result["fund_flow"] = {
-                "lg_net": round((buy_lg - sell_lg) / 1e8, 2),
-                "md_net": round((buy_md - sell_md) / 1e8, 2),
-                "sm_net": round((buy_sm - sell_sm) / 1e8, 2),
-            }
+                buy_lg = float(df_flow["buy_lg_amount"].sum()) if "buy_lg_amount" in df_flow.columns else 0
+                sell_lg = float(df_flow["sell_lg_amount"].sum()) if "sell_lg_amount" in df_flow.columns else 0
+                buy_md = float(df_flow["buy_md_amount"].sum()) if "buy_md_amount" in df_flow.columns else 0
+                sell_md = float(df_flow["sell_md_amount"].sum()) if "sell_md_amount" in df_flow.columns else 0
+                buy_sm = float(df_flow["buy_sm_amount"].sum()) if "buy_sm_amount" in df_flow.columns else 0
+                sell_sm = float(df_flow["sell_sm_amount"].sum()) if "sell_sm_amount" in df_flow.columns else 0
+                result["fund_flow"] = {
+                    "lg_net": round((buy_lg - sell_lg) / 1e8, 2),
+                    "md_net": round((buy_md - sell_md) / 1e8, 2),
+                    "sm_net": round((buy_sm - sell_sm) / 1e8, 2),
+                }
         except Exception:
             pass
 
