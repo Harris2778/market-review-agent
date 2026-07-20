@@ -316,8 +316,37 @@ def fetch_finnhub_news(limit: int = 10) -> list:
     return items
 
 
+def fetch_sina_news(limit: int = 20) -> list:
+    """新浪财经滚动新闻（免费RSS，无需API Key，稳定）。"""
+    items = []
+    try:
+        import re
+        url = "https://feed.mix.sina.com.cn/api/roll/get"
+        params = {"pageid": 153, "lid": 2509, "k": "", "num": limit, "page": 1}
+        resp = requests.get(url, params=params, timeout=15,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+        for item in data.get("result", {}).get("data", [])[:limit]:
+            title = re.sub(r'<[^>]+>', '', item.get("title", ""))
+            ctime_raw = item.get("ctime", "")
+            # 时间戳转可读格式
+            try:
+                ts = int(ctime_raw)
+                time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
+            except Exception:
+                time_str = str(ctime_raw)
+            items.append({
+                "source": "新浪财经",
+                "time": time_str,
+                "title": title[:150],
+            })
+    except Exception:
+        pass
+    return items
+
+
 def fetch_cls_telegraph(limit: int = 20) -> list:
-    """财联社电报（免费爬虫，备用）。"""
+    """财联社电报（备用）。"""
     items = []
     try:
         resp = requests.post(
@@ -459,11 +488,13 @@ async def collect_market_snapshot(
     macro = await loop.run_in_executor(None, fetch_us_macro)
     snapshot.macro_data = macro
 
-    # 新闻：Tushare 新闻 → 财联社电报 → Finnhub
+    # 新闻：新浪财经 → Tushare → 财联社 → Finnhub（多源互备）
+    sina = await loop.run_in_executor(None, fetch_sina_news, 20)
     ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
     cls_news = await loop.run_in_executor(None, fetch_cls_telegraph, 15)
     fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 8)
     snapshot.news_items = {
+        "sina": sina,
         "ts_news": ts_news,
         "cls_telegraph": cls_news,
         "global": fh_news,
@@ -543,10 +574,17 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- 融资余额: {snapshot.fund_flows['margin_bal']:.2f}亿")
     lines.append("")
 
+    # ── 新浪财经新闻 ──
+    sina = snapshot.news_items.get("sina", [])
+    if sina:
+        lines.append(f"### 新浪财经滚动新闻（共{len(sina)}条）")
+        for item in sina[:15]:
+            lines.append(f"- [{item['time']}] {item['title']}")
+
     # ── Tushare 新闻 ──
     ts_news = snapshot.news_items.get("ts_news", [])
     if ts_news:
-        lines.append(f"### 财联社新闻（Tushare，共{len(ts_news)}条）")
+        lines.append(f"\n### 财联社新闻（Tushare，共{len(ts_news)}条）")
         for item in ts_news[:20]:
             lines.append(f"- [{item['time']}] {item['title']}")
             if item.get("content"):
