@@ -136,25 +136,30 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     """
     msg = message.strip()
 
-    # 先检查是不是全市场复盘
+    # 先提取行业名（如果有的话，优先判定为板块聚焦）
+    sector = _extract_sector(msg)
+
+    # 如果明确有聚焦关键词 + 行业 → 板块聚焦
+    for sk in SECTOR_KEYWORDS:
+        if sk in msg and sector:
+            return ("sector_deep_dive", sector)
+
+    # 如果提到行业名 + 复盘/回顾类关键词 → 板块聚焦（行业名优先级高于全市场）
+    if sector:
+        for kw in MARKET_REVIEW_KEYWORDS:
+            if kw in msg:
+                return ("sector_deep_dive", sector)
+        for pattern in MARKET_REVIEW_PATTERNS:
+            if re.search(pattern, msg):
+                return ("sector_deep_dive", sector)
+
+    # 全市场复盘
     for kw in MARKET_REVIEW_KEYWORDS:
         if kw in msg:
-            # 但如果同时有行业关键词，则可能是聚焦模式
-            for sector_keyword in SECTOR_KEYWORDS:
-                if sector_keyword in msg:
-                    # 尝试提取行业名
-                    sector = _extract_sector(msg)
-                    if sector:
-                        return ("sector_deep_dive", sector)
             return ("market_review", None)
 
     for pattern in MARKET_REVIEW_PATTERNS:
         if re.search(pattern, msg):
-            for sector_keyword in SECTOR_KEYWORDS:
-                if sector_keyword in msg:
-                    sector = _extract_sector(msg)
-                    if sector:
-                        return ("sector_deep_dive", sector)
             return ("market_review", None)
 
     # 检查是不是单板块聚焦
@@ -164,9 +169,12 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
-    # 直接提行业名 + 问怎么样/复盘
+    # 直接提行业名 + 问怎么样/复盘/回顾/相关新闻/情况
     for kw, sw_name in SECTOR_NAME_MAP.items():
-        if kw in msg and any(w in msg for w in ["怎么样", "复盘", "分析", "走势", "行情", "表现"]):
+        if kw in msg and any(w in msg for w in [
+            "怎么样", "复盘", "分析", "走势", "行情", "表现",
+            "回顾", "情况", "相关", "新闻", "动态", "看看",
+        ]):
             return ("sector_deep_dive", sw_name)
 
     return ("general_chat", None)

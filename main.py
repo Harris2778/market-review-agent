@@ -23,7 +23,7 @@ import os
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -200,6 +200,40 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
         }
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
+
+
+# ── 图表端点 ──
+
+@app.get("/chart/sector-heatmap")
+async def chart_sector_heatmap():
+    """生成申万行业热力图 PNG。"""
+    from datetime import datetime
+    from agent.data_fetcher import fetch_shenwan_sectors, _get_pro
+    from agent.charts import sector_heatmap
+
+    # 获取最近交易日
+    pro = _get_pro()
+    date = datetime.now().strftime("%Y%m%d")
+    if pro:
+        try:
+            start = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+            df = pro.trade_cal(exchange="SSE", start_date=start, end_date=date)
+            if df is not None and not df.empty:
+                trading = df[df["is_open"] == 1]["cal_date"].sort_values(ascending=False)
+                if len(trading) > 0:
+                    date = str(trading.iloc[0])
+        except Exception:
+            pass
+
+    sectors = fetch_shenwan_sectors(date)
+    img_b64 = sector_heatmap(sectors, date)
+    if not img_b64:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "数据不可用"}, status_code=503)
+
+    from fastapi.responses import Response
+    import base64
+    return Response(content=base64.b64decode(img_b64), media_type="image/png")
 
 
 # ── 调试端点 ──
