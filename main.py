@@ -229,6 +229,22 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/sina-news")
+async def debug_sina_news():
+    """测试新浪历史新闻是否能拉取。"""
+    from agent.data_fetcher import fetch_sina_news
+    d1 = "2026-07-20"
+    d2 = "2026-07-19"
+    items1 = fetch_sina_news(30, d1)
+    items2 = fetch_sina_news(30, d2)
+    return {
+        "d1_count": len(items1),
+        "d2_count": len(items2),
+        "d1_sample": [i["title"][:60] for i in items1[:3]],
+        "d2_sample": [i["title"][:60] for i in items2[:3]],
+    }
+
+
 @app.get("/debug/sector-stocks")
 async def debug_sector_stocks(sector: str = "食品饮料"):
     """测试板块成分股数据获取。"""
