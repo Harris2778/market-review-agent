@@ -900,29 +900,35 @@ async def collect_market_snapshot(
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
 
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    results = dict(zip(tasks.keys(), results))
+    gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results_raw = dict(zip(tasks.keys(), gathered))
 
-    snapshot.indices = results.get("indices", {}) or {}
-    snapshot.sectors = results.get("sectors", []) or []
-    snapshot.fund_flows = results.get("flows", {}) or {}
-    snapshot.global_indices = results.get("gidx", {}) or {}
-    snapshot._broker_recs = results.get("broker", []) or []
-    snapshot._commodities = results.get("comm", {}) or {}
-    snapshot._shibor = results.get("shibor", {}) or {}
-    snapshot._north_hold = results.get("north", []) or []
-    snapshot._top_list = results.get("toplist", []) or []
+    def safe(v, default):
+        """如果结果是异常或None，返回默认值。"""
+        if isinstance(v, Exception) or v is None:
+            return default
+        return v
+
+    snapshot.indices = safe(results_raw.get("indices"), {})
+    snapshot.sectors = safe(results_raw.get("sectors"), [])
+    snapshot.fund_flows = safe(results_raw.get("flows"), {})
+    snapshot.global_indices = safe(results_raw.get("gidx"), {})
+    snapshot._broker_recs = safe(results_raw.get("broker"), [])
+    snapshot._commodities = safe(results_raw.get("comm"), {})
+    snapshot._shibor = safe(results_raw.get("shibor"), {})
+    snapshot._north_hold = safe(results_raw.get("north"), [])
+    snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
-        "china": results.get("cn_macro", {}) or {},
-        "us": results.get("us_macro", {}) or {},
+        "china": safe(results_raw.get("cn_macro"), {}),
+        "us": safe(results_raw.get("us_macro"), {}),
     }
     snapshot.news_items = {
-        "eastmoney": results.get("em_news", []) or [],
-        "global": results.get("fh_news", []) or [],
+        "eastmoney": safe(results_raw.get("em_news"), []),
+        "global": safe(results_raw.get("fh_news"), []),
     }
-    snapshot.calendar = results.get("calendar", []) or []
+    snapshot.calendar = safe(results_raw.get("calendar"), [])
     if sector_focus:
-        snapshot._stock_detail = results.get("stock") or None
+        snapshot._stock_detail = safe(results_raw.get("stock"), None)
 
     return snapshot
 
