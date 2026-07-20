@@ -405,6 +405,78 @@ def fetch_cls_telegraph(limit: int = 20) -> list:
 
 
 # ═══════════════════════════════════════════
+# 龙虎榜 + 北向持仓 + SHIBOR
+# ═══════════════════════════════════════════
+
+def fetch_top_list(date: str) -> list:
+    """龙虎榜数据：机构/游资在哪些板块活跃。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    items = []
+    try:
+        df = pro.top_list(trade_date=date)
+        if df is not None and not df.empty:
+            for _, r in df.iterrows():
+                items.append({
+                    "name": str(r.get("name", "")),
+                    "code": str(r.get("ts_code", "")),
+                    "pct_chg": round(float(r.get("pct_change", 0)), 2),
+                    "net_amount": round(float(r.get("net_amount", 0)) / 1e8, 2),
+                    "l_buy": round(float(r.get("l_buy", 0)) / 1e8, 2),
+                    "l_sell": round(float(r.get("l_sell", 0)) / 1e8, 2),
+                    "reason": str(r.get("reason", ""))[:100],
+                })
+    except Exception:
+        pass
+    return items
+
+
+def fetch_north_holdings() -> list:
+    """北向资金持仓TOP20（按持股市值排序）。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    items = []
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        df = pro.hk_hold(trade_date=today)
+        if df is not None and not df.empty:
+            df = df.sort_values("vol", ascending=False)
+            for _, r in df.head(20).iterrows():
+                items.append({
+                    "name": str(r.get("name", "")),
+                    "code": str(r.get("ts_code", "")),
+                    "vol": round(float(r.get("vol", 0)) / 1e8, 2),
+                    "ratio": round(float(r.get("ratio", 0)), 2),
+                })
+    except Exception:
+        pass
+    return items
+
+
+def fetch_shibor() -> dict:
+    """SHIBOR利率（国内流动性指标）。"""
+    pro = _get_pro()
+    if not pro:
+        return {}
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        df = pro.shibor(start_date=today, end_date=today)
+        if df is not None and not df.empty:
+            r = df.iloc[0]
+            return {
+                "隔夜": f"{float(r['on']):.4f}%",
+                "1周": f"{float(r['1w']):.4f}%",
+                "1月": f"{float(r['1m']):.4f}%",
+                "3月": f"{float(r['3m']):.4f}%",
+            }
+    except Exception:
+        pass
+    return {}
+
+
+# ═══════════════════════════════════════════
 # 机构数据
 # ═══════════════════════════════════════════
 
@@ -816,6 +888,15 @@ async def collect_market_snapshot(
     comm = await loop.run_in_executor(None, fetch_commodities_and_fx)
     snapshot._commodities = comm
 
+    shibor = await loop.run_in_executor(None, fetch_shibor)
+    snapshot._shibor = shibor
+
+    north_hold = await loop.run_in_executor(None, fetch_north_holdings)
+    snapshot._north_hold = north_hold
+
+    top_list = await loop.run_in_executor(None, fetch_top_list, date)
+    snapshot._top_list = top_list
+
     # 板块个股数据（仅板块聚焦模式）
     stock_detail = None
     if sector_focus:
@@ -977,12 +1058,41 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- {name}: {val}")
         lines.append("")
 
+    # ── SHIBOR ──
+    shibor = getattr(snapshot, "_shibor", {})
+    if shibor:
+        lines.append("### 国内流动性（SHIBOR）")
+        lines.append(f"隔夜{shibor['隔夜']} 1周{shibor['1周']} 1月{shibor['1月']} 3月{shibor['3月']}")
+        lines.append("")
+
     # ── 商品 + 汇率 ──
     comm = getattr(snapshot, "_commodities", {})
     if comm:
         lines.append("### 商品期货与汇率")
         for name, d in comm.items():
             lines.append(f"- {name}: {d['close']} {d['pct_chg']:+.2f}%")
+        lines.append("")
+
+    # ── 龙虎榜 ──
+    top_list = getattr(snapshot, "_top_list", [])
+    if top_list:
+        lines.append(f"### 龙虎榜活跃股（共{len(top_list)}只上榜）")
+        inst = [t for t in top_list if t['l_buy'] > t['l_sell']]
+        retail = [t for t in top_list if t['l_buy'] < t['l_sell']]
+        if inst:
+            names = ", ".join(f"{t['name']}(净买入{t['net_amount']:+.1f}亿)" for t in inst[:10])
+            lines.append(f"机构净买入: {names}")
+        if retail:
+            names = ", ".join(f"{t['name']}(净卖出{abs(t['net_amount']):.1f}亿)" for t in retail[:10])
+            lines.append(f"机构净卖出: {names}")
+        lines.append("")
+
+    # ── 北向持仓TOP ──
+    north_h = getattr(snapshot, "_north_hold", [])
+    if north_h:
+        lines.append("### 北向资金持仓TOP20")
+        for h in north_h[:15]:
+            lines.append(f"- {h['name']}({h['code']}) 持仓{h['vol']}亿 占比{h['ratio']}%")
         lines.append("")
 
     # ── 美国宏观 ──
