@@ -355,9 +355,10 @@ class MarketReviewAgent:
                 max_tokens=12288,
             )
             raw = completion.choices[0].message.content
+            disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
             return {
                 "role": "assistant",
-                "content": _clean_markdown(raw),
+                "content": _clean_markdown(raw) + disclaimer,
             }
 
     async def _stream_response(self, messages: list) -> AsyncGenerator:
