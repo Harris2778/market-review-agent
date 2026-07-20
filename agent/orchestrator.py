@@ -296,9 +296,14 @@ class MarketReviewAgent:
 
 {market_data}
 
-请根据以上数据生成A股市场复盘报告。报告日期使用{date_display}（数据对应的交易日），不要使用其他日期。严格按照系统提示词中的格式输出。
+请根据以上数据生成A股市场复盘报告。
 
-注意：数据缺失处标[UNSOURCED]不编造。新闻全部呈现并附分析。31行业全部列出。"""
+强制要求：
+- 报告标题日期必须用{date_display}，禁止用任何其他日期！
+- 提示词中所有新闻必须全部列出，一条不许漏，每条附原始时间+影响分析。
+- 31行业全部列出。
+
+数据缺失处标[UNSOURCED]，不编造。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -327,7 +332,11 @@ class MarketReviewAgent:
 
 {market_data}
 
-请对{sector}板块深度分析。按系统提示词框架展开，充分利用成分股数据、资金流向数据。报告日期使用{date_display}。"""
+请对{sector}板块深度分析。按系统提示词框架展开，充分利用成分股数据、资金流向数据。
+
+强制要求：
+- 报告标题日期必须用{date_display}，禁止使用任何其他日期
+- 相关新闻必须全部列出！不许筛选！不许省略！提示词里有多少条新闻就列多少条。每条附原始时间。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
