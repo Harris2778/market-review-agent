@@ -210,6 +210,38 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/derivatives")
+async def debug_derivatives():
+    """测试衍生品数据权限。"""
+    token = os.getenv("TUSHARE_TOKEN", "")
+    if not token:
+        return {"status": "no_token"}
+
+    import tushare as ts
+    ts.set_token(token)
+    pro = ts.pro_api()
+    results = {}
+
+    tests = [
+        ("opt_daily", lambda: pro.opt_daily(trade_date="20260718")),
+        ("opt_basic", lambda: pro.opt_basic(exchange="SSE")),
+        ("fut_daily", lambda: pro.fut_daily(trade_date="20260718")),
+        ("fut_holding", lambda: pro.fut_holding(trade_date="20260718")),
+    ]
+
+    for name, fn in tests:
+        try:
+            df = fn()
+            if df is not None and not df.empty:
+                results[name] = {"status": "ok", "rows": len(df), "cols": list(df.columns)[:8]}
+            else:
+                results[name] = {"status": "empty"}
+        except Exception as e:
+            results[name] = {"status": "fail", "error": str(e)[:120]}
+
+    return {"derivatives": results}
+
+
 @app.get("/debug/macro")
 async def debug_macro():
     """测试 Tushare 宏观数据 + 个股基本面接口权限。"""
