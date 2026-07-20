@@ -202,25 +202,25 @@ def fetch_sector_detail(sector_name: str, date: str) -> dict:
 # ── Finnhub: 全球指数 ──
 
 def fetch_global_indices() -> dict:
-    """获取全球主要指数行情。"""
-    if not _token("FINNHUB_API_KEY"):
-        return {}
-
+    """获取全球主要指数行情。用 yfinance（免费，无需API Key）。"""
     result = {}
-    indices = {
-        "^GSPC": "标普500", "^DJI": "道琼斯工业", "^IXIC": "纳斯达克",
-        "^HSI": "恒生指数", "^N225": "日经225", "^FTSE": "富时100",
-    }
+    # (yfinance代码, 显示名)
+    indices = [
+        ("^GSPC", "标普500"), ("^DJI", "道琼斯工业"), ("^IXIC", "纳斯达克"),
+        ("^HSI", "恒生指数"), ("^N225", "日经225"), ("^FTSE", "富时100"),
+        ("EURUSD=X", "欧元/美元"),
+    ]
     try:
-        import finnhub
-        client = finnhub.Client(api_key=_token("FINNHUB_API_KEY"))
-        for symbol, name in indices.items():
+        import yfinance as yf
+        for symbol, name in indices:
             try:
-                quote = client.quote(symbol)
-                if quote and quote.get("c"):
-                    prev = quote.get("pc", quote["c"])
-                    pct = round((quote["c"] - prev) / prev * 100, 2) if prev else 0
-                    result[name] = {"close": round(quote["c"], 2), "pct_chg": pct}
+                t = yf.Ticker(symbol)
+                hist = t.history(period="2d")
+                if hist is not None and len(hist) >= 1:
+                    close = round(float(hist["Close"].iloc[-1]), 2)
+                    prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else close
+                    pct = round((close - prev) / prev * 100, 2) if prev else 0
+                    result[name] = {"close": close, "pct_chg": pct}
             except Exception:
                 pass
     except Exception:
