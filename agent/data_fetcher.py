@@ -18,12 +18,10 @@ from dataclasses import dataclass, field
 import requests
 import pandas as pd
 
-# ── 配置 ──
+# ── 配置（运行时读取，非导入时） ──
 
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "")
+def _token(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
 
 
 @dataclass
@@ -44,11 +42,11 @@ class MarketSnapshot:
 
 def _get_tushare_pro():
     """获取 Tushare Pro 连接。"""
-    if not TUSHARE_TOKEN:
+    if not _token("TUSHARE_TOKEN"):
         return None
     try:
         import tushare as ts
-        ts.set_token(TUSHARE_TOKEN)
+        ts.set_token(_token("TUSHARE_TOKEN"))
         return ts.pro_api()
     except Exception:
         return None
@@ -211,7 +209,7 @@ def fetch_sector_detail(sector_name: str, date: str) -> dict:
 
 def fetch_global_indices() -> dict:
     """获取全球主要指数行情。"""
-    if not FINNHUB_API_KEY:
+    if not _token("FINNHUB_API_KEY"):
         return {}
 
     result = {}
@@ -221,7 +219,7 @@ def fetch_global_indices() -> dict:
     }
     try:
         import finnhub
-        client = finnhub.Client(api_key=FINNHUB_API_KEY)
+        client = finnhub.Client(api_key=_token("FINNHUB_API_KEY"))
         for symbol, name in indices.items():
             try:
                 quote = client.quote(symbol)
@@ -240,7 +238,7 @@ def fetch_global_indices() -> dict:
 
 def fetch_us_macro() -> dict:
     """获取美国关键宏观数据。"""
-    if not FRED_API_KEY:
+    if not _token("FRED_API_KEY"):
         return {}
 
     result = {}
@@ -251,7 +249,7 @@ def fetch_us_macro() -> dict:
     }
     try:
         from fredapi import Fred
-        fred = Fred(api_key=FRED_API_KEY)
+        fred = Fred(api_key=_token("FRED_API_KEY"))
         today = datetime.now().strftime("%Y-%m-%d")
         for sid, name in series.items():
             try:
@@ -297,13 +295,13 @@ def fetch_cls_news(limit: int = 20) -> list:
 
 def fetch_finnhub_news(limit: int = 10) -> list:
     """从 Finnhub 获取全球财经新闻。免费层60次/分钟。"""
-    if not FINNHUB_API_KEY:
+    if not _token("FINNHUB_API_KEY"):
         return []
 
     items = []
     try:
         import finnhub
-        client = finnhub.Client(api_key=FINNHUB_API_KEY)
+        client = finnhub.Client(api_key=_token("FINNHUB_API_KEY"))
         news = client.general_news("general", min_id=0)
         for item in news[:limit]:
             items.append({
@@ -321,7 +319,7 @@ def fetch_finnhub_news(limit: int = 10) -> list:
 def search_financial_news(query: str, limit: int = 8) -> list:
     """搜索金融新闻。用 Brave Search API（免费2000次/月）或降级到公开源。"""
     items = []
-    if BRAVE_SEARCH_API_KEY:
+    if _token("BRAVE_SEARCH_API_KEY"):
         try:
             resp = requests.get(
                 "https://api.search.brave.com/res/v1/web/search",
@@ -329,7 +327,7 @@ def search_financial_news(query: str, limit: int = 8) -> list:
                 headers={
                     "Accept": "application/json",
                     "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+                    "X-Subscription-Token": _token("BRAVE_SEARCH_API_KEY"),
                 },
                 timeout=15,
             )
