@@ -176,7 +176,8 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
         # 显示预计等待时间
         warm = agent.cache_warm
-        hint = "数据已就绪，正在生成分析报告，约需15-30秒...\n\n" if warm else "正在从7个数据源采集行情与新闻（首次约需30-40秒），请稍候...\n\n"
+        seconds = "15-30" if warm else "30-40"
+        hint = f"正在采集市场数据并生成分析报告，请稍候..（{'首次' if not warm else ''}约需{seconds}秒）\n\n"
         yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': hint}, 'finish_reason': None}]})}\n\n"
 
         # 流式输出内容
