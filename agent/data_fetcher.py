@@ -316,8 +316,36 @@ def fetch_finnhub_news(limit: int = 10) -> list:
     return items
 
 
+def fetch_eastmoney_news(limit: int = 25) -> list:
+    """东方财富 7x24 实时快讯（免费，质量高，带完整摘要）。"""
+    items = []
+    try:
+        import uuid as _uuid
+        url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+        params = {
+            "client": "web", "biz": "fastnews", "fastColumn": "102",
+            "sortEnd": "", "pageSize": limit, "pageIndex": 1,
+            "req_trace": str(_uuid.uuid4()).replace("-", "")[:32],
+        }
+        resp = requests.get(url, params=params, timeout=15,
+                          headers={"User-Agent": "Mozilla/5.0",
+                                   "Referer": "https://www.eastmoney.com/"})
+        data = resp.json()
+        news_list = data.get("data", {}).get("fastNewsList", [])
+        for item in news_list[:limit]:
+            items.append({
+                "source": "东方财富",
+                "time": item.get("showTime", ""),
+                "title": item.get("title", "")[:150],
+                "summary": item.get("summary", "")[:300] if item.get("summary") else "",
+            })
+    except Exception:
+        pass
+    return items
+
+
 def fetch_sina_news(limit: int = 20) -> list:
-    """新浪财经滚动新闻（免费RSS，无需API Key，稳定）。"""
+    """新浪财经滚动新闻（备用）。"""
     items = []
     try:
         import re
@@ -329,7 +357,6 @@ def fetch_sina_news(limit: int = 20) -> list:
         for item in data.get("result", {}).get("data", [])[:limit]:
             title = re.sub(r'<[^>]+>', '', item.get("title", ""))
             ctime_raw = item.get("ctime", "")
-            # 时间戳转可读格式
             try:
                 ts = int(ctime_raw)
                 time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
@@ -488,15 +515,15 @@ async def collect_market_snapshot(
     macro = await loop.run_in_executor(None, fetch_us_macro)
     snapshot.macro_data = macro
 
-    # 新闻：新浪财经 → Tushare → 财联社 → Finnhub（多源互备）
+    # 新闻：东方财富（主力）→ 新浪（备用）→ Tushare → Finnhub
+    em_news = await loop.run_in_executor(None, fetch_eastmoney_news, 25)
     sina = await loop.run_in_executor(None, fetch_sina_news, 20)
     ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
-    cls_news = await loop.run_in_executor(None, fetch_cls_telegraph, 15)
     fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 8)
     snapshot.news_items = {
+        "eastmoney": em_news,
         "sina": sina,
         "ts_news": ts_news,
-        "cls_telegraph": cls_news,
         "global": fh_news,
     }
 
@@ -574,10 +601,19 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- 融资余额: {snapshot.fund_flows['margin_bal']:.2f}亿")
     lines.append("")
 
-    # ── 新浪财经新闻 ──
+    # ── 东方财富新闻 ──
+    em = snapshot.news_items.get("eastmoney", [])
+    if em:
+        lines.append(f"### 东方财富 7x24 实时快讯（共{len(em)}条）")
+        for item in em[:20]:
+            lines.append(f"- [{item['time']}] {item['title']}")
+            if item.get("summary"):
+                lines.append(f"  {item['summary'][:250]}")
+
+    # ── 新浪新闻（备用）──
     sina = snapshot.news_items.get("sina", [])
-    if sina:
-        lines.append(f"### 新浪财经滚动新闻（共{len(sina)}条）")
+    if sina and not em:
+        lines.append(f"### 新浪财经新闻（共{len(sina)}条）")
         for item in sina[:15]:
             lines.append(f"- [{item['time']}] {item['title']}")
 
