@@ -455,49 +455,6 @@ def fetch_north_holdings() -> list:
     return items
 
 
-def fetch_derivatives_sentiment() -> dict:
-    """衍生品情绪：期权PCR + 期货升贴水（如果能获取的话）。"""
-    pro = _get_pro()
-    if not pro:
-        return {}
-
-    result = {}
-    today = datetime.now().strftime("%Y%m%d")
-
-    # 尝试获取50ETF期权PCR
-    try:
-        df = pro.opt_daily(trade_date=today)
-        if df is not None and not df.empty:
-            calls = df[df["call_put"] == "C"]["vol"].sum()
-            puts = df[df["call_put"] == "P"]["vol"].sum()
-            if calls > 0:
-                result["50ETF期权PCR"] = round(float(puts / calls), 2)
-                # PCR > 1 = 偏空, < 0.7 = 偏多
-                result["期权情绪"] = "偏空" if result["50ETF期权PCR"] > 1 else "偏多" if result["50ETF期权PCR"] < 0.7 else "中性"
-    except Exception:
-        pass
-
-    # 尝试获取股指期货升贴水（IF当月合约）
-    try:
-        df = pro.fut_daily(trade_date=today)
-        if df is not None and not df.empty:
-            # 找IF合约
-            if_contracts = df[df["ts_code"].str.startswith("IF")]
-            if not if_contracts.empty:
-                # 当月合约（最近的）
-                latest_if = if_contracts.iloc[0]
-                settle = float(latest_if.get("settle", 0))
-                close = float(latest_if.get("close", 0))
-                if settle > 0:
-                    discount = round((close - settle) / settle * 100, 2)
-                    result["IF升贴水率"] = f"{discount:+.2f}%"
-                    result["期指情绪"] = "偏多（升水）" if discount > 0 else "偏空（贴水）" if discount < -0.5 else "中性"
-    except Exception:
-        pass
-
-    return result
-
-
 def fetch_shibor() -> dict:
     """SHIBOR利率（国内流动性指标）。"""
     pro = _get_pro()
@@ -931,9 +888,6 @@ async def collect_market_snapshot(
     comm = await loop.run_in_executor(None, fetch_commodities_and_fx)
     snapshot._commodities = comm
 
-    derivatives = await loop.run_in_executor(None, fetch_derivatives_sentiment)
-    snapshot._derivatives = derivatives
-
     shibor = await loop.run_in_executor(None, fetch_shibor)
     snapshot._shibor = shibor
 
@@ -1102,14 +1056,6 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("### 中国宏观数据（Tushare）")
         for name, val in china.items():
             lines.append(f"- {name}: {val}")
-        lines.append("")
-
-    # ── 衍生品情绪 ──
-    deriv = getattr(snapshot, "_derivatives", {})
-    if deriv:
-        lines.append("### 衍生品情绪（领先指标）")
-        for k, v in deriv.items():
-            lines.append(f"- {k}: {v}")
         lines.append("")
 
     # ── SHIBOR ──
