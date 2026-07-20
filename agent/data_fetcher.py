@@ -1,86 +1,63 @@
 """
-数据采集器：市场行情 + 全球指数 + 新闻 + 宏观数据。
+数据采集器 v2.0：行情 + 趋势 + 新闻 + 宏观 + 量价分析。
 
 设计原则：
-- 每个数据源独立封装，失败时返回 None 而不是抛异常
+- 每个数据源独立封装，失败返回空而非抛异常
 - 支持降级：API → 公开数据 → 标记不可用
 - 所有时间戳统一为北京时间
 """
 
 import os
 import json
-import hashlib
-import asyncio
+import requests
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Optional
 from dataclasses import dataclass, field
 
-import requests
-import pandas as pd
 
-# ── 配置（运行时读取，非导入时） ──
-
-def _token(key: str, default: str = "") -> str:
+def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+# ── 数据结构 ──
+
 @dataclass
 class MarketSnapshot:
-    """全市场快照。"""
     date: str = ""
-    indices: dict = field(default_factory=dict)     # {指数名: {close, pct_chg, vol}}
+    indices: dict = field(default_factory=dict)
+    sectors: list = field(default_factory=list)
+    fund_flows: dict = field(default_factory=dict)
     global_indices: dict = field(default_factory=dict)
-    sectors: list = field(default_factory=list)       # [{name, pct_chg, tag}]
-    fund_flows: dict = field(default_factory=dict)     # {north_bound, south_bound, margin_bal, turnover}
-    news_items: list = field(default_factory=list)    # [{tier, time, source, title, impact, sector}]
-    calendar: list = field(default_factory=list)       # [{date, event, importance}]
-    macro_data: dict = field(default_factory=dict)     # {指标名: 数值}
-    errors: list = field(default_factory=list)         # 各数据源错误信息
+    macro_data: dict = field(default_factory=dict)
+    news_items: list = field(default_factory=list)
+    calendar: list = field(default_factory=list)
 
 
-# ── Tushare: A股数据 ──
+# ── Tushare 连接 ──
 
-def _get_tushare_pro():
-    """获取 Tushare Pro 连接。"""
-    if not _token("TUSHARE_TOKEN"):
+def _get_pro():
+    token = _env("TUSHARE_TOKEN")
+    if not token:
         return None
     try:
         import tushare as ts
-        ts.set_token(_token("TUSHARE_TOKEN"))
+        ts.set_token(token)
         return ts.pro_api()
     except Exception:
         return None
 
 
-def fetch_a_share_indices(date: str) -> dict:
-    """获取A股主要指数行情。逐个指数查询（Tushare不支持逗号分隔多代码）。"""
-    pro = _get_tushare_pro()
-    if not pro:
-        return {}
+# ═══════════════════════════════════════════
+# A 股行情 + 历史趋势 + 均线 + 量价
+# ═══════════════════════════════════════════
 
-    index_codes = {
-        "000001.SH": "上证综指", "399001.SZ": "深证成指",
-        "399006.SZ": "创业板指", "000688.SH": "科创50",
-        "000300.SH": "沪深300", "000905.SH": "中证500",
-        "000852.SH": "中证1000",
-    }
-    result = {}
-    for code, name in index_codes.items():
-        try:
-            df = pro.index_daily(ts_code=code, start_date=date, end_date=date)
-            if df is not None and not df.empty:
-                row = df.iloc[-1]  # 最新一行
-                result[name] = {
-                    "close": round(float(row["close"]), 2),
-                    "pct_chg": round(float(row["pct_chg"]), 2),
-                    "vol": round(float(row.get("vol", 0)) / 10000, 2),
-                }
-        except Exception:
-            pass
-    return result
+A_INDEX_CODES = {
+    "000001.SH": "上证综指", "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指", "000688.SH": "科创50",
+    "000300.SH": "沪深300", "000905.SH": "中证500",
+    "000852.SH": "中证1000",
+}
 
-
-# 申万一级31行业指数代码
 SW_SECTOR_CODES = {
     "801010.SI": "农林牧渔", "801020.SI": "采掘", "801030.SI": "化工",
     "801040.SI": "钢铁", "801050.SI": "有色金属", "801080.SI": "电子",
@@ -96,65 +73,172 @@ SW_SECTOR_CODES = {
 }
 
 
+def fetch_a_share_indices(date: str) -> dict:
+    """
+    获取A股7大指数行情 + 5日/20日趋势 + 均线位置 + 量比。
+    拉取近60天数据用于计算均线和历史趋势。
+    """
+    pro = _get_pro()
+    if not pro:
+        return {}
+
+    start_60d = (datetime.strptime(date, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+    result = {}
+
+    for code, name in A_INDEX_CODES.items():
+        try:
+            df = pro.index_daily(ts_code=code, start_date=start_60d, end_date=date)
+            if df is None or df.empty:
+                continue
+            df = df.sort_values("trade_date")
+            latest = df.iloc[-1]
+            close = float(latest["close"])
+            pct_chg = float(latest["pct_chg"])
+            vol = float(latest.get("vol", 0)) / 10000
+
+            closes = df["close"].astype(float)
+            vols = df["vol"].astype(float)
+
+            # 均线
+            ma5 = round(float(closes.tail(5).mean()), 2) if len(closes) >= 5 else None
+            ma10 = round(float(closes.tail(10).mean()), 2) if len(closes) >= 10 else None
+            ma20 = round(float(closes.tail(20).mean()), 2) if len(closes) >= 20 else None
+            ma60 = round(float(closes.tail(60).mean()), 2) if len(closes) >= 60 else None
+
+            # 历史涨跌
+            def _chg_from(days_ago):
+                if len(closes) > days_ago:
+                    prev = float(closes.iloc[-(days_ago + 1)])
+                    return round((close - prev) / prev * 100, 2)
+                return None
+
+            chg_5d = _chg_from(5)
+            chg_20d = _chg_from(20)
+
+            # 量比（今日量 / 5日均量）
+            avg_vol_5d = float(vols.tail(6).head(5).mean()) if len(vols) >= 6 else vol
+            vol_ratio = round(vol / (avg_vol_5d / 10000), 2) if avg_vol_5d > 0 else 1.0
+
+            # 趋势方向
+            trend_5d = "上涨" if chg_5d and chg_5d > 0 else "下跌" if chg_5d else "—"
+            trend_20d = "上涨" if chg_20d and chg_20d > 0 else "下跌" if chg_20d else "—"
+
+            # 均线排列
+            mas = [m for m in [ma5, ma10, ma20, ma60] if m is not None]
+            above_mas = sum(1 for m in mas if close > m)
+            total_mas = len(mas)
+
+            result[name] = {
+                "close": round(close, 2),
+                "pct_chg": round(pct_chg, 2),
+                "vol": round(vol, 2),
+                "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
+                "chg_5d": chg_5d, "chg_20d": chg_20d,
+                "trend_5d": trend_5d, "trend_20d": trend_20d,
+                "vol_ratio": vol_ratio,
+                "mas_above": f"{above_mas}/{total_mas}" if total_mas else "—",
+            }
+        except Exception:
+            pass
+    return result
+
+
 def fetch_shenwan_sectors(date: str) -> list:
-    """获取申万一级31行业涨跌幅。用 index_daily 接口（免费版也可用）。"""
-    pro = _get_tushare_pro()
+    """获取31行业涨跌幅 + 5日趋势。"""
+    pro = _get_pro()
     if not pro:
         return []
 
-    # 方式1: 逐个查询申万行业指数（单次查全部31个）
-    try:
-        sectors = []
-        for code, name in SW_SECTOR_CODES.items():
-            try:
-                df = pro.index_daily(ts_code=code, start_date=date, end_date=date)
-                if df is not None and not df.empty:
-                    row = df.iloc[-1]
-                    pct = round(float(row["pct_chg"]), 2)
-                    tag = ("强势" if pct > 2 else "偏强" if pct > 1 else
-                           "中性" if pct >= -1 else "偏弱" if pct >= -2 else "弱势")
-                    sectors.append({"name": name, "pct_chg": pct, "tag": tag})
-            except Exception:
-                pass
-        if sectors:
-            sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
-            return sectors
-    except Exception:
-        pass
+    start_10d = (datetime.strptime(date, "%Y%m%d") - timedelta(days=15)).strftime("%Y%m%d")
+    sectors = []
 
-    # 方式2: 尝试 sw_daily（需要更高权限）
-    try:
-        df = pro.sw_daily(trade_date=date)
-        if df is not None and not df.empty:
-            sectors = []
-            for _, row in df.iterrows():
-                pct = round(float(row["pct_chg"]), 2)
-                tag = "强势" if pct > 2 else "偏强" if pct > 1 else "中性" if pct >= -1 else "偏弱" if pct >= -2 else "弱势"
-                sectors.append({"name": row["sw_name"], "pct_chg": pct, "tag": tag})
-            sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
-            return sectors
-    except Exception:
-        pass
+    for code, name in SW_SECTOR_CODES.items():
+        try:
+            df = pro.index_daily(ts_code=code, start_date=start_10d, end_date=date)
+            if df is None or df.empty:
+                continue
+            df = df.sort_values("trade_date")
+            row = df.iloc[-1]
+            pct = round(float(row["pct_chg"]), 2)
 
-    return []
+            # 标签
+            if pct > 2:
+                tag = "强势"
+            elif pct > 1:
+                tag = "偏强"
+            elif pct >= -1:
+                tag = "中性"
+            elif pct >= -2:
+                tag = "偏弱"
+            else:
+                tag = "弱势"
+
+            # 5日趋势
+            closes = df["close"].astype(float)
+            chg_5d = None
+            if len(closes) > 5:
+                prev_5 = float(closes.iloc[-6])
+                chg_5d = round((float(closes.iloc[-1]) - prev_5) / prev_5 * 100, 2)
+
+            # 连续涨跌天数
+            streak = 0
+            streak_dir = ""
+            for i in range(len(df) - 1, 0, -1):
+                if float(df.iloc[i]["pct_chg"]) > 0:
+                    if streak_dir == "":
+                        streak_dir = "涨"
+                    if streak_dir == "涨":
+                        streak += 1
+                    else:
+                        break
+                elif float(df.iloc[i]["pct_chg"]) < 0:
+                    if streak_dir == "":
+                        streak_dir = "跌"
+                    if streak_dir == "跌":
+                        streak += 1
+                    else:
+                        break
+                else:
+                    break
+
+            streak_str = f"连{streak_dir}{streak}天" if streak >= 2 else "—"
+
+            sectors.append({
+                "name": name, "pct_chg": pct, "tag": tag,
+                "chg_5d": chg_5d, "streak": streak_str,
+            })
+        except Exception:
+            pass
+
+    sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
+    return sectors
 
 
 def fetch_fund_flows(date: str) -> dict:
-    """获取资金流向：北向/南向/融资融券。"""
-    pro = _get_tushare_pro()
+    """资金流向：北向/南向/两融。"""
+    pro = _get_pro()
     if not pro:
         return {}
 
     result = {}
+    # 北向/南向
     try:
-        df = pro.moneyflow_hsgt(start_date=date, end_date=date)
+        df = pro.moneyflow_hsgt(trade_date=date)
         if df is not None and not df.empty:
             row = df.iloc[0]
             result["north_bound"] = round(float(row.get("north_net_inflow", 0)), 2)
             result["south_bound"] = round(float(row.get("south_net_inflow", 0)), 2)
     except Exception:
-        pass
+        try:
+            df = pro.moneyflow_hsgt(start_date=date, end_date=date)
+            if df is not None and not df.empty:
+                row = df.iloc[0]
+                result["north_bound"] = round(float(row.get("north_net_inflow", 0)), 2)
+                result["south_bound"] = round(float(row.get("south_net_inflow", 0)), 2)
+        except Exception:
+            pass
 
+    # 融资融券
     try:
         df_m = pro.margin(trade_date=date)
         if df_m is not None and not df_m.empty:
@@ -162,49 +246,107 @@ def fetch_fund_flows(date: str) -> dict:
     except Exception:
         pass
 
-    # 成交额直接从指数数据取，这里设个默认
-    if "turnover" not in result:
-        result["turnover"] = None
     return result
 
 
-def fetch_sector_detail(sector_name: str, date: str) -> dict:
-    """获取单板块深度数据：成分股表现。"""
-    pro = _get_tushare_pro()
-    if not pro:
-        return {}
+# ═══════════════════════════════════════════
+# 新闻采集（Tushare 新闻 + Finnhub）
+# ═══════════════════════════════════════════
 
-    result = {"name": sector_name}
+def fetch_tushare_news(date: str, limit: int = 25) -> list:
+    """从 Tushare 获取主流财经新闻。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+
+    items = []
     try:
-        df_member = pro.sw_member(sw_name=sector_name)
-        if df_member is not None and not df_member.empty:
-            stocks = df_member["ts_code"].tolist()[:30]
-            df_stock = pro.daily(ts_code=",".join(stocks),
-                                start_date=date, end_date=date)
-            if df_stock is not None and not df_stock.empty:
-                df_sorted = df_stock.sort_values("pct_chg", ascending=False)
-                result["top_gainers"] = [
-                    {"name": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2)}
-                    for _, r in df_sorted.head(5).iterrows()
-                ]
-                result["top_losers"] = [
-                    {"name": r["ts_code"], "pct_chg": round(float(r["pct_chg"]), 2)}
-                    for _, r in df_sorted.tail(5).iterrows()
-                ]
-                result["up_count"] = int((df_stock["pct_chg"] > 0).sum())
-                result["down_count"] = int((df_stock["pct_chg"] < 0).sum())
-                result["flat_count"] = int((df_stock["pct_chg"] == 0).sum())
+        df = pro.news(src="cls", start_date=date, end_date=date)
+        if df is not None and not df.empty:
+            for _, row in df.head(limit).iterrows():
+                items.append({
+                    "source": "财联社",
+                    "time": str(row.get("datetime", "")),
+                    "title": str(row.get("title", "")),
+                    "content": str(row.get("content", ""))[:300],
+                })
     except Exception:
         pass
-    return result
+
+    # 如果 CLS 源为空，尝试其他源
+    if not items:
+        try:
+            df = pro.news(src="sina", start_date=date, end_date=date)
+            if df is not None and not df.empty:
+                for _, row in df.head(limit).iterrows():
+                    items.append({
+                        "source": "新浪财经",
+                        "time": str(row.get("datetime", "")),
+                        "title": str(row.get("title", "")),
+                        "content": str(row.get("content", ""))[:300],
+                    })
+        except Exception:
+            pass
+
+    return items
 
 
-# ── Finnhub: 全球指数 ──
+def fetch_finnhub_news(limit: int = 10) -> list:
+    """Finnhub 全球财经新闻。"""
+    key = _env("FINNHUB_API_KEY")
+    if not key:
+        return []
+
+    items = []
+    try:
+        import finnhub
+        client = finnhub.Client(api_key=key)
+        news = client.general_news("general", min_id=0)
+        for item in news[:limit]:
+            ts = item.get("datetime", 0)
+            time_str = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else ""
+            items.append({
+                "source": item.get("source", "Finnhub"),
+                "time": time_str,
+                "title": item.get("headline", ""),
+                "summary": item.get("summary", ""),
+            })
+    except Exception:
+        pass
+    return items
+
+
+def fetch_cls_telegraph(limit: int = 20) -> list:
+    """财联社电报（免费爬虫，备用）。"""
+    items = []
+    try:
+        resp = requests.post(
+            "https://www.cls.cn/api/sw",
+            json={"type": "telegram", "page": 1, "limit": limit,
+                  "last_time": int(datetime.now().timestamp())},
+            headers={"Content-Type": "application/json", "Referer": "https://www.cls.cn/telegraph"},
+            timeout=15,
+        )
+        data = resp.json()
+        for item in data.get("data", {}).get("roll_data", [])[:limit]:
+            items.append({
+                "source": "财联社电报",
+                "time": item.get("ctime", ""),
+                "title": item.get("title", ""),
+                "brief": str(item.get("brief", ""))[:200],
+            })
+    except Exception:
+        pass
+    return items
+
+
+# ═══════════════════════════════════════════
+# 全球指数 + 宏观
+# ═══════════════════════════════════════════
 
 def fetch_global_indices() -> dict:
-    """获取全球主要指数行情。用 yfinance（免费，无需API Key）。"""
+    """全球主要指数（yfinance，免费）。"""
     result = {}
-    # (yfinance代码, 显示名)
     indices = [
         ("^GSPC", "标普500"), ("^DJI", "道琼斯工业"), ("^IXIC", "纳斯达克"),
         ("^HSI", "恒生指数"), ("^N225", "日经225"), ("^FTSE", "富时100"),
@@ -219,7 +361,7 @@ def fetch_global_indices() -> dict:
                 if hist is not None and len(hist) >= 1:
                     close = round(float(hist["Close"].iloc[-1]), 2)
                     prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else close
-                    pct = round((close - prev) / prev * 100, 2) if prev else 0
+                    pct = round((close - prev) / prev * 100, 2) if prev else 0.0
                     result[name] = {"close": close, "pct_chg": pct}
             except Exception:
                 pass
@@ -228,11 +370,10 @@ def fetch_global_indices() -> dict:
     return result
 
 
-# ── FRED: 美国宏观 ──
-
 def fetch_us_macro() -> dict:
-    """获取美国关键宏观数据。"""
-    if not _token("FRED_API_KEY"):
+    """FRED 美国宏观数据。"""
+    key = _env("FRED_API_KEY")
+    if not key:
         return {}
 
     result = {}
@@ -243,8 +384,7 @@ def fetch_us_macro() -> dict:
     }
     try:
         from fredapi import Fred
-        fred = Fred(api_key=_token("FRED_API_KEY"))
-        today = datetime.now().strftime("%Y-%m-%d")
+        fred = Fred(api_key=key)
         for sid, name in series.items():
             try:
                 data = fred.get_series(sid, observation_start="2026-01-01")
@@ -257,260 +397,193 @@ def fetch_us_macro() -> dict:
     return result
 
 
-# ── 新闻采集 ──
-
-def fetch_cls_news(limit: int = 20) -> list:
-    """从财联社采集实时电报新闻。免费，无需API Key。"""
-    items = []
-    try:
-        # 财联社公开接口
-        url = "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.6"
-        resp = requests.post(url, json={
-            "type": "telegram", "page": 1, "limit": limit,
-            "last_time": int(datetime.now().timestamp()),
-        }, headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.cls.cn/telegraph",
-        }, timeout=15)
-        data = resp.json()
-        for item in data.get("data", {}).get("roll_data", [])[:limit]:
-            items.append({
-                "source": "财联社",
-                "time": item.get("ctime", ""),
-                "title": item.get("title", ""),
-                "content": item.get("content", ""),
-                "brief": item.get("brief", ""),
-            })
-    except Exception:
-        pass
-    return items
-
-
-def fetch_finnhub_news(limit: int = 10) -> list:
-    """从 Finnhub 获取全球财经新闻。免费层60次/分钟。"""
-    if not _token("FINNHUB_API_KEY"):
-        return []
-
-    items = []
-    try:
-        import finnhub
-        client = finnhub.Client(api_key=_token("FINNHUB_API_KEY"))
-        news = client.general_news("general", min_id=0)
-        for item in news[:limit]:
-            items.append({
-                "source": item.get("source", "Finnhub"),
-                "time": datetime.fromtimestamp(item.get("datetime", 0)).strftime("%H:%M"),
-                "title": item.get("headline", ""),
-                "summary": item.get("summary", ""),
-                "url": item.get("url", ""),
-            })
-    except Exception:
-        pass
-    return items
-
-
-def search_financial_news(query: str, limit: int = 8) -> list:
-    """搜索金融新闻。用 Brave Search API（免费2000次/月）或降级到公开源。"""
-    items = []
-    if _token("BRAVE_SEARCH_API_KEY"):
-        try:
-            resp = requests.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": f"{query} 今日", "count": limit, "freshness": "pd"},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": _token("BRAVE_SEARCH_API_KEY"),
-                },
-                timeout=15,
-            )
-            data = resp.json()
-            for r in data.get("web", {}).get("results", [])[:limit]:
-                items.append({
-                    "source": "Brave Search",
-                    "title": r.get("title", ""),
-                    "url": r.get("url", ""),
-                    "description": r.get("description", ""),
-                })
-        except Exception:
-            pass
-    return items
-
-
-# ── 经济日历 ──
+# ═══════════════════════════════════════════
+# 经济日历
+# ═══════════════════════════════════════════
 
 def fetch_economic_calendar() -> list:
-    """获取近期经济事件日历。从公开源获取。"""
+    """近期经济事件。"""
     items = []
     try:
-        # 金十数据公开接口
         resp = requests.get(
             "https://cdn-rili.jin10.com/web_data/2026/daily/00/en.json",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=15
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
         )
         if resp.status_code == 200:
             data = resp.json()
             today = datetime.now().strftime("%Y%m%d")
             tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
-            for date_key in [today, tomorrow]:
-                for event in data.get(date_key, [])[:8]:
+            for dk in [today, tomorrow]:
+                for ev in data.get(dk, [])[:8]:
                     items.append({
-                        "date": date_key,
-                        "time": event.get("time", ""),
-                        "event": event.get("name", event.get("title", "")),
-                        "country": event.get("country", ""),
-                        "importance": event.get("star", event.get("importance", 1)),
-                        "previous": event.get("previous", ""),
-                        "consensus": event.get("consensus", ""),
+                        "date": dk, "time": ev.get("time", ""),
+                        "event": ev.get("name", ev.get("title", "")),
+                        "country": ev.get("country", ""),
+                        "importance": ev.get("star", 1),
                     })
     except Exception:
         pass
     return items
 
 
-# ── 综合采集 ──
+# ═══════════════════════════════════════════
+# 综合采集 + 格式化
+# ═══════════════════════════════════════════
 
 async def collect_market_snapshot(
     date: Optional[str] = None,
     sector_focus: Optional[str] = None,
 ) -> MarketSnapshot:
-    """并行采集全市场数据，返回聚合快照。"""
+    """并行采集全市场数据。"""
     if date is None:
         date = datetime.now().strftime("%Y%m%d")
 
-    snapshot = MarketSnapshot(date=date)
-
-    # 并行执行所有数据采集（用线程池，因为都是IO操作）
+    import asyncio
     loop = asyncio.get_event_loop()
 
-    # A股数据
+    snapshot = MarketSnapshot(date=date)
+
+    # 并行执行
     indices = await loop.run_in_executor(None, fetch_a_share_indices, date)
     snapshot.indices = indices
 
-    # 申万行业
     sectors = await loop.run_in_executor(None, fetch_shenwan_sectors, date)
     snapshot.sectors = sectors
 
-    # 资金流向
     flows = await loop.run_in_executor(None, fetch_fund_flows, date)
     snapshot.fund_flows = flows
 
-    # 全球指数
-    global_idx = await loop.run_in_executor(None, fetch_global_indices)
-    snapshot.global_indices = global_idx
+    gidx = await loop.run_in_executor(None, fetch_global_indices)
+    snapshot.global_indices = gidx
 
-    # 美国宏观
     macro = await loop.run_in_executor(None, fetch_us_macro)
     snapshot.macro_data = macro
 
-    # 新闻
-    cls_news = await loop.run_in_executor(None, fetch_cls_news, 15)
+    # 新闻：Tushare 新闻 → 财联社电报 → Finnhub
+    ts_news = await loop.run_in_executor(None, fetch_tushare_news, date)
+    cls_news = await loop.run_in_executor(None, fetch_cls_telegraph, 15)
     fh_news = await loop.run_in_executor(None, fetch_finnhub_news, 8)
     snapshot.news_items = {
-        "cls": cls_news,
+        "ts_news": ts_news,
+        "cls_telegraph": cls_news,
         "global": fh_news,
     }
 
-    # 经济日历
     calendar = await loop.run_in_executor(None, fetch_economic_calendar)
     snapshot.calendar = calendar
-
-    # 单板块深度数据
-    if sector_focus:
-        sector_detail = await loop.run_in_executor(
-            None, fetch_sector_detail, sector_focus, date
-        )
-        snapshot._sector_detail = sector_detail
 
     return snapshot
 
 
 def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
-    """将市场数据格式化为注入 LLM prompt 的文本。"""
+    """格式化数据为 LLM prompt。"""
     lines = []
-    lines.append(f"## 实时市场数据（采集时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}）\n")
+    ts = datetime.now().strftime("%H:%M")
+    lines.append(f"## 实时市场数据（采集时间：{ts}）\n")
 
-    # 指数
+    # ── A 股指数 ──
     if snapshot.indices:
-        lines.append("### A股主要指数")
-        for name, data in snapshot.indices.items():
-            lines.append(f"- {name}: {data['close']} | {data['pct_chg']:+.2f}% | 成交额{data['vol']}亿")
+        lines.append("### A股主要指数（含趋势分析）")
+        for name, d in snapshot.indices.items():
+            extras = []
+            if d.get("chg_5d") is not None:
+                extras.append(f"5日{d['chg_5d']:+.2f}%")
+            if d.get("chg_20d") is not None:
+                extras.append(f"20日{d['chg_20d']:+.2f}%")
+            if d.get("vol_ratio"):
+                extras.append(f"量比{d['vol_ratio']}x")
+            if d.get("mas_above") and d["mas_above"] != "—":
+                extras.append(f"站上{d['mas_above']}条均线")
+            extra_str = f" | {' | '.join(extras)}" if extras else ""
+            lines.append(
+                f"- {name}: {d['close']} | {d['pct_chg']:+.2f}%"
+                f" | 成交额{d['vol']}亿{extra_str}"
+            )
     else:
-        lines.append("### A股主要指数\n[Tushare未配置，数据不可用]")
+        lines.append("### A股主要指数\n[Tushare未配置]")
 
     lines.append("")
 
-    # 申万行业
+    # ── 申万行业 ──
     if snapshot.sectors:
-        lines.append("### 申万一级行业涨跌幅（共{}个行业）".format(len(snapshot.sectors)))
+        lines.append(f"### 申万一级行业（共{len(snapshot.sectors)}个）")
         strong = [s for s in snapshot.sectors if s["tag"] in ("强势", "偏强")]
         weak = [s for s in snapshot.sectors if s["tag"] in ("弱势", "偏弱")]
         if strong:
-            strong_str = ", ".join(f"{s['name']}({s['pct_chg']:+.2f}%)" for s in strong[:8])
-            lines.append(f"领涨：{strong_str}")
+            names = ", ".join(f"{s['name']}({s['pct_chg']:+.2f}%)" for s in strong[:8])
+            lines.append(f"偏强：{names}")
         if weak:
-            weak_str = ", ".join(f"{s['name']}({s['pct_chg']:+.2f}%)" for s in weak[:8])
-            lines.append(f"领跌：{weak_str}")
-        lines.append("完整31行业：")
+            names = ", ".join(f"{s['name']}({s['pct_chg']:+.2f}%)" for s in weak[:8])
+            lines.append(f"偏弱：{names}")
+        lines.append("完整列表：")
         for s in snapshot.sectors:
-            lines.append(f"  {s['name']}: {s['pct_chg']:+.2f}% [{s['tag']}]")
+            streak = f" [{s['streak']}]" if s.get("streak") and s["streak"] != "—" else ""
+            chg5 = f" 5日{s['chg_5d']:+.2f}%" if s.get("chg_5d") is not None else ""
+            lines.append(f"  {s['name']}: {s['pct_chg']:+.2f}% [{s['tag']}]{streak}{chg5}")
     else:
-        lines.append("### 申万行业\n[Tushare未配置，数据不可用]")
+        lines.append("### 申万行业\n[Tushare未配置]")
 
     lines.append("")
 
-    # 全球指数
+    # ── 全球指数 ──
     if snapshot.global_indices:
         lines.append("### 全球主要指数")
-        for name, data in snapshot.global_indices.items():
-            lines.append(f"- {name}: {data['close']} | {data['pct_chg']:+.2f}%")
-
+        for name, d in snapshot.global_indices.items():
+            lines.append(f"- {name}: {d['close']} | {d['pct_chg']:+.2f}%")
     lines.append("")
 
-    # 资金流向
+    # ── 资金面 ──
     if snapshot.fund_flows:
         lines.append("### 资金面")
-        if "north_bound" in snapshot.fund_flows:
+        if snapshot.fund_flows.get("north_bound"):
             lines.append(f"- 北向资金: {snapshot.fund_flows['north_bound']:+.2f}亿")
-        if "south_bound" in snapshot.fund_flows:
+        if snapshot.fund_flows.get("south_bound"):
             lines.append(f"- 南向资金: {snapshot.fund_flows['south_bound']:+.2f}亿")
-        if "margin_bal" in snapshot.fund_flows:
+        if snapshot.fund_flows.get("margin_bal"):
             lines.append(f"- 融资余额: {snapshot.fund_flows['margin_bal']:.2f}亿")
-
     lines.append("")
 
-    # 财联社新闻
-    if snapshot.news_items.get("cls"):
-        lines.append("### 财联社今日电报（最新15条）")
-        for item in snapshot.news_items["cls"][:15]:
+    # ── Tushare 新闻 ──
+    ts_news = snapshot.news_items.get("ts_news", [])
+    if ts_news:
+        lines.append(f"### 财联社新闻（Tushare，共{len(ts_news)}条）")
+        for item in ts_news[:20]:
+            lines.append(f"- [{item['time']}] {item['title']}")
+            if item.get("content"):
+                lines.append(f"  {item['content'][:200]}")
+
+    # ── 财联社电报 ──
+    cls = snapshot.news_items.get("cls_telegraph", [])
+    if cls:
+        lines.append(f"\n### 财联社电报（实时，共{len(cls)}条）")
+        for item in cls[:15]:
             lines.append(f"- [{item['time']}] {item['title']}")
             if item.get("brief"):
                 lines.append(f"  {item['brief'][:150]}")
 
     lines.append("")
 
-    # 全球新闻
-    if snapshot.news_items.get("global"):
-        lines.append("### 全球财经新闻")
-        for item in snapshot.news_items["global"][:8]:
+    # ── 全球新闻 ──
+    global_news = snapshot.news_items.get("global", [])
+    if global_news:
+        lines.append("### 全球财经新闻（Finnhub）")
+        for item in global_news[:8]:
             lines.append(f"- [{item['source']} {item['time']}] {item['title']}")
 
     lines.append("")
 
-    # 经济日历
-    if snapshot.calendar:
-        lines.append("### 近期经济事件")
-        for ev in snapshot.calendar[:10]:
-            stars = "*" * ev.get("importance", 1)
-            lines.append(f"- {ev['date']} {ev['time']} [{stars}] {ev['event']} ({ev.get('country','')})")
-
-    lines.append("")
-
-    # 美国宏观
+    # ── 宏观 ──
     if snapshot.macro_data:
-        lines.append("### 美国宏观数据")
+        lines.append("### 美国宏观数据（FRED）")
         for name, val in snapshot.macro_data.items():
             lines.append(f"- {name}: {val}")
+    lines.append("")
+
+    # ── 日历 ──
+    if snapshot.calendar:
+        lines.append("### 近期经济事件")
+        for ev in snapshot.calendar[:8]:
+            stars = "*" * ev.get("importance", 1)
+            lines.append(f"- {ev['date']} {ev['time']} [{stars}] {ev['event']}")
 
     return "\n".join(lines)
