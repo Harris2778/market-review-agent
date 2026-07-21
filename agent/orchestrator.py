@@ -418,29 +418,40 @@ class MarketReviewAgent:
         date_display = trade_date.strftime("%Y年%m月%d日")
         weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
 
-        # 全量采集，不过滤。新闻模式的value就是"多"
-        snapshot = await collect_market_snapshot(date=date_str, sector_focus=None)
+        # 新闻模式：Sina直拉（同步，避免并行采集丢失）+ EM补最新
+        from agent.data_fetcher import fetch_sina_news as _sina, fetch_eastmoney_news as _em
+        import asyncio
+        loop = asyncio.get_event_loop()
+        d1 = trade_date.strftime("%Y-%m-%d")
+        d2 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # 同步拉取，避免并行丢失
+        sina1 = await loop.run_in_executor(None, _sina, 50, d1)
+        sina2 = await loop.run_in_executor(None, _sina, 50, d2)
+        em1 = await loop.run_in_executor(None, _em, 50)
+
         from collections import defaultdict
         by_date = defaultdict(set)
-        for item in snapshot.news_items.get("sina", []) + snapshot.news_items.get("eastmoney", []):
-            t = item.get("time", "")[:10]
-            if t:
-                title = item.get("title", "")
-                if title:
-                    by_date[t].add(title)
+        for item in (sina1 or []) + (sina2 or []) + (em1 or []):
+            t = (item.get("time", "") or "")[:10]
+            title = (item.get("title", "") or "").strip()
+            if t and title and len(title) > 3:
+                by_date[t].add(title)
 
         total = sum(len(v) for v in by_date.values())
         label = f"{sector}板块" if sector else "全市场"
 
-        news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
-        news_text += "提示：以下是近48小时全市场新闻。如需某板块专属新闻，可输入\"XX板块新闻\"。\n"
-        for d in sorted(by_date.keys(), reverse=True):
-            items = sorted(by_date[d])
-            news_text += f"\n--- {d}（{len(items)}条）---\n"
-            for title in items:
-                news_text += f"[{d}] {title}\n"
+        if total == 0:
+            news_text = f"{label}新闻汇总 — {date_display} {weekday}\n暂未获取到新闻数据，请稍后重试。"
+        else:
+            news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
+            for d in sorted(by_date.keys(), reverse=True):
+                items = sorted(by_date[d])
+                news_text += f"\n--- {d}（{len(items)}条）---\n"
+                for title in items:
+                    news_text += f"[{d}] {title}\n"
 
-        system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。纯文本。"
+        system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。"
         user_prompt = f"{news_text}\n\n以上48小时新闻汇总。原样输出。"
 
         result = await self._call_llm(system, user_prompt, stream)
