@@ -576,20 +576,31 @@ class MarketReviewAgent:
         return result
 
     async def _stock_query(self, message: str, stream: bool):
-        """个股查询——直接调用预封装函数，不绕function calling。"""
-        from agent.data_fetcher import search_stock, fetch_stock_quote, fetch_stock_kline, fetch_stock_news
-        results = search_stock(message[:30])
-        if not results:
-            return {"role": "assistant", "content": "未找到该股票，请输入完整代码如600519.SH或公司名如贵州茅台"}
-        s = results[0]
-        market = "cn" if s.get("market","") == "11" else "us"
-        code = s.get("full_code", s.get("code",""))
+        """个股查询——中文名本地映射，不走搜索API。"""
+        from agent.data_fetcher import fetch_stock_quote, fetch_stock_kline, fetch_stock_news
+        # 常见中文名→代码映射
+        NAME_MAP = {
+            "茅台": ("贵州茅台", "cn", "sh600519"), "五粮液": ("五粮液", "cn", "sz000858"),
+            "宁德": ("宁德时代", "cn", "sz300750"), "比亚迪": ("比亚迪", "cn", "sz002594"),
+            "中芯": ("中芯国际", "cn", "sh688981"), "招商银行": ("招商银行", "cn", "sh600036"),
+            "平安": ("中国平安", "cn", "sh601318"), "苹果": ("Apple", "us", "AAPL"),
+            "特斯拉": ("Tesla", "us", "TSLA"), "英伟达": ("NVIDIA", "us", "NVDA"),
+            "腾讯": ("腾讯", "hk", "00700"), "阿里": ("阿里巴巴", "us", "BABA"),
+        }
+        matched = None
+        for kw, (name, mkt, code) in NAME_MAP.items():
+            if kw in message:
+                matched = (name, mkt, code)
+                break
+        if not matched:
+            return {"role": "assistant", "content": "请使用常见股票名称查询，如：茅台、宁德、比亚迪、苹果、特斯拉。或输入完整代码。"}
+        name, market, code = matched
         quote = fetch_stock_quote(market, code)
         kline = fetch_stock_kline(market, code, 5)
         news = fetch_stock_news(code, market, 5)
         kline_str = ", ".join(k["date"][-5:] + ":" + str(k["close"]) for k in kline)
         news_str = " | ".join(n["title"][:40] for n in news[:3])
-        info = f"{s['name']}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}%\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{kline_str}\n相关新闻：{news_str}\n数据来源：新浪智研"
+        info = f"{name}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}%\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{kline_str}\n相关新闻：{news_str}\n数据来源：新浪智研"
         return {"role": "assistant", "content": info}
 
     async def _futures_query(self, message: str, stream: bool):
