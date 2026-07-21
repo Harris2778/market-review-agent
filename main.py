@@ -229,6 +229,15 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/mcp-breadth")
+async def debug_mcp_breadth():
+    """测试MCP涨跌分布+热搜。"""
+    from agent.data_fetcher import fetch_market_breadth, fetch_hot_stocks
+    b = fetch_market_breadth()
+    h = fetch_hot_stocks()
+    return {"breadth_keys": list(b.keys()) if b else [], "hot_count": len(h)}
+
+
 @app.get("/debug/sina-news")
 async def debug_sina_news():
     """测试新浪历史新闻是否能拉取。"""
