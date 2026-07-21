@@ -17,6 +17,22 @@ from .system_prompts import get_system_prompt
 
 logger = logging.getLogger(__name__)
 
+# 第二波：Agent 工具注册表（并行开发的 agent/tools.py 未落地时降级为 None，走普通对话）
+try:
+    from .tools import TOOL_REGISTRY, execute_tool
+except ImportError as e:
+    logger.warning("agent/tools.py 未就绪，Agent 工具调用路径将降级为普通对话: %s", e)
+    TOOL_REGISTRY = None
+    execute_tool = None
+
+# 第二波：Agent 循环提示词与自我审查提示词（未就绪时对应能力降级，不影响主流程）
+try:
+    from .system_prompts import AGENT_QUERY_PROMPT, CRITIQUE_PROMPT
+except ImportError as e:
+    logger.warning("AGENT_QUERY_PROMPT/CRITIQUE_PROMPT 未就绪，Agent 循环与自我审查将降级: %s", e)
+    AGENT_QUERY_PROMPT = None
+    CRITIQUE_PROMPT = None
+
 
 def _get_latest_trade_date(ref_date: datetime) -> datetime:
     """获取最近一个交易日。用 Tushare 交易日历，失败则用周末规则兜底。"""
@@ -339,6 +355,79 @@ def _resolve_contextual_intent(message: str, history: list) -> tuple[str, Option
     return intent, sector, None
 
 
+# ── 复杂分析路由（general_chat → Agent 工具循环） ──
+
+# 跨实体比较/归因类表达：命中且带市场语境时，认为问题超出闲聊范畴
+_AGENT_QUERY_PATTERNS = [
+    r"(比较|对比|对照)",
+    r"哪个更",
+    r"谁更",
+    r"和.{1,12}哪个",
+    r"值不值得",
+    r"怎么看.{1,12}和",
+]
+
+# 市场语境词：比较模式命中时要求至少出现一个，防止『我比较喜欢吃辣』误入 Agent 循环
+_MARKET_CONTEXT_KEYWORDS = [
+    "股", "板块", "行业", "基金", "估值", "大盘", "A股", "市场",
+    "行情", "指数", "ETF", "期货", "涨", "跌", "资金", "业绩",
+]
+
+# 常见个股实体（用于多实体计数，与 _stock_query 的 NAME_MAP 口径一致）
+_STOCK_ENTITY_KEYWORDS = [
+    "茅台", "五粮液", "宁德", "比亚迪", "中芯", "招商银行",
+    "平安", "苹果", "特斯拉", "英伟达", "腾讯", "阿里",
+]
+
+
+def _count_entities(msg: str) -> int:
+    """统计消息中提到的不同行业/股票实体数量。"""
+    entities = set()
+    for kw, sw_name in SECTOR_NAME_MAP.items():
+        if kw in msg:
+            entities.add(f"sector:{sw_name}")
+    for kw in _STOCK_ENTITY_KEYWORDS:
+        if kw in msg:
+            entities.add(f"stock:{kw}")
+    return len(entities)
+
+
+def _should_use_agent_query(message: str) -> bool:
+    """
+    保守判定：general_chat 消息是否属于复杂分析（应走 Agent 工具循环）。
+    放行条件（满足其一）：
+      1. 命中跨实体分析模式，且消息带市场语境（实体或市场词）；
+      2. 同时提到 2 个以上行业/股票实体。
+    拿不准（短消息、纯闲聊如『你好』）一律回 False 走 _chat。
+    """
+    msg = message.strip()
+    if len(msg) < 6:  # 过短消息不可能是复杂分析
+        return False
+    entity_count = _count_entities(msg)
+    if entity_count >= 2:
+        return True
+    if any(re.search(p, msg) for p in _AGENT_QUERY_PATTERNS):
+        has_market_context = entity_count >= 1 or any(kw in msg for kw in _MARKET_CONTEXT_KEYWORDS)
+        if has_market_context:
+            return True
+    return False
+
+
+def _assistant_tool_message(message) -> dict:
+    """把 SDK 返回的 assistant 消息（含 tool_calls）转成可回传给 API 的 dict。"""
+    tool_calls = []
+    for tc in (getattr(message, "tool_calls", None) or []):
+        try:
+            tool_calls.append(tc.model_dump())
+        except AttributeError:  # 兼容无 model_dump 的轻量 mock 对象
+            tool_calls.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            })
+    return {"role": "assistant", "content": message.content, "tool_calls": tool_calls}
+
+
 # ── Markdown 清理 ──
 
 def _clean_markdown(text: str) -> str:
@@ -616,6 +705,12 @@ class MarketReviewAgent:
             if inherited_from else None
         )
 
+        # 第二波：复杂分析（跨实体比较/多实体问题）优先升级为 Agent 工具循环。
+        # 裸行业名命中板块意图时，若消息实为比较/多实体分析（如『比较白酒和半导体』），
+        # 也让位给 Agent 循环；规则保守，拿不准走原路径
+        if intent in ("general_chat", "sector_deep_dive") and _should_use_agent_query(user_message):
+            return await self._agent_query(user_message, stream, history=history)
+
         if intent == "general_chat":
             return await self._chat(user_message, stream, history=history)
         elif intent == "market_review":
@@ -766,7 +861,15 @@ class MarketReviewAgent:
 
 深度分析{sector}板块。输出标题需包含日期{date_display}。新闻条目仅作为第五维催化与风险的引用素材，不要单独罗列新闻清单。数据缺失处标注数据暂缺，禁止编造。"""
 
-        return await self._call_llm(system, user_prompt, stream)
+        if stream:
+            # 流式路径跳过自我审查以保延迟（审查+修正需两轮非流式调用，会显著抬高首字延迟）
+            return await self._call_llm(system, user_prompt, stream)
+        result = await self._call_llm(system, user_prompt, stream)
+        if isinstance(result, dict):
+            # 第二波：多 pass 自我审查修正；数据上下文用完整 user_prompt 供数字出处核对
+            draft = result.get("content", "")
+            result["content"] = _clean_markdown(await self._critique_and_revise(draft, user_prompt))
+        return result
 
     async def _news_only(self, sector: str, stream: bool):
         """新闻专属模式：代码层按行业关键字精准过滤，48小时全覆盖。"""
@@ -1034,6 +1137,131 @@ class MarketReviewAgent:
                         return {"role": "assistant", "content": f"{kw}期货：价格{d['price']} 涨跌{d.get('pct','?')}% 成交量{d.get('vol','?')} "}
                     return {"role": "assistant", "content": f"{kw}期货数据暂不可用，请稍后再试。"}
         return await self._generic_mcp(message, stream)
+
+    # 第二波：Agent 工具循环与多 pass 生成配置
+    _AGENT_MAX_ROUNDS = 8        # 工具调用循环上限，超轮降级 _chat
+    _TOOL_RESULT_MAX_CHARS = 3000  # 单条工具结果截断长度，防 context 膨胀
+    _CRITIQUE_MIN_CHARS = 500    # 草稿不长于此长度时不做自我审查（成本护栏）
+
+    async def _agent_query(self, user_message: str, stream: bool, history: list = None):
+        """
+        Agent 工具调用循环（第二波）：模型自主决定调用哪些数据工具，多轮拿数后再成文。
+        仅由 process_message 在复杂分析场景路由进入。
+        兜底原则：工具注册表未就绪 / 任一轮异常 / 循环超轮 → 降级 _chat，绝不向上抛异常。
+        """
+        if not TOOL_REGISTRY or execute_tool is None or AGENT_QUERY_PROMPT is None:
+            logger.warning("Agent 工具注册表或提示词未就绪，降级为普通对话路径")
+            return await self._chat(user_message, stream, history=history)
+
+        date_display = datetime.now().strftime("%Y年%m月%d日")
+        system = AGENT_QUERY_PROMPT + f"\n\n当前日期：{date_display}。"
+        messages = [{"role": "system", "content": system}]
+        messages.extend(_trim_history(history))  # 最多保留最近 10 轮（20 条）
+        messages.append({"role": "user", "content": user_message})
+
+        tool_context_parts = []  # 工具返回摘要，供自我审查核对数字出处
+        loop = asyncio.get_running_loop()
+
+        try:
+            for _ in range(self._AGENT_MAX_ROUNDS):
+                # 工具循环阶段一律非流式（tool calling 无法流式）
+                completion = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=TOOL_REGISTRY,
+                    tool_choice="auto",
+                    temperature=0.2,
+                    max_tokens=8192,
+                )
+                choice = completion.choices[0]
+                tool_calls = getattr(choice.message, "tool_calls", None)
+
+                if not tool_calls:
+                    # 模型返回纯文本 → 工具循环收敛，最终成文
+                    if stream:
+                        # 最终纯文本生成那一轮改用流式输出（不传 tools，模型只能写正文）。
+                        # 流式路径同时跳过自我审查以保延迟，见 _critique_and_revise 注释。
+                        return self._stream_response(messages)
+                    draft = choice.message.content or ""
+                    context = user_message + "\n\n" + "\n".join(tool_context_parts)
+                    final = await self._critique_and_revise(draft, context)
+                    disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+                    return {"role": "assistant", "content": _clean_markdown(final) + disclaimer}
+
+                # 有工具调用：回显 assistant 消息，逐个在线程池执行并追加 tool 结果
+                messages.append(_assistant_tool_message(choice.message))
+                for tc in tool_calls:
+                    fn_name = tc.function.name
+                    try:
+                        fn_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except Exception as e:
+                        logger.warning("Agent 工具参数解析失败(%s): %s", fn_name, e, exc_info=True)
+                        fn_args = {}
+                    try:
+                        result = await loop.run_in_executor(None, execute_tool, fn_name, fn_args)
+                    except Exception as e:
+                        logger.warning("Agent 工具执行异常(%s): %s", fn_name, e, exc_info=True)
+                        result = {"ok": False, "error": f"工具执行异常: {e}"}
+                    content = json.dumps(result, ensure_ascii=False)[:self._TOOL_RESULT_MAX_CHARS]
+                    tool_context_parts.append(f"[{fn_name}] {content[:800]}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
+        except Exception as e:
+            logger.warning("Agent 工具循环异常，降级为普通对话路径: %s", e, exc_info=True)
+            return await self._chat(user_message, stream, history=history)
+
+        # 循环超轮：模型仍要调工具 → 降级
+        logger.warning("Agent 工具循环达到 %d 轮上限仍未收敛，降级为普通对话路径", self._AGENT_MAX_ROUNDS)
+        return await self._chat(user_message, stream, history=history)
+
+    async def _critique_and_revise(self, draft: str, context: str) -> str:
+        """
+        多 pass 生成：先用 CRITIQUE_PROMPT 审查草稿（数字出处/禁用词/过度推断/合规边界/AI腔），
+        再基于审查意见生成修正版。两次均为非流式调用。
+        成本护栏：草稿不超过 500 字直接返回原文；审查结论为「通过」时跳过修正。
+        失败安全：任何一步失败（或修正版异常偏短）都返回原 draft，绝不抛出。
+        """
+        if CRITIQUE_PROMPT is None:
+            return draft
+        if not draft or len(draft) <= self._CRITIQUE_MIN_CHARS:
+            return draft
+        context_part = (context or "")[:4000]
+        try:
+            critique_completion = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": CRITIQUE_PROMPT},
+                    {"role": "user", "content": f"【数据上下文】\n{context_part}\n\n【待审查初稿】\n{draft}"},
+                ],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            critique = critique_completion.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning("自我审查（critique）失败，返回原草稿: %s", e, exc_info=True)
+            return draft
+
+        # 五条清单全部通过 → 无需修正，省一次调用
+        if critique.strip().startswith("通过"):
+            return draft
+
+        try:
+            revise_completion = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是修订编辑。根据审查意见修正初稿：删除或改写无出处的数字、禁用词、无据断言、合规越界和 AI 腔内容，保留其余内容与原结构。只输出修正后的完整正文，不要解释。"},
+                    {"role": "user", "content": f"【数据上下文】\n{context_part}\n\n【初稿】\n{draft}\n\n【审查意见】\n{critique}"},
+                ],
+                temperature=0.2,
+                max_tokens=8192,
+            )
+            revised = revise_completion.choices[0].message.content or ""
+            if len(revised.strip()) < 50:  # 修正版异常偏短（疑似失败），回退原稿
+                logger.warning("自我审查修正版过短（%d 字），返回原草稿", len(revised.strip()))
+                return draft
+            return revised
+        except Exception as e:
+            logger.warning("自我审查修正（revise）失败，返回原草稿: %s", e, exc_info=True)
+            return draft
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False,
