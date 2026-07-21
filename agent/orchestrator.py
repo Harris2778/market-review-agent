@@ -334,6 +334,7 @@ class MarketReviewAgent:
         )
         self.model = "deepseek-chat"
         self._cache: dict = {}  # 行情数据缓存
+        self._pending: dict = {}  # 待续写状态：{session_key: {system, user}}
 
     @property
     def cache_warm(self) -> bool:
@@ -344,9 +345,15 @@ class MarketReviewAgent:
     async def process_message(
         self, message: str, stream: bool = False
     ) -> dict | AsyncGenerator:
-        """
-        处理用户消息，返回 OpenAI 兼容格式的响应。
-        """
+        """处理用户消息。"""
+        # "继续"：续写上次截断内容
+        if message.strip() in ["继续", "继续输出", "接着来", "继续分析", "go on", "continue"]:
+            if self._pending:
+                key = list(self._pending.keys())[-1]
+                state = self._pending.pop(key)
+                return await self._continue_output(state, stream)
+            return {"role": "assistant", "content": "没有待续写的内容。"}
+
         intent, sector = detect_intent(message)
 
         if intent == "general_chat":
@@ -583,6 +590,13 @@ class MarketReviewAgent:
         info = f"{kw}期货: 价格{q.get('price','?')} 涨跌{q.get('pct','?')}% 成交量{q.get('volume','?')}"
         return {"role": "assistant", "content": info}
 
+    async def _continue_output(self, state: dict, stream: bool):
+        """续写上次截断的内容。"""
+        system = state["system"]
+        user_prompt = f"上一段末尾内容:\n{state['prev']}\n\n请从上一段末尾继续输出，不要重复已输出的内容。数据如下:\n{state['data']}"
+        result = await self._call_llm(system, user_prompt, stream)
+        return result
+
     async def _fund_query(self, message: str, stream: bool):
         """基金/期货/股票/汇率等通用MCP查询——LLM自动选择工具。"""
         from agent.data_fetcher import get_mcp_tools, _mcp_call
@@ -630,10 +644,14 @@ class MarketReviewAgent:
             )
             raw = completion.choices[0].message.content
             disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
-            return {
-                "role": "assistant",
-                "content": _clean_markdown(raw) + disclaimer,
-            }
+            clean = _clean_markdown(raw)
+            # 检测是否被截断（内容>5000字且末尾无句号）
+            finish = completion.choices[0].finish_reason
+            if finish == "length" or (len(clean) > 5000 and not clean.rstrip().endswith(("。","）",")","\"","\n"))):
+                hint = "\n\n[内容较长，回复"继续"查看剩余部分]"
+                self._pending[str(len(self._pending))] = {"system": system_prompt, "data": user_message[:2000], "prev": clean[-1000:]}
+                return {"role": "assistant", "content": clean + disclaimer + hint}
+            return {"role": "assistant", "content": clean + disclaimer}
 
     async def _stream_response(self, messages: list) -> AsyncGenerator:
         """流式响应生成器。注意：流式不清理markdown，但非流式会清理。"""
