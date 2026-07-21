@@ -411,28 +411,54 @@ class MarketReviewAgent:
         return await self._call_llm(system, user_prompt, stream)
 
     async def _news_only(self, sector: str, stream: bool):
-        """新闻专属模式：全量48h新闻，不过滤不限量。"""
+        """新闻专属模式：代码层按行业关键字精准过滤，48小时全覆盖。"""
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
         date_str = trade_date.strftime("%Y%m%d")
         date_display = trade_date.strftime("%Y年%m月%d日")
+        weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
 
-        # 不过滤，全量采集
+        # 采集全量新闻 + 代码层按行业过滤
+        from agent.data_fetcher import filter_news_by_sector as _filter
         snapshot = await collect_market_snapshot(date=date_str, sector_focus=None)
-        news_block = _format_all_news(snapshot, date_display)
+        all_em = snapshot.news_items.get("eastmoney", [])
+        all_sina = snapshot.news_items.get("sina", [])
+        if sector:
+            all_em = _filter(all_em, sector)
+            all_sina = _filter(all_sina, sector)
+        # 合并、去重、按时间排序
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for item in all_sina + all_em:
+            t = item.get("time", "")[:10] or item.get("time", "")[:10]
+            if t:
+                title = item.get("title", "")
+                by_date[t].append(title)
+        # 去重
+        for d in by_date:
+            by_date[d] = list(dict.fromkeys(by_date[d]))
 
+        total = sum(len(v) for v in by_date.values())
         label = f"{sector}板块" if sector else "全市场"
-        system = f"""你是财经新闻编辑。以下是{label}新闻汇总，覆盖{date_display}及前一天（48小时）。请将以下所有新闻按日期分组列出。每条格式：[时间] 标题。不要添加分析。纯文本。"""
+        dates_sorted = sorted(by_date.keys(), reverse=True)
 
-        user_prompt = f"""{label}新闻汇总 — {date_display}及前一天（48小时全覆盖）
+        # 直接拼接新闻文本，不依赖LLM格式化
+        news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
+        for d in dates_sorted:
+            news_text += f"\n--- {d}（{len(by_date[d])}条）---\n"
+            for title in by_date[d]:
+                news_text += f"[{d}] {title}\n"
 
-{news_block}
+        # 如果无新闻，诚实告知
+        if total == 0:
+            news_text += "\n未找到该板块相关新闻。请尝试更宽泛的行业名称（如'电子'而非'半导体'），或查询'全市场新闻'。"
 
-以上所有新闻全部列出，不许跳过任何一条。按日期分组，先列{date_display}，再列前一天。"""
+        system = f"你是财经新闻编辑。请将以下{label}新闻汇总原样输出给用户。不要删减、不要添加分析、不要修改格式。纯文本。"
+        user_prompt = f"{news_text}\n\n以上是{label}48小时新闻汇总。原样输出，不要改动。"
 
         result = await self._call_llm(system, user_prompt, stream)
         if not stream and isinstance(result, dict):
-            result["content"] = news_block + "\n\n" + result["content"]
+            result["content"] = news_text
         return result
 
     async def _call_llm(
