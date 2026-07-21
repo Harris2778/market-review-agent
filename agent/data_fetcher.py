@@ -564,6 +564,34 @@ def fetch_us_sectors() -> list:
     return items
 
 
+def fetch_limit_up_pool() -> list:
+    """A股涨停池。"""
+    d = _mcp_call("cnMarketLimitUpPool", {})
+    items = []
+    data = d.get("result",{}).get("data",[]) or []
+    for it in data[:15]:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "pct": it.get("change_pct",""),
+                      "reason": it.get("reason","")})
+    return items
+
+
+def fetch_lian_ban() -> list:
+    """连板个股。"""
+    d = _mcp_call("cnStockLianBC", {})
+    items = []
+    data = d.get("result",{}).get("data",[]) or []
+    for it in data[:10]:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "count": it.get("limit_count","")})
+    return items
+
+
+def fetch_us_fund_flow() -> list:
+    """美股今日资金趋势。"""
+    d = _mcp_call("usTradingFundFlow1Day", {"symbol": "AAPL"})
+    data = d.get("result",{}).get("data",{}) or d.get("data",{})
+    return [data] if data else []
+
+
 def fetch_hk_sectors() -> list:
     """港股板块行情。"""
     d = _mcp_call("hkSectorQuotesList", {"type": "hangye", "num": 10, "page": 1})
@@ -1233,8 +1261,9 @@ async def collect_market_snapshot(
         "breadth": loop.run_in_executor(None, fetch_market_breadth),
         "hot": loop.run_in_executor(None, fetch_hot_stocks),
         "us_breadth": loop.run_in_executor(None, fetch_us_breadth),
-        "us_sec": loop.run_in_executor(None, fetch_us_sectors),
-        "hk_sec": loop.run_in_executor(None, fetch_hk_sectors),
+        "limit_up": loop.run_in_executor(None, fetch_limit_up_pool),
+        "lian_ban": loop.run_in_executor(None, fetch_lian_ban),
+        "us_fund": loop.run_in_executor(None, fetch_us_fund_flow),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1265,6 +1294,9 @@ async def collect_market_snapshot(
     snapshot._north_flow = safe(results_raw.get("north_flow"), [])
     snapshot._us_sec = safe(results_raw.get("us_sec"), [])
     snapshot._hk_sec = safe(results_raw.get("hk_sec"), [])
+    snapshot._limit_up = safe(results_raw.get("limit_up"), [])
+    snapshot._lian_ban = safe(results_raw.get("lian_ban"), [])
+    snapshot._us_fund = safe(results_raw.get("us_fund"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1491,6 +1523,16 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("### 港股板块表现TOP10")
         for s in hk_sec[:8]:
             lines.append(f"- {s['name']}: {s['pct']}")
+    limit_up = getattr(snapshot, "_limit_up", [])
+    if limit_up:
+        lines.append(f"### A股涨停池（{len(limit_up)}只）")
+        for s in limit_up[:10]:
+            lines.append(f"- {s['name']}({s['code']}) {s['pct']} {s.get('reason','')}")
+    lian_ban = getattr(snapshot, "_lian_ban", [])
+    if lian_ban:
+        lines.append("### 连板个股")
+        for s in lian_ban[:8]:
+            lines.append(f"- {s['name']}({s['code']}) {s.get('count','')}连板")
 
     # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
