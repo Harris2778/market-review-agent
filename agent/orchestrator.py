@@ -745,22 +745,61 @@ class MarketReviewAgent:
                 max_tokens=8192,
             )
             raw = completion.choices[0].message.content
+            # 输出截断检测：finish_reason="length" 表示撞了 max_tokens，自动续写一次
+            if getattr(completion.choices[0], "finish_reason", None) == "length":
+                continuation = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages + [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": "请从上次中断处继续，不要重复已输出内容。"},
+                    ],
+                    temperature=0.2,
+                    max_tokens=8192,
+                )
+                more = continuation.choices[0].message.content or ""
+                if getattr(continuation.choices[0], "finish_reason", None) == "length":
+                    logger.warning("LLM 输出截断，续写一次后仍为 length，放弃继续续写")
+                else:
+                    logger.info("检测到 LLM 输出截断（finish_reason=length），已自动续写一次")
+                raw = (raw or "") + more
             disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
             clean = _clean_markdown(raw)
             return {"role": "assistant", "content": clean + disclaimer}
 
     async def _stream_response(self, messages: list) -> AsyncGenerator:
         """流式响应生成器。注意：流式不清理markdown，但非流式会清理。"""
-        stream = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=8192,
-            stream=True,
-        )
-        async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        accumulated = ""
+        continued = False
+        current_messages = messages
+        while True:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=current_messages,
+                temperature=0.2,
+                max_tokens=8192,
+                stream=True,
+            )
+            finish_reason = None
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.delta.content:
+                    accumulated += choice.delta.content
+                    yield choice.delta.content
+                # 只有最后一个 chunk 的 finish_reason 有值（中间 chunk 为 None）
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+            # 输出截断检测：撞了 max_tokens 则无缝续写一轮（最多一次），对用户透明
+            if finish_reason == "length" and not continued:
+                continued = True
+                logger.warning("流式输出被截断（finish_reason=length），自动续写一次")
+                current_messages = messages + [
+                    {"role": "assistant", "content": accumulated},
+                    {"role": "user", "content": "请从上次中断处继续，不要重复已输出内容。"},
+                ]
+                continue
+            break
 
 
 # ── 全局单例 ──

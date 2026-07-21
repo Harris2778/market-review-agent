@@ -43,10 +43,13 @@ def _make_agent() -> MarketReviewAgent:
     return agent
 
 
-def _fake_completion(content: str = "复盘正文"):
+def _fake_completion(content: str = "复盘正文", finish_reason: str = "stop"):
     """伪造 chat.completions.create 的非流式返回对象。"""
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content),
+            finish_reason=finish_reason,
+        )]
     )
 
 
@@ -357,3 +360,107 @@ class TestNewsDedup:
         assert "这是一条正常长度的新闻标题" in content
         # 只有一条有效新闻
         assert "共1+0条" in content or "共1条" in content or content.count("---") >= 1
+
+
+# ════════════════════════════════════════════════════════════════
+# 5. 输出截断检测 + 自动续写（finish_reason == "length"）
+# ════════════════════════════════════════════════════════════════
+
+
+class TestTruncationContinuation:
+    """DeepSeek 撞 max_tokens 时 finish_reason="length"，必须自动续写一次拼接内容。"""
+
+    def test_non_stream_truncated_then_continued(self):
+        """非流式：第一次 length、第二次 stop → 两段拼接，create 恰好 2 次，
+        且第二次调用的 messages 含 assistant 部分内容 + 继续指令。"""
+        agent = _make_agent()
+        agent.client.chat.completions.create = AsyncMock(
+            side_effect=[
+                _fake_completion("前半段内容", finish_reason="length"),
+                _fake_completion("后半段内容", finish_reason="stop"),
+            ]
+        )
+
+        result = asyncio.run(agent._call_llm("系统提示", "用户消息", stream=False))
+
+        create = agent.client.chat.completions.create
+        assert create.await_count == 2
+        # 最终 content 是两段拼接（外加免责声明）
+        assert "前半段内容" in result["content"]
+        assert "后半段内容" in result["content"]
+        assert "风险提示" in result["content"]
+        # 第二次调用的 messages：assistant 带已生成内容 + user 继续指令
+        second_messages = create.await_args.kwargs["messages"]
+        assert second_messages[-2]["role"] == "assistant"
+        assert "前半段内容" in second_messages[-2]["content"]
+        assert second_messages[-1]["role"] == "user"
+        assert "继续" in second_messages[-1]["content"]
+        # 续写调用也带 max_tokens=8192
+        assert create.await_args.kwargs.get("max_tokens") == 8192
+
+    def test_non_stream_truncated_twice_gives_up(self):
+        """非流式：两次都 length → 只续 1 次（create 恰好 2 次），仍返回已拼接内容。"""
+        agent = _make_agent()
+        agent.client.chat.completions.create = AsyncMock(
+            side_effect=[
+                _fake_completion("第一段", finish_reason="length"),
+                _fake_completion("第二段", finish_reason="length"),
+            ]
+        )
+
+        result = asyncio.run(agent._call_llm("系统提示", "用户消息", stream=False))
+
+        create = agent.client.chat.completions.create
+        assert create.await_count == 2, (
+            f"最多续写 1 次，create 应恰好调用 2 次，实际 {create.await_count} 次"
+        )
+        assert "第一段" in result["content"]
+        assert "第二段" in result["content"]
+        assert "风险提示" in result["content"]
+
+    def test_stream_truncated_then_continued_seamlessly(self):
+        """流式：第一轮末尾 finish_reason=length → 自动续写一轮，
+        消费到的 chunk 序列是两轮流的无缝拼接。"""
+        agent = _make_agent()
+
+        def _chunk(content, finish_reason=None):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=content),
+                    finish_reason=finish_reason,
+                )]
+            )
+
+        async def first_stream():
+            yield _chunk("你好")
+            yield _chunk("世界", finish_reason="length")
+
+        async def second_stream():
+            yield _chunk("，继续")
+            yield _chunk("输出", finish_reason="stop")
+
+        agent.client.chat.completions.create = AsyncMock(
+            side_effect=[first_stream(), second_stream()]
+        )
+
+        async def run_stream():
+            gen = await agent._call_llm("系统提示", "用户消息", stream=True)
+            chunks = []
+            async for piece in gen:
+                chunks.append(piece)
+            return chunks
+
+        chunks = asyncio.run(run_stream())
+
+        create = agent.client.chat.completions.create
+        assert create.await_count == 2
+        # 两轮流的 chunk 无缝拼接，对用户透明
+        assert chunks == ["你好", "世界", "，继续", "输出"]
+        assert "".join(chunks) == "你好世界，继续输出"
+        # 第二轮调用的 messages 含 assistant 已累积内容 + 继续指令
+        second_messages = create.await_args.kwargs["messages"]
+        assert second_messages[-2]["role"] == "assistant"
+        assert second_messages[-2]["content"] == "你好世界"
+        assert second_messages[-1]["role"] == "user"
+        assert "继续" in second_messages[-1]["content"]
+        assert create.await_args.kwargs.get("stream") is True
