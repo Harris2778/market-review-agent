@@ -22,6 +22,7 @@
 
 import asyncio
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -574,3 +575,110 @@ class TestOrchestratorArchiveIntegration:
         chunks = asyncio.run(run_stream())
         assert "".join(chunks) == "正文", "存档异常不应影响流式产出"
         assert broken_archive.save_analysis.call_count == 1
+
+
+
+# ════════════════════════════════════════════════════════════════
+# 7. DATA_DIR 统一约定（存储持久化波次）
+# ════════════════════════════════════════════════════════════════
+
+
+class TestDataDirConvention:
+    """ARCHIVE_DIR 显式优先；缺省推导为 ${DATA_DIR:-data}/archive。"""
+
+    def test_default_derives_from_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        assert archive._archive_dir() == str(tmp_path / "mydata" / "archive")
+
+    def test_default_without_data_dir_is_data_archive(self, monkeypatch):
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.delenv("DATA_DIR", raising=False)
+        assert archive._archive_dir() == os.path.join("data", "archive")
+
+    def test_empty_data_dir_falls_back(self, monkeypatch):
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", "")
+        assert archive._archive_dir() == os.path.join("data", "archive")
+
+    def test_explicit_archive_dir_wins_over_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "explicit"))
+        assert archive._archive_dir() == str(tmp_path / "explicit")
+
+    def test_save_analysis_uses_data_dir_derived_path(self, tmp_path, monkeypatch):
+        """不设 ARCHIVE_DIR 时，存档实际落到 ${DATA_DIR}/archive 下。"""
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        rid = archive.save_analysis(
+            "market_review", None, "正文涨1.2%", "ctx", FIXED_DATE_STR
+        )
+        assert rid is not None
+        day_file = tmp_path / "mydata" / "archive" / f"archive_{FIXED_DATE_STR}.jsonl"
+        assert day_file.exists(), "存档应落到 DATA_DIR 推导目录"
+        rec = archive.load_records(FIXED_DATE_STR)[0]
+        assert rec["id"] == rid
+
+
+# ════════════════════════════════════════════════════════════════
+# 8. Railway 临时存储警告（每模块仅警告一次）
+# ════════════════════════════════════════════════════════════════
+
+_WARN_KEYWORD = "运行在 Railway 但未挂卷"
+
+
+class TestEphemeralStorageWarning:
+    def test_warns_on_railway_without_volume(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))  # 非 /data 开头
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            archive._archive_dir()
+        assert any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_dir_under_volume(self, monkeypatch, caplog):
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", "/data/archive")  # 挂载卷路径下
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            archive._archive_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_off_railway(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            archive._archive_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_warns_only_once_per_module(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            archive._archive_dir()
+            archive._archive_dir()
+            archive._archive_dir()
+        warns = [r for r in caplog.records if _WARN_KEYWORD in r.getMessage()]
+        assert len(warns) == 1, "同一模块重复解析目录只应警告一次"
+
+    def test_data_dir_derived_ephemeral_path_warns(self, tmp_path, monkeypatch, caplog):
+        """DATA_DIR 推导出的临时目录同样触发警告（未挂卷场景）。"""
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            archive._archive_dir()
+        assert any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_data_dir_on_volume_no_warning(self, monkeypatch, caplog):
+        """DATA_DIR=/data 时推导目录在挂载卷下，不警告（生产正确配置）。"""
+        monkeypatch.setattr(archive, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", "/data")
+        with caplog.at_level(logging.WARNING, logger="agent.archive"):
+            assert archive._archive_dir() == "/data/archive"
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)

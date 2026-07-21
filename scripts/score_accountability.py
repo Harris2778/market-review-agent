@@ -4,7 +4,7 @@
 用法：
     /usr/local/bin/python3 scripts/score_accountability.py [--days 5] [--archive-dir DIR]
 
-流程：扫描存档目录（ARCHIVE_DIR 或 data/archive/）下 archive_*.jsonl，
+流程：扫描存档目录（ARCHIVE_DIR，缺省 ${DATA_DIR:-data}/archive）下 archive_*.jsonl，
 对 score 为 null 且 trade_date 距今 >= days 天的记录，取实际行情涨跌幅打分，
 写回 score/scored_at/score_note，并打印 hit/miss/neutral 汇总与明细。
 
@@ -102,7 +102,7 @@ def main(argv=None):
     parser.add_argument("--days", type=int, default=5,
                         help="只打分 trade_date 距今 >= 该天数的记录（默认 5）")
     parser.add_argument("--archive-dir", default=scorer.default_archive_dir(),
-                        help="存档目录（默认取 ARCHIVE_DIR 或 data/archive/）")
+                        help="存档目录（默认取 ARCHIVE_DIR，缺省 ${DATA_DIR:-data}/archive）")
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.archive_dir):

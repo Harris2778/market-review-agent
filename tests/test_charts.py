@@ -207,14 +207,16 @@ def test_generate_daily_charts_default_dir_uses_env_and_date_subdir(tmp_path, mo
 
 def test_generate_daily_charts_default_dir_fallback(tmp_path, monkeypatch):
     monkeypatch.delenv("CHART_DIR", raising=False)
-    monkeypatch.chdir(tmp_path)  # 相对 charts/ 落进临时目录，不污染仓库
+    monkeypatch.delenv("DATA_DIR", raising=False)  # 隔离外部环境，固定旧缺省推导
+    monkeypatch.chdir(tmp_path)  # 相对 data/charts/ 落进临时目录，不污染仓库
     snap = _full_snapshot()
     snap.date = ""  # 缺失日期回退为今天
     paths = generate_daily_charts(snap)
     today = datetime.now().strftime("%Y%m%d")
     assert len(paths) == 3
     for p in paths:
-        assert os.path.basename(os.path.dirname(p)) == today
+        # 新约定：缺省为 ${DATA_DIR:-data}/charts/<日期>（相对路径）
+        assert os.path.dirname(p) == os.path.join("data", "charts", today)
         assert os.path.exists(tmp_path / p)
 
 
@@ -243,3 +245,88 @@ def test_generate_daily_charts_all_bad_indices_skips_chart(tmp_path):
     snap.indices = {"坏值": {"pct_chg": "abc"}}
     paths = generate_daily_charts(snap, out_dir=str(tmp_path / "c"))
     assert paths == []  # 全部条目无效 → 跳过该图且不抛
+
+
+# ── DATA_DIR 统一约定 + Railway 临时存储警告（存储持久化波次）──
+
+_WARN_KEYWORD = "运行在 Railway 但未挂卷"
+
+
+def test_default_dir_derives_from_data_dir(tmp_path, monkeypatch):
+    """不设 CHART_DIR 时，默认图表根目录推导为 ${DATA_DIR}/charts。"""
+    monkeypatch.delenv("CHART_DIR", raising=False)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+    snap = _full_snapshot()
+    snap.date = "20260609"
+    paths = generate_daily_charts(snap)
+    assert len(paths) == 3
+    for p in paths:
+        assert os.path.dirname(p) == str(tmp_path / "mydata" / "charts" / "20260609")
+        assert os.path.exists(p)
+
+
+def test_explicit_chart_dir_wins_over_data_dir(tmp_path, monkeypatch):
+    """CHART_DIR 显式设置时优先于 DATA_DIR 推导。"""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+    monkeypatch.setenv("CHART_DIR", str(tmp_path / "explicit_charts"))
+    paths = generate_daily_charts(_full_snapshot())
+    assert len(paths) == 3
+    for p in paths:
+        assert str(tmp_path / "explicit_charts") in p
+        assert str(tmp_path / "mydata") not in p
+
+
+def test_ephemeral_warning_on_railway_without_volume(tmp_path, monkeypatch, caplog):
+    import agent.charts as charts_mod
+    monkeypatch.setattr(charts_mod, "_EPHEMERAL_WARNED", False)
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))  # 非 /data 开头
+    with caplog.at_level(logging.WARNING, logger="agent.charts"):
+        paths = generate_daily_charts(_full_snapshot())
+    assert len(paths) == 3  # 警告不影响图表生成
+    assert any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+
+def test_ephemeral_warning_suppressed_when_on_volume(monkeypatch, caplog):
+    import agent.charts as charts_mod
+    monkeypatch.setattr(charts_mod, "_EPHEMERAL_WARNED", False)
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("CHART_DIR", "/data/charts")  # 挂载卷路径下
+    # 目录 /data/charts 在本地不可写也无妨——本用例只验证警告判定，
+    # 目录创建失败走既有的 fail-safe 分支返回空清单。
+    with caplog.at_level(logging.WARNING, logger="agent.charts"):
+        generate_daily_charts(_full_snapshot())
+    assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+
+def test_ephemeral_warning_off_railway_silent(tmp_path, monkeypatch, caplog):
+    import agent.charts as charts_mod
+    monkeypatch.setattr(charts_mod, "_EPHEMERAL_WARNED", False)
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))
+    with caplog.at_level(logging.WARNING, logger="agent.charts"):
+        generate_daily_charts(_full_snapshot())
+    assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+
+def test_ephemeral_warning_fires_only_once(tmp_path, monkeypatch, caplog):
+    import agent.charts as charts_mod
+    monkeypatch.setattr(charts_mod, "_EPHEMERAL_WARNED", False)
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))
+    with caplog.at_level(logging.WARNING, logger="agent.charts"):
+        generate_daily_charts(_full_snapshot())
+        generate_daily_charts(_full_snapshot())
+    warns = [r for r in caplog.records if _WARN_KEYWORD in r.getMessage()]
+    assert len(warns) == 1, "同一模块重复生成图表只应警告一次"
+
+
+def test_explicit_out_dir_skips_warning(tmp_path, monkeypatch, caplog):
+    """显式 out_dir 是调用方自主选择，不触发环境配置警告。"""
+    import agent.charts as charts_mod
+    monkeypatch.setattr(charts_mod, "_EPHEMERAL_WARNED", False)
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    with caplog.at_level(logging.WARNING, logger="agent.charts"):
+        paths = generate_daily_charts(_full_snapshot(), out_dir=str(tmp_path / "c"))
+    assert len(paths) == 3
+    assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)

@@ -10,6 +10,7 @@
 import os
 import json
 import logging
+import re
 import threading
 import time
 import requests
@@ -48,7 +49,8 @@ def _get_pro():
         import tushare as ts
         ts.set_token(token)
         return ts.pro_api()
-    except Exception:
+    except Exception as e:
+        logger.warning("_get_pro 初始化 Tushare 连接失败: %s", e)
         return None
 
 
@@ -244,7 +246,8 @@ def fetch_fund_flows(date: str) -> dict:
                 result["north_bound"] = round(nm / 10000, 2)
             if sm != 0:
                 result["south_bound"] = round(sm / 10000, 2)
-    except Exception:
+    except Exception as e:
+        logger.warning("fetch_fund_flows 沪深港通资金流(区间查询)获取失败，改按交易日重试: %s", e)
         try:
             df = pro.moneyflow_hsgt(trade_date=date)
             if df is not None and not df.empty:
@@ -255,16 +258,16 @@ def fetch_fund_flows(date: str) -> dict:
                     result["north_bound"] = round(nm / 10000, 2)
                 if sm != 0:
                     result["south_bound"] = round(sm / 10000, 2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("fetch_fund_flows 沪深港通资金流(交易日查询)获取失败: %s", e)
 
     # 融资融券
     try:
         df_m = pro.margin(trade_date=date)
         if df_m is not None and not df_m.empty:
             result["margin_bal"] = round(float(df_m["rzye"].sum()) / 1e8, 2)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_fund_flows 融资融券余额获取失败: %s", e)
 
     return result
 
@@ -272,6 +275,71 @@ def fetch_fund_flows(date: str) -> dict:
 # ═══════════════════════════════════════════
 # 新闻采集（Tushare 新闻 + Finnhub）
 # ═══════════════════════════════════════════
+
+# ── 新闻 prompt 注入防护 ──
+# 五个来源的新闻标题/内容是不可信外部输入，直接拼进 LLM prompt 前必须中和注入模式。
+# 命中片段统一替换为占位符；sanitizer 幂等（占位符不会再次命中），聚合出口可二次过滤。
+
+NEWS_FILTER_PLACEHOLDER = "〔已过滤〕"
+
+_NEWS_INJECTION_PATTERNS = [
+    # 中文：忽略/无视/忘掉 + 之前/以上/上述 + 指令/提示/任务（动词兼容 ignore/forget 混写）
+    re.compile(
+        r"(?:忽略|无视|忘掉|忘记|丢弃|ignore|forget|disregard)[^。；;！!？?\n]{0,8}?"
+        r"(?:之前|以上|上述|先前|预设)[^。；;！!？?\n]{0,6}?"
+        r"(?:指令|指示|提示|任务|命令|要求|设定|规则|提示词)",
+        re.IGNORECASE,
+    ),
+    # 英文：ignore/forget/disregard + previous/above + instructions/prompt
+    re.compile(
+        r"\b(?:ignore|forget|disregard|override|bypass)\b[^.\n]{0,40}?"
+        r"\b(?:previous|prior|above|earlier|initial|all)\b[^.\n]{0,40}?"
+        r"\b(?:instructions?|prompts?|tasks?|commands?|rules?)\b",
+        re.IGNORECASE,
+    ),
+    # 角色劫持：你现在是/你扮演的角色是 / you are now / act as
+    re.compile(
+        r"你现在是|你扮演的角色是|你将扮演|从现在开始你是|假设你是"
+        r"|\byou are now\b|\bact as\b|\bpretend to be\b|\bfrom now on,? you\b",
+        re.IGNORECASE,
+    ),
+    # 伪装系统消息：system:/system :
+    re.compile(r"\bsystem\s*:\s*", re.IGNORECASE),
+    # 套取系统提示：输出/打印/显示 + 系统提示/提示词/系统指令
+    re.compile(
+        r"(?:输出|打印|显示|重复|背诵|透露|泄露|告诉我)[^。；;！!？?\n]{0,12}?"
+        r"(?:系统提示|系统指令|提示词|初始指令|内部指令)"
+        r"|\b(?:print|output|reveal|show|repeat|tell me|disclose)\b[^.\n]{0,40}?"
+        r"\b(?:system prompt|initial instructions?|your instructions?)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _sanitize_news_text(text, max_len: int = None) -> str:
+    """净化不可信新闻文本，中和 prompt 注入片段。
+
+    - 命中注入模式的中英文片段替换为 〔已过滤〕，并 logger.warning 计数
+      （每次调用最多记一次；幂等，二次过滤不会重复命中/重复记日志）。
+    - max_len 可选截断（content/summary 类字段建议 500），截断后追加『…』。
+    - fail-safe：None/非 str 一律返回空串。
+    """
+    if not isinstance(text, str):
+        return ""
+    if not text:
+        return ""
+    cleaned = text
+    hit = False
+    for pat in _NEWS_INJECTION_PATTERNS:
+        if pat.search(cleaned):
+            hit = True
+            cleaned = pat.sub(NEWS_FILTER_PLACEHOLDER, cleaned)
+    if hit:
+        logger.warning("新闻文本疑似 prompt 注入，已过滤: %s", text[:80])
+    if max_len is not None and max_len > 0 and len(cleaned) > max_len:
+        cleaned = cleaned[:max_len] + "…"
+    return cleaned
+
 
 def fetch_tushare_news(date: str, limit: int = 25) -> list:
     """从 Tushare 获取主流财经新闻。"""
@@ -287,8 +355,8 @@ def fetch_tushare_news(date: str, limit: int = 25) -> list:
                 items.append({
                     "source": "财联社",
                     "time": str(row.get("datetime", "")),
-                    "title": str(row.get("title", "")),
-                    "content": str(row.get("content", ""))[:300],
+                    "title": _sanitize_news_text(str(row.get("title", ""))),
+                    "content": _sanitize_news_text(str(row.get("content", "")), max_len=500),
                 })
     except Exception as e:
         # 常见原因：token 无 news 接口权限，降级尝试 sina 源
@@ -303,8 +371,8 @@ def fetch_tushare_news(date: str, limit: int = 25) -> list:
                     items.append({
                         "source": "新浪财经",
                         "time": str(row.get("datetime", "")),
-                        "title": str(row.get("title", "")),
-                        "content": str(row.get("content", ""))[:300],
+                        "title": _sanitize_news_text(str(row.get("title", ""))),
+                        "content": _sanitize_news_text(str(row.get("content", "")), max_len=500),
                     })
         except Exception as e:
             logger.warning("Tushare 新闻(sina源)获取失败: %s", str(e)[:120])
@@ -329,11 +397,11 @@ def fetch_finnhub_news(limit: int = 10) -> list:
             items.append({
                 "source": item.get("source", "Finnhub"),
                 "time": time_str,
-                "title": item.get("headline", ""),
-                "summary": item.get("summary", ""),
+                "title": _sanitize_news_text(item.get("headline", "")),
+                "summary": _sanitize_news_text(item.get("summary", ""), max_len=500),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_finnhub_news Finnhub新闻获取失败: %s", e)
     return items
 
 
@@ -357,11 +425,11 @@ def fetch_eastmoney_news(limit: int = 25) -> list:
             items.append({
                 "source": "东方财富",
                 "time": item.get("showTime", ""),
-                "title": item.get("title", "")[:150],
-                "summary": item.get("summary", "")[:300] if item.get("summary") else "",
+                "title": _sanitize_news_text(item.get("title", "")[:150]),
+                "summary": _sanitize_news_text(item.get("summary", ""), max_len=500) if item.get("summary") else "",
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_eastmoney_news 东方财富快讯获取失败: %s", e)
     return items
 
 
@@ -446,11 +514,11 @@ def fetch_eastmoney_news_page2(limit: int = 80) -> list:
             items.append({
                 "source": "东方财富",
                 "time": item.get("showTime", ""),
-                "title": item.get("title", "")[:150],
-                "summary": item.get("summary", "")[:300] if item.get("summary") else "",
+                "title": _sanitize_news_text(item.get("title", "")[:150]),
+                "summary": _sanitize_news_text(item.get("summary", ""), max_len=500) if item.get("summary") else "",
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_eastmoney_news_page2 东方财富第2页获取失败: %s", e)
     return items
 
 
@@ -471,10 +539,10 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
         for item in data.get("data", {}).get("fastNewsList", []):
             items.append({
                 "source": "东方财富", "time": item.get("showTime", ""),
-                "title": item.get("title", "")[:150],
+                "title": _sanitize_news_text(item.get("title", "")[:150]),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_eastmoney_news_page3 东方财富第3页获取失败: %s", e)
     return items
 
 
@@ -505,8 +573,8 @@ def get_mcp_tools() -> list:
                                 "params":list(t.get("inputSchema",{}).get("properties",{}).keys())}
                               for t in tools]
             return _mcp_tools_cache
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("get_mcp_tools MCP工具列表获取失败: %s", e)
     return []
 
 
@@ -537,8 +605,8 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
             # 格式1: JSON → 尝试解析
             try:
                 return json.loads(text)
-            except:
-                pass
+            except Exception as e:
+                logger.warning("_mcp_call 响应非JSON，降级按文本格式解析: %s", e)
             # 格式2: var xxx="csv,data" 或 HTML/纯文本
             if "var " in text and "=\"" in text:
                 csv = text.split('="')[1].split('"')[0] if '="' in text else text
@@ -547,11 +615,12 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
             if text.strip().startswith("{") or text.strip().startswith("["):
                 try:
                     return json.loads(text)
-                except:
+                except Exception as e:
+                    logger.warning("_mcp_call 类JSON文本解析失败，按原始文本返回: %s", e)
                     return {"raw": text, "type": "text"}
             return {"raw": text, "type": "text"}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_mcp_call MCP工具调用失败 tool=%s: %s", tool_name, e)
     return {}
 
 
@@ -666,7 +735,7 @@ def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
     items = []
     data = d.get("result",{}).get("data",[]) or []
     for it in data[:limit]:
-        items.append({"title": it.get("title",""), "url": it.get("url","")})
+        items.append({"title": _sanitize_news_text(it.get("title","")), "url": it.get("url","")})
     return items
 
 
@@ -731,8 +800,8 @@ def fetch_financials(code: str) -> dict:
             df = fn(ts_code=code, start_date="20260101", end_date="20260630")
             if df is not None and not df.empty:
                 result[name] = df.iloc[0].to_dict()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("fetch_financials %s获取失败 code=%s: %s", name, code, e)
     return result
 
 
@@ -746,8 +815,8 @@ def fetch_forecast(date: str = "") -> list:
         df = pro.forecast(ann_date=d)
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "type": r.get("type",""), "p_min": r.get("p_change_min",""), "p_max": r.get("p_change_max","")} for _, r in df.head(20).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_forecast 业绩预告获取失败 date=%s: %s", d, e)
     return []
 
 
@@ -761,8 +830,8 @@ def fetch_express(date: str = "") -> list:
         df = pro.express(ann_date=d)
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "revenue": r.get("revenue",""), "profit": r.get("operate_profit","")} for _, r in df.head(20).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_express 业绩快报获取失败 date=%s: %s", d, e)
     return []
 
 
@@ -776,8 +845,8 @@ def fetch_block_trades(code: str = "", date: str = "") -> list:
         df = pro.block_trade(ts_code=code, start_date=d, end_date=date or datetime.now().strftime("%Y%m%d")) if code else pro.block_trade(start_date=d, end_date=date or datetime.now().strftime("%Y%m%d"))
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "date": r.get("trade_date",""), "price": r.get("price",""), "amount": r.get("amount","")} for _, r in df.head(20).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_block_trades 大宗交易获取失败 code=%s date=%s: %s", code, date, e)
     return []
 
 
@@ -790,8 +859,8 @@ def fetch_fund_list(market: str = "E") -> list:
         df = pro.fund_basic(market=market)
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "name": r["name"], "type": r.get("fund_type",""), "company": r.get("management","")} for _, r in df.head(50).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_fund_list 基金列表获取失败 market=%s: %s", market, e)
     return []
 
 
@@ -806,8 +875,8 @@ def fetch_ggt_daily() -> list:
         df = pro.ggt_daily(start_date=start, end_date=today)
         if df is not None and not df.empty:
             return [{"date": r["trade_date"], "buy": r.get("buy_amount",""), "sell": r.get("sell_amount","")} for _, r in df.iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_ggt_daily 港股通资金流获取失败: %s", e)
     return []
 
 
@@ -821,8 +890,8 @@ def fetch_repurchase(date: str = "") -> list:
         df = pro.repurchase(ann_date=d)
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "vol": r.get("vol",""), "proc": r.get("proc","")} for _, r in df.head(20).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_repurchase 股票回购获取失败 date=%s: %s", d, e)
     return []
 
 
@@ -836,8 +905,8 @@ def fetch_share_float(date: str = "") -> list:
         df = pro.share_float(ann_date=d)
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "date": r.get("float_date",""), "share": r.get("float_share",""), "ratio": r.get("float_ratio","")} for _, r in df.head(20).iterrows()]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_share_float 限售解禁获取失败 date=%s: %s", d, e)
     return []
 
 
@@ -926,7 +995,7 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
                 if nd.get(tf):
                     raw_time = nd.get(tf)
                     break
-            items.append({"source":"智研","time":_fmt_news_time(raw_time, today_str),"title":title})
+            items.append({"source":"智研","time":_fmt_news_time(raw_time, today_str),"title":_sanitize_news_text(title)})
     except Exception as e:
         logger.warning("智研MCP新闻解析失败: %s", e)
     return items
@@ -957,7 +1026,7 @@ def fetch_sina_news(limit: int = 20, date_str: str = "") -> list:
                     "source": "新浪财经",
                     # 按日期查询时直接用日期；否则把 epoch ctime 格式化为可读时间
                     "time": date_str if date_str else _fmt_news_time(item.get("ctime", "")),
-                    "title": title[:150],
+                    "title": _sanitize_news_text(title[:150]),
                 })
         except Exception as e:
             logger.warning("新浪新闻第%d页获取失败: %s", page, e)
@@ -1021,8 +1090,8 @@ def fetch_cls_telegraph(limit: int = 20) -> list:
                     "source": "财联社电报",
                     # ctime 为 epoch 秒，统一格式化为可读时间
                     "time": _fmt_news_time(item.get("ctime", "")),
-                    "title": title,
-                    "brief": str(item.get("brief", ""))[:200],
+                    "title": _sanitize_news_text(title),
+                    "brief": _sanitize_news_text(str(item.get("brief", "")), max_len=500),
                 })
             if len(items) >= limit:
                 break
@@ -1111,6 +1180,10 @@ def fetch_news_pool(sector_keywords: list = None, days: int = 3) -> dict:
             title = (it.get("title", "") or "").strip()
             if not title or title in seen_titles:
                 continue
+            # 双保险：聚合出口再过一次净化（幂等，正常文本零成本）
+            title = _sanitize_news_text(title)
+            if not title or title in seen_titles:
+                continue
             seen_titles.add(title)
             unified.append({
                 "title": title,
@@ -1148,8 +1221,8 @@ def fetch_top_list(date: str) -> list:
                     "l_sell": round(float(r.get("l_sell", 0)) / 1e8, 2),
                     "reason": str(r.get("reason", ""))[:100],
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_top_list 龙虎榜获取失败 date=%s: %s", date, e)
     return items
 
 
@@ -1171,8 +1244,8 @@ def fetch_north_holdings() -> list:
                     "vol": round(float(r.get("vol", 0)) / 1e8, 2),
                     "ratio": round(float(r.get("ratio", 0)), 2),
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_north_holdings 北向持仓获取失败: %s", e)
     return items
 
 
@@ -1223,8 +1296,8 @@ def fetch_sector_volume_all(date: str) -> dict:
                 "amount": round(sector_amount[sector], 2),
                 "vol": round(sector_vol[sector], 2),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_sector_volume_all 全行业成交额聚合失败 date=%s: %s", date, e)
     return result
 
 
@@ -1244,8 +1317,8 @@ def fetch_shibor() -> dict:
                 "1月": f"{float(r['1m']):.4f}%",
                 "3月": f"{float(r['3m']):.4f}%",
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_shibor SHIBOR获取失败: %s", e)
     return {}
 
 
@@ -1271,8 +1344,8 @@ def fetch_broker_recommendations() -> list:
                 {"code": r["ts_code"], "name": r["name"], "brokers": int(r["count"])}
                 for _, r in top.iterrows()
             ]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_broker_recommendations 券商推荐获取失败 month=%s: %s", this_month, e)
     return []
 
 
@@ -1314,8 +1387,8 @@ def _load_stock_names():
             for _, row in df.iterrows():
                 _stock_name_cache[row["ts_code"]] = row.get("name", "")
                 _stock_sector_cache[row["ts_code"]] = row.get("industry", "")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("_load_stock_names 股票名称/行业映射加载失败: %s", e)
 
 
 def _stock_name(code: str) -> str:
@@ -1358,8 +1431,8 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
                 df = pro.daily(ts_code=",".join(batch), trade_date=date)
                 if df is not None and not df.empty:
                     all_daily.append(df)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("fetch_sector_stock_detail 成分股行情批次获取失败: %s", e)
 
         if not all_daily:
             return result
@@ -1431,12 +1504,13 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
                     "md_net": round((buy_md - sell_md) / 10000, 2),
                     "sm_net": round((buy_sm - sell_sm) / 10000, 2),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("fetch_sector_stock_detail 成分股资金流获取失败: %s", e)
 
         return result
 
-    except Exception:
+    except Exception as e:
+        logger.warning("fetch_sector_stock_detail 板块成分股行情获取失败 sector=%s: %s", sector_name, e)
         return result
 
 
@@ -1983,8 +2057,8 @@ def fetch_china_macro() -> dict:
             row = df.iloc[-1]
             result["CPI同比"] = f"{float(row['nt_yoy']):.2f}%"
             result["CPI环比"] = f"{float(row['nt_mom']):.2f}%"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro CPI获取失败: %s", e)
 
     # PPI
     try:
@@ -1992,8 +2066,8 @@ def fetch_china_macro() -> dict:
         if df is not None and not df.empty:
             row = df.iloc[-1]
             result["PPI同比"] = f"{float(row['ppi_yoy']):.2f}%"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro PPI获取失败: %s", e)
 
     # PMI
     try:
@@ -2002,8 +2076,8 @@ def fetch_china_macro() -> dict:
             row = df.iloc[-1]
             col0 = df.columns[0]
             result["制造业PMI"] = f"{float(row[col0]):.1f}"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro PMI获取失败: %s", e)
 
     # M2
     try:
@@ -2012,8 +2086,8 @@ def fetch_china_macro() -> dict:
             row = df.iloc[-1]
             result["M2同比"] = f"{float(row['m2_yoy']):.2f}%"
             result["M2余额"] = f"{float(row['m2']):.2f}万亿"  # M2绝对值作为背景
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro M2获取失败: %s", e)
 
     # GDP
     try:
@@ -2022,8 +2096,8 @@ def fetch_china_macro() -> dict:
             row = df.iloc[-1]
             result["GDP同比"] = f"{float(row['gdp_yoy']):.2f}%"
             result["GDP季度"] = str(row.get("quarter", ""))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro GDP获取失败: %s", e)
 
     # 社融
     try:
@@ -2032,8 +2106,8 @@ def fetch_china_macro() -> dict:
             row = df.iloc[-1]
             val = float(row.get("inc_month", 0))
             result["社融当月新增"] = f"{val / 10000:.2f}万亿" if val > 10000 else f"{val:.2f}亿"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro 社融获取失败: %s", e)
 
     # PPI产业链子项（上游→中游→下游传导）
     try:
@@ -2045,8 +2119,8 @@ def fetch_china_macro() -> dict:
             result["PPI_加工中游"] = f"{float(row['ppi_mp_p_yoy']):.1f}%"
             result["PPI_生活资料下游"] = f"{float(row['ppi_cg_yoy']):.1f}%"
             result["PPI_食品终端"] = f"{float(row['ppi_cg_f_yoy']):.1f}%"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_china_macro PPI产业链子项获取失败: %s", e)
 
     return result
 
@@ -2130,10 +2204,10 @@ def fetch_global_indices() -> dict:
                     prev = round(float(hist["Close"].iloc[-2]), 2) if len(hist) >= 2 else close
                     pct = round((close - prev) / prev * 100, 2) if prev else 0.0
                     result[name] = {"close": close, "pct_chg": pct}
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.warning("fetch_global_indices 指数获取失败 symbol=%s: %s", symbol, e)
+    except Exception as e:
+        logger.warning("fetch_global_indices yfinance 整体初始化失败: %s", e)
     return result
 
 
@@ -2157,10 +2231,10 @@ def fetch_us_macro() -> dict:
                 data = fred.get_series(sid, observation_start="2026-01-01")
                 if data is not None and len(data) > 0:
                     result[name] = round(float(data.iloc[-1]), 4)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.warning("fetch_us_macro FRED序列获取失败 sid=%s: %s", sid, e)
+    except Exception as e:
+        logger.warning("fetch_us_macro FRED初始化失败: %s", e)
     return result
 
 
@@ -2188,8 +2262,8 @@ def fetch_economic_calendar() -> list:
                         "country": ev.get("country", ""),
                         "importance": ev.get("star", 1),
                     })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("fetch_economic_calendar 经济日历获取失败: %s", e)
     return items
 
 

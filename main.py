@@ -21,7 +21,11 @@
 环境变量（可选 · 定时推送与图表静态服务）：
   PUSH_WEBHOOK_URL    定时推送的目标 Webhook URL（未配置则只生成内容记日志，不发送）
   PUSH_TIME           定时推送触发时间，上海时区 HH:MM（默认 15:40，仅工作日触发）
-  CHART_DIR           图表文件目录，启动时自动创建并挂载到 /charts（默认 charts/）
+  CHART_DIR           图表文件目录，启动时自动创建并挂载到 /charts（默认 ${DATA_DIR:-data}/charts）
+
+环境变量（可选 · 限流与每日配额）：
+  RATE_LIMIT_PER_MIN  每分钟限流（默认 30，仅统计鉴权通过的 /v1/chat/completions 请求）
+  QUOTA_DAILY         每日配额（默认 500，按 Asia/Shanghai 自然日重置）
 """
 
 import os
@@ -29,9 +33,11 @@ import json
 import time
 import uuid
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -80,7 +86,7 @@ AGENT_DESCRIPTION = (
     "宏观新闻S/A/B/C四级权威性分级解读、资金流向分析、"
     "单板块7维度深度聚焦。数据来源：DeepSeek + Tushare + Finnhub + FRED。"
 )
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.3.0"
 
 # ── FastAPI App ──
 
@@ -141,7 +147,9 @@ app = FastAPI(
 
 # ── 图表静态文件（第五波可视化产出，目录不存在先创建再挂载）──
 
-CHART_DIR = os.getenv("CHART_DIR", "charts")
+# CHART_DIR 显式设置优先；缺省沿用 DATA_DIR 约定（${DATA_DIR:-data}/charts），
+# 与 agent/charts.py、agent/push.py 的解析保持一致，挂卷（DATA_DIR=/data）时无需再单设。
+CHART_DIR = os.getenv("CHART_DIR") or os.path.join(os.getenv("DATA_DIR") or "data", "charts")
 try:
     os.makedirs(CHART_DIR, exist_ok=True)
 except OSError:
@@ -170,6 +178,93 @@ def verify_api_key(request: Request) -> None:
             status_code=401,
             detail={"error": "未授权：API Key 无效", "code": "invalid_api_key"},
         )
+
+
+# ── 限流与每日配额（第六波工程化）──
+#
+# 纯内存实现，零外部依赖。局限：仅对单 worker 进程有效——Railway 单实例部署下
+# 计数准确；若未来水平扩容为多实例/多 worker，各进程计数互相独立，需外置共享
+# 计数器（如 Redis）才能保证全局一致。
+
+
+def _env_int(name: str, default: int) -> int:
+    """读取正整数环境变量；缺失或非法时回退默认值并记日志（不让配置错误摧毁启动）。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是整数，回退默认值 %d", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("环境变量 %s=%d 不是正整数，回退默认值 %d", name, value, default)
+        return default
+    return value
+
+
+RATE_LIMIT_PER_MIN = _env_int("RATE_LIMIT_PER_MIN", 30)  # 每分钟限流阈值
+QUOTA_DAILY = _env_int("QUOTA_DAILY", 500)               # 每日配额阈值
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+_quota_lock = threading.Lock()
+_quota_state = {
+    "minutes": {},                        # 分钟桶：int(epoch // 60) -> 本桶已用计数
+    "daily": {"date": None, "count": 0},  # 每日配额：date 为上海自然日 YYYY-MM-DD
+}
+
+
+def _quota_now() -> float:
+    """配额计数使用的当前时间（epoch 秒）。独立成函数，便于测试 patch 注入时间。"""
+    return time.time()
+
+
+def _quota_today(ts: float) -> str:
+    """把 epoch 秒按 Asia/Shanghai 时区折算为自然日（YYYY-MM-DD）。"""
+    return datetime.fromtimestamp(ts, tz=_SHANGHAI_TZ).date().isoformat()
+
+
+def _check_rate_and_quota() -> Optional[JSONResponse]:
+    """
+    对一次【已通过鉴权】的 /v1/chat/completions 请求做限流与每日配额检查。
+
+    - 分钟限流：滑动窗口以"每分钟桶"近似——按 int(epoch//60) 分桶，当前分钟桶
+      计数达到 RATE_LIMIT_PER_MIN 即拒绝；跨入下一分钟自动恢复。
+    - 每日配额：按 Asia/Shanghai 自然日计数，达到 QUOTA_DAILY 即拒绝；
+      跨日后的首次请求自动归零重置。
+    - 分钟限流优先于每日配额检查（更瞬时的限制先报）；两项均未超限才一起 +1，
+      任一超限返回 429 且不消耗任何计数。
+    - 鉴权失败（401）的请求在 verify_api_key 处已被拒绝，到不了这里，不计数。
+
+    返回 None 表示放行；返回 429 JSONResponse 表示拒绝（OpenAI 风格 error 结构）。
+    """
+    ts = _quota_now()
+    minute_bucket = int(ts // 60)
+    today = _quota_today(ts)
+    with _quota_lock:
+        minutes = _quota_state["minutes"]
+        minute_used = minutes.get(minute_bucket, 0)
+        if minute_used >= RATE_LIMIT_PER_MIN:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {"message": "请求过于频繁，请稍后再试", "code": "rate_limited"}},
+            )
+        daily = _quota_state["daily"]
+        if daily["date"] != today:
+            daily["date"] = today
+            daily["count"] = 0
+        if daily["count"] >= QUOTA_DAILY:
+            return JSONResponse(
+                status_code=429,
+                content={"error": {"message": "今日配额已用完", "code": "quota_exceeded"}},
+            )
+        minutes[minute_bucket] = minute_used + 1
+        daily["count"] += 1
+        # 惰性清理过期分钟桶，防长时间运行后 dict 膨胀
+        for key in [k for k in minutes if k < minute_bucket]:
+            del minutes[key]
+    return None
 
 
 # ── OpenAI 兼容端点 ──
@@ -205,6 +300,30 @@ async def list_models():
     }
 
 
+@app.get("/v1/usage", dependencies=[Depends(verify_api_key)])
+async def usage_stats():
+    """
+    配额用量查询（需 Bearer 鉴权；查询本身不消耗限流与配额计数）。
+
+    返回当前分钟窗口已用/上限、今日（Asia/Shanghai 自然日）已用/上限。
+    计数器跨分钟/跨日的重置是惰性的：本端点读取时按当前时间折算，
+    不依赖 /v1/chat/completions 请求触发。
+    """
+    ts = _quota_now()
+    minute_bucket = int(ts // 60)
+    today = _quota_today(ts)
+    with _quota_lock:
+        minute_used = _quota_state["minutes"].get(minute_bucket, 0)
+        daily = _quota_state["daily"]
+        today_used = daily["count"] if daily["date"] == today else 0
+    return {
+        "today_used": today_used,
+        "daily_quota": QUOTA_DAILY,
+        "minute_used": minute_used,
+        "rate_limit": RATE_LIMIT_PER_MIN,
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
@@ -218,6 +337,11 @@ async def chat_completions(request: Request):
     }
     """
     verify_api_key(request)
+
+    # 限流与每日配额：仅本端点计数；鉴权失败（401）的请求上一行已拒绝，不计数
+    quota_response = _check_rate_and_quota()
+    if quota_response is not None:
+        return quota_response
 
     try:
         body = await request.json()

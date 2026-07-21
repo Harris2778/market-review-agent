@@ -7,7 +7,11 @@
   写回 score / scored_at / score_note。
 
 存档格式（与存档层约定一致；本模块独立实现同格式读写，不 import archive.py）：
-- 目录由环境变量 ARCHIVE_DIR 决定，默认 data/archive/
+- 目录解析：ARCHIVE_DIR 显式设置时优先；缺省推导为 ${DATA_DIR:-data}/archive
+  （DATA_DIR 为全项目统一的数据根目录约定，Railway 挂卷后设 DATA_DIR=/data，
+  见 DEPLOY.md）。目录解析时若在 Railway 上未挂卷（RAILWAY_ENVIRONMENT 存在
+  且最终目录不以 RAILWAY_VOLUME_PREFIX /data 开头），logger.warning 提醒
+  数据将在重启后丢失，每模块仅警告一次（模块级标志位）。
 - 文件 archive_YYYYMMDD.jsonl，每行一个 JSON 对象：
   {"id": str, "ts": str, "trade_date": "YYYYMMDD",
    "mode": "market_review|sector_deep_dive|agent_query",
@@ -18,14 +22,28 @@
 
 import glob
 import json
+import logging
 import os
 import tempfile
 import threading
 from datetime import date, datetime
 
+logger = logging.getLogger(__name__)
+
 ARCHIVE_DIR_ENV = "ARCHIVE_DIR"
+DATA_DIR_ENV = "DATA_DIR"
+DEFAULT_DATA_DIR = "data"
+# 旧缺省常量（= os.path.join(DEFAULT_DATA_DIR, "archive")），保留以兼容外部引用；
+# 新代码请用 default_archive_dir() 动态推导
 DEFAULT_ARCHIVE_DIR = os.path.join("data", "archive")
+RAILWAY_ENV_ENV = "RAILWAY_ENVIRONMENT"
+# Railway 挂载卷路径前缀判定：最终目录以此开头才视为已挂卷持久化。
+# 判定规则集中在这一处常量，如需调整（例如更换挂载路径）改这里即可。
+RAILWAY_VOLUME_PREFIX = "/data"
 ARCHIVE_FILE_GLOB = "archive_*.jsonl"
+
+# 临时存储警告只发一次的模块级标志位（测试可用 monkeypatch 重置）
+_EPHEMERAL_WARNED = False
 
 # 命中/落空的方向性阈值：实际区间涨跌幅绝对值须严格大于 1% 才计 hit/miss。
 HIT_THRESHOLD_PCT = 1.0
@@ -37,9 +55,44 @@ _BEARISH_WORDS = ("偏空", "谨慎", "弱势", "回避")
 _PRIORITY_MARKERS = ("综合判断", "总体")
 
 
+def _data_dir() -> str:
+    """数据根目录：环境变量 DATA_DIR，缺省 "data"（空串回退缺省）。"""
+    return os.getenv(DATA_DIR_ENV) or DEFAULT_DATA_DIR
+
+
+def _warn_if_ephemeral_storage(path) -> None:
+    """Railway 临时存储警告：未挂卷时提醒数据将在重启后丢失（每模块仅警告一次）。
+
+    判定规则：环境变量 RAILWAY_ENVIRONMENT 存在（Railway 运行时自动注入），
+    且最终目录不以 RAILWAY_VOLUME_PREFIX（默认 "/data"，挂载卷路径前缀）开头。
+    挂载路径前缀的判定集中在 RAILWAY_VOLUME_PREFIX 常量，如需调整改该常量。
+    本函数自身 fail-safe：任何异常静默吞掉，绝不影响目录解析主流程。
+    """
+    global _EPHEMERAL_WARNED
+    if _EPHEMERAL_WARNED:
+        return
+    try:
+        if not os.getenv(RAILWAY_ENV_ENV):
+            return
+        if str(path).startswith(RAILWAY_VOLUME_PREFIX):
+            return
+        logger.warning(
+            "运行在 Railway 但未挂卷，重启后数据将丢失"
+            "（当前存档目录=%r，不在挂载卷路径 %s 下；"
+            "请挂载 Volume 到 %s 并设置 %s=%s，详见 DEPLOY.md）",
+            path, RAILWAY_VOLUME_PREFIX,
+            RAILWAY_VOLUME_PREFIX, DATA_DIR_ENV, RAILWAY_VOLUME_PREFIX,
+        )
+        _EPHEMERAL_WARNED = True
+    except Exception:
+        pass
+
+
 def default_archive_dir() -> str:
-    """存档目录：环境变量 ARCHIVE_DIR 优先，默认 data/archive/。"""
-    return os.getenv(ARCHIVE_DIR_ENV, DEFAULT_ARCHIVE_DIR)
+    """存档目录：ARCHIVE_DIR 显式设置优先，缺省推导为 ${DATA_DIR:-data}/archive。"""
+    path = os.getenv(ARCHIVE_DIR_ENV) or os.path.join(_data_dir(), "archive")
+    _warn_if_ephemeral_storage(path)
+    return path
 
 
 def _parse_trade_date(value):
@@ -165,7 +218,11 @@ def _read_jsonl(path):
 
 
 def _write_jsonl(path, records, bad_lines):
-    """原子回写：先写临时文件再 os.replace，避免中途崩溃截断存档。"""
+    """原子回写：先写临时文件再 os.replace，避免中途崩溃截断存档。
+
+    写入前 makedirs exist_ok 补强：目录不存在时自动创建（挂载卷首次写入
+    或目录被外部清理的场景），已存在则不动。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         dir=os.path.dirname(path), prefix=".archive_", suffix=".tmp"
     )

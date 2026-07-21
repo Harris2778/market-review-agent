@@ -9,6 +9,8 @@ pct_fn 生产实现（pro 全 mock）。绝不发起真实网络请求。
 
 import importlib.util
 import json
+import logging
+import os
 import sys
 import threading
 from datetime import date, timedelta
@@ -429,3 +431,88 @@ class TestCliMain:
         rc = cli.main(["--archive-dir", str(archive_dir)])
         assert rc == 1
         assert "Tushare 连接不可用" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────
+# DATA_DIR 统一约定 + Railway 临时存储警告（存储持久化波次）
+# ─────────────────────────────────────────────
+
+_WARN_KEYWORD = "运行在 Railway 但未挂卷"
+
+
+class TestDataDirConvention:
+    """ARCHIVE_DIR 显式优先；缺省推导为 ${DATA_DIR:-data}/archive。"""
+
+    def test_default_derives_from_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        assert scorer.default_archive_dir() == str(tmp_path / "mydata" / "archive")
+
+    def test_default_without_data_dir_is_data_archive(self, monkeypatch):
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.delenv("DATA_DIR", raising=False)
+        assert scorer.default_archive_dir() == os.path.join("data", "archive")
+
+    def test_explicit_archive_dir_wins_over_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "explicit"))
+        assert scorer.default_archive_dir() == str(tmp_path / "explicit")
+
+
+class TestEphemeralStorageWarning:
+    def test_warns_on_railway_without_volume(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(scorer, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))
+        with caplog.at_level(logging.WARNING, logger="agent.scorer"):
+            scorer.default_archive_dir()
+        assert any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_dir_under_volume(self, monkeypatch, caplog):
+        monkeypatch.setattr(scorer, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", "/data/archive")
+        with caplog.at_level(logging.WARNING, logger="agent.scorer"):
+            scorer.default_archive_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_off_railway(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(scorer, "_EPHEMERAL_WARNED", False)
+        monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))
+        with caplog.at_level(logging.WARNING, logger="agent.scorer"):
+            scorer.default_archive_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_warns_only_once_per_module(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(scorer, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archive"))
+        with caplog.at_level(logging.WARNING, logger="agent.scorer"):
+            scorer.default_archive_dir()
+            scorer.default_archive_dir()
+        warns = [r for r in caplog.records if _WARN_KEYWORD in r.getMessage()]
+        assert len(warns) == 1
+
+    def test_data_dir_on_volume_no_warning(self, monkeypatch, caplog):
+        monkeypatch.setattr(scorer, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.delenv("ARCHIVE_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", "/data")
+        with caplog.at_level(logging.WARNING, logger="agent.scorer"):
+            assert scorer.default_archive_dir() == "/data/archive"
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+
+class TestWriteJsonlMakedirs:
+    """_write_jsonl 目录补强：目录不存在时自动创建（挂载卷首次写入场景）。"""
+
+    def test_write_jsonl_creates_missing_dir(self, tmp_path):
+        path = tmp_path / "deep" / "nested" / "archive_20240120.jsonl"
+        assert not path.parent.exists()
+        rec = make_record("r1")
+        scorer._write_jsonl(str(path), [rec], ["坏行"])
+        assert path.exists()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[0])["id"] == "r1"
+        assert lines[1] == "坏行"

@@ -9,6 +9,13 @@
    模块顶层不引用任何项目内模块，避免 import 期冲突。
 3. 时区一律显式使用 Asia/Shanghai（Railway 容器是 UTC，
    依赖容器本地时间会错判推送窗口）。
+4. 图表目录约定：CHART_DIR 显式设置时优先，缺省推导为
+   ${DATA_DIR:-data}/charts（与 archive/scorer/charts 行为一致；
+   Railway 挂卷后设 DATA_DIR=/data，见 DEPLOY.md）。解析结果仅用于
+   /charts/<日期>/<文件> URL 的相对路径组装，URL 组装逻辑不变。
+   解析时若在 Railway 上未挂卷（RAILWAY_ENVIRONMENT 存在且目录不以
+   RAILWAY_VOLUME_PREFIX /data 开头），logger.warning 提醒数据将在
+   重启后丢失，每模块仅警告一次（模块级标志位）。
 
 对外接口：
 - should_fire(now, fire_time, last_fired_date)  纯函数，是否到达推送时机
@@ -32,6 +39,67 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_FIRE_TIME = "15:40"  # 收盘后默认推送时间
 PUSH_MESSAGE = "今日复盘"     # 触发非流式复盘的用户消息
 SEND_TIMEOUT_SECONDS = 10.0   # webhook POST 超时
+
+# ── 数据目录约定（DATA_DIR 统一根目录，与 archive/scorer/charts 行为一致）──
+CHART_DIR_ENV = "CHART_DIR"
+DATA_DIR_ENV = "DATA_DIR"
+DEFAULT_DATA_DIR = "data"
+RAILWAY_ENV_ENV = "RAILWAY_ENVIRONMENT"
+# Railway 挂载卷路径前缀判定：最终目录以此开头才视为已挂卷持久化。
+# 判定规则集中在这一处常量，如需调整（例如更换挂载路径）改这里即可。
+RAILWAY_VOLUME_PREFIX = "/data"
+
+# 临时存储警告只发一次的模块级标志位（测试可用 monkeypatch 重置）
+_EPHEMERAL_WARNED = False
+
+
+def _data_dir() -> str:
+    """数据根目录：环境变量 DATA_DIR，缺省 "data"（空串回退缺省）。"""
+    return os.getenv(DATA_DIR_ENV) or DEFAULT_DATA_DIR
+
+
+def _default_chart_dir() -> str:
+    """图表根目录缺省值：${DATA_DIR:-data}/charts。"""
+    return os.path.join(_data_dir(), "charts")
+
+
+def _warn_if_ephemeral_storage(path) -> None:
+    """Railway 临时存储警告：未挂卷时提醒数据将在重启后丢失（每模块仅警告一次）。
+
+    判定规则：环境变量 RAILWAY_ENVIRONMENT 存在（Railway 运行时自动注入），
+    且最终目录不以 RAILWAY_VOLUME_PREFIX（默认 "/data"，挂载卷路径前缀）开头。
+    挂载路径前缀的判定集中在 RAILWAY_VOLUME_PREFIX 常量，如需调整改该常量。
+    本函数自身 fail-safe：任何异常静默吞掉，绝不影响推送主流程。
+    """
+    global _EPHEMERAL_WARNED
+    if _EPHEMERAL_WARNED:
+        return
+    try:
+        if not os.getenv(RAILWAY_ENV_ENV):
+            return
+        if str(path).startswith(RAILWAY_VOLUME_PREFIX):
+            return
+        logger.warning(
+            "运行在 Railway 但未挂卷，重启后数据将丢失"
+            "（当前图表目录=%r，不在挂载卷路径 %s 下；"
+            "请挂载 Volume 到 %s 并设置 %s=%s，详见 DEPLOY.md）",
+            path, RAILWAY_VOLUME_PREFIX,
+            RAILWAY_VOLUME_PREFIX, DATA_DIR_ENV, RAILWAY_VOLUME_PREFIX,
+        )
+        _EPHEMERAL_WARNED = True
+    except Exception:
+        pass
+
+
+def _resolve_chart_dir() -> str:
+    """图表目录：CHART_DIR 显式设置优先，缺省推导为 ${DATA_DIR:-data}/charts。
+
+    解析结果仅用于 /charts/<日期>/<文件> URL 的相对路径组装
+    （与 StaticFiles 挂载目录保持一致）；URL 组装逻辑不变。
+    """
+    path = os.getenv(CHART_DIR_ENV) or _default_chart_dir()
+    _warn_if_ephemeral_storage(path)
+    return path
 
 
 # ── 时间工具 ──
@@ -162,7 +230,7 @@ async def build_push_payload() -> dict:
             snapshot = await collect_market_snapshot()
             trade_date = getattr(snapshot, "date", "") or ""
 
-            chart_dir = os.getenv("CHART_DIR", "charts")
+            chart_dir = _resolve_chart_dir()
             paths = charts_mod.generate_daily_charts(snapshot) or []
             if isinstance(paths, dict):
                 paths = list(paths.values())

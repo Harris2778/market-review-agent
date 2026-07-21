@@ -47,6 +47,27 @@ except ImportError as e:
     logger.warning("agent/archive.py 未就绪，分析存档将整体降级跳过: %s", e)
     archive = None
 
+# 第七波：自选股（agent/watchlist.py 未就绪时自选股能力整体降级，不影响主流程）
+try:
+    from . import watchlist
+except ImportError as e:
+    logger.warning("agent/watchlist.py 未就绪，自选股能力将整体降级: %s", e)
+    watchlist = None
+
+# 第七波：行业知识库（agent/industry_kb.py 未就绪时知识库注入降级跳过，不影响主流程）
+try:
+    from . import industry_kb
+except ImportError as e:
+    logger.warning("agent/industry_kb.py 未就绪，行业知识库注入将降级跳过: %s", e)
+    industry_kb = None
+
+# 第七波：以史为鉴（agent/history_lens.py 未就绪时历史回顾注入降级跳过，不影响主流程）
+try:
+    from . import history_lens
+except ImportError as e:
+    logger.warning("agent/history_lens.py 未就绪，以史为鉴注入将降级跳过: %s", e)
+    history_lens = None
+
 
 def _log_stream_violations(label: str, violations: list) -> None:
     """流式路径 log-only：记录疑似无出处数字的数量与前几条原文，绝不抛出、不拦截。"""
@@ -85,6 +106,63 @@ def _get_latest_trade_date(ref_date: datetime) -> datetime:
     while d.weekday() >= 5:  # 周六=5, 周日=6
         d = d - timedelta(days=1)
     return d
+
+# ── 第七波：自选股 / 行业知识库 / 以史为鉴 集成 ──
+
+# 自选股动作词（detect_intent 与 _watchlist handler 共用同一口径）
+_WATCHLIST_ADD_VERBS = ("添加", "加入", "加")
+_WATCHLIST_REMOVE_VERBS = ("删除", "移除", "删")
+_WATCHLIST_REVIEW_WORDS = ("复盘", "看看", "怎么样")
+
+_WATCHLIST_USAGE = (
+    "自选股用法：\n"
+    "- 添加：『加自选 茅台』或『添加自选 600519』\n"
+    "- 删除：『删自选 茅台』\n"
+    "- 查看清单：『我的自选股』\n"
+    "- 逐只复盘：『复盘我的自选股』"
+)
+
+_WATCHLIST_EMPTY_GUIDE = (
+    "您还没有添加自选股。回复『加自选 茅台』即可添加；"
+    "添加后可回复『我的自选股』查看清单，或『复盘我的自选股』获取逐只复盘。"
+)
+
+# 内联兜底提示词：get_system_prompt("watchlist") 取不到或返回空时使用
+_DEFAULT_WATCHLIST_SYSTEM_PROMPT = (
+    "你是严谨的自选股复盘助手。基于用户自选股清单与实时行情数据逐只复盘："
+    "每只给出当日表现、关键价位与一句话简评，最后给一段整体小结。"
+    "仅使用上方提供的数据，数据缺失处标注数据暂缺，禁止编造；"
+    "纯文本输出，不使用 Markdown 表格；内容仅为客观数据整理，不构成投资建议。"
+)
+
+
+def _industry_kb_block(sector: str) -> str:
+    """第七波：行业知识库注入块（fail-safe）。模块未就绪/未知行业/异常返回空串。"""
+    if industry_kb is None:
+        return ""
+    try:
+        block = industry_kb.format_kb_block(sector)
+        if block:
+            return f"\n\n{block}"
+    except Exception as e:
+        logger.warning("行业知识库注入失败（%s板块，跳过）: %s", sector, e, exc_info=True)
+    return ""
+
+
+def _history_note_block(sector=None, mode=None) -> str:
+    """第七波：以史为鉴注入块（fail-safe）。模块自带头部，此处不加任何引导语。"""
+    if history_lens is None:
+        return ""
+    try:
+        note = history_lens.get_history_note(sector=sector, mode=mode)
+        if note:
+            return f"\n\n{note}"
+    except Exception as e:
+        logger.warning(
+            "以史为鉴注入失败（sector=%s mode=%s，跳过）: %s", sector, mode, e, exc_info=True
+        )
+    return ""
+
 
 # ── 意图关键词 ──
 
@@ -182,6 +260,15 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     intent_type: "market_review" | "sector_deep_dive" | "general_chat"
     """
     msg = message.strip()
+
+    # 第七波：自选股意图（保守规则：必须含『自选』二字才判；裸『自选/自选股』按列表处理）
+    if "自选" in msg:
+        wl_action_words = (
+            _WATCHLIST_ADD_VERBS + _WATCHLIST_REMOVE_VERBS
+            + _WATCHLIST_REVIEW_WORDS + ("我的", "列表")
+        )
+        if msg in ("自选", "自选股") or any(w in msg for w in wl_action_words):
+            return ("watchlist", None)
 
     # 先提取行业名（如果有的话，优先判定为板块聚焦）
     sector = _extract_sector(msg)
@@ -451,6 +538,7 @@ def _assistant_tool_message(message) -> dict:
         try:
             tool_calls.append(tc.model_dump())
         except AttributeError:  # 兼容无 model_dump 的轻量 mock 对象
+            logger.warning("tool_call 对象无 model_dump，使用属性兜底序列化: %r", tc, exc_info=True)
             tool_calls.append({
                 "id": tc.id,
                 "type": "function",
@@ -816,6 +904,8 @@ class MarketReviewAgent:
             return await self._chat(user_message, stream, history=history)
         elif intent == "market_review":
             return await self._market_review(stream, context_note=context_note)
+        elif intent == "watchlist":
+            result = await self._watchlist(user_message, stream)
         elif intent == "news_only":
             return await self._news_only(sector, stream, message=user_message)
         elif intent == "stock_query":
@@ -841,6 +931,176 @@ class MarketReviewAgent:
         """通用对话。带对话历史，让闲聊也有上下文。"""
         system = get_system_prompt("general_chat")
         return await self._call_llm(system, message, stream, history=history)
+
+    # ── 第七波：自选股管理（加 / 删 / 列表 / 复盘）──
+
+    async def _watchlist(self, message: str, stream: bool):
+        """自选股意图入口：按动作词分发到加/删/列表/复盘。
+
+        模块未就绪或任一环节异常都降级为文案提示，绝不向上抛出。
+        """
+        if watchlist is None:
+            return {"role": "assistant", "content": "自选股功能暂不可用（模块未就绪），请稍后再试。"}
+        msg = (message or "").strip()
+        has_add = any(v in msg for v in _WATCHLIST_ADD_VERBS)
+        has_remove = any(v in msg for v in _WATCHLIST_REMOVE_VERBS)
+        has_review = any(w in msg for w in _WATCHLIST_REVIEW_WORDS)
+
+        if has_add and not has_remove:
+            return self._watchlist_add(msg)
+        if has_remove and not has_add:
+            return self._watchlist_remove(msg)
+        if has_review:
+            return await self._watchlist_review(stream)
+        return self._watchlist_list()
+
+    @staticmethod
+    def _clean_watchlist_text(text: str) -> str:
+        """剥掉『自选股/自选』字样与首尾标点空白，得到候选股票名/代码。"""
+        t = (text or "").replace("自选股", " ").replace("自选", " ")
+        return t.strip(" \t　，。,.、：:！!？?；;")
+
+    @classmethod
+    def _extract_watchlist_keyword(cls, msg: str, verbs) -> str:
+        """提取动作词后的股票名；为空时兜底取动作词前的文本（如『把茅台加入自选股』）。"""
+        after, before = "", ""
+        for v in verbs:
+            if v in msg:
+                after, before = msg.split(v, 1)[1], msg.split(v, 1)[0]
+                break
+        keyword = cls._clean_watchlist_text(after)
+        if keyword:
+            return keyword
+        keyword = cls._clean_watchlist_text(before)
+        for prefix in ("帮我", "把", "将", "请"):
+            if keyword.startswith(prefix):
+                keyword = keyword[len(prefix):]
+        return keyword
+
+    def _watchlist_add(self, msg: str) -> dict:
+        """添加自选股：resolver 用模块缺省实现（内部触网搜索），回显 (code, name) 供用户确认。"""
+        keyword = self._extract_watchlist_keyword(msg, _WATCHLIST_ADD_VERBS)
+        if not keyword:
+            return {"role": "assistant", "content": _WATCHLIST_USAGE}
+        try:
+            ok, text = watchlist.add_stock(keyword)
+        except Exception as e:
+            logger.warning("自选股添加调用异常（fail-safe）: %s", e, exc_info=True)
+            return {"role": "assistant", "content": "自选股添加失败，请稍后再试。"}
+        content = text
+        if ok:
+            content += f"\n请核对上方股票名称与代码；如不正确，回复『删自选 {keyword}』后重新添加。"
+        return {"role": "assistant", "content": content}
+
+    def _watchlist_remove(self, msg: str) -> dict:
+        """删除自选股：回显删除结果。"""
+        keyword = self._extract_watchlist_keyword(msg, _WATCHLIST_REMOVE_VERBS)
+        if not keyword:
+            return {"role": "assistant", "content": _WATCHLIST_USAGE}
+        try:
+            ok, text = watchlist.remove_stock(keyword)
+        except Exception as e:
+            logger.warning("自选股删除调用异常（fail-safe）: %s", e, exc_info=True)
+            return {"role": "assistant", "content": "自选股删除失败，请稍后再试。"}
+        return {"role": "assistant", "content": text}
+
+    def _watchlist_list(self) -> dict:
+        """自选股清单：纯文本直接输出，无需 LLM。"""
+        try:
+            stocks = watchlist.list_stocks()
+        except Exception as e:
+            logger.warning("自选股清单获取异常（fail-safe）: %s", e, exc_info=True)
+            stocks = []
+        if not stocks:
+            return {"role": "assistant", "content": _WATCHLIST_EMPTY_GUIDE}
+        lines = [f"我的自选股（共 {len(stocks)} 只）："]
+        for i, s in enumerate(stocks, 1):
+            name = s.get("name", "?") if isinstance(s, dict) else "?"
+            code = s.get("code", "?") if isinstance(s, dict) else "?"
+            lines.append(f"{i}. {name}（{code}）")
+        lines.append("")
+        lines.append("回复『复盘我的自选股』查看逐只复盘；『加自选 名称』/『删自选 名称』管理清单。")
+        return {"role": "assistant", "content": "\n".join(lines)}
+
+    def _watchlist_system_prompt(self) -> str:
+        """自选股复盘系统提示词：优先 get_system_prompt("watchlist")，取不到/为空用内联兜底。"""
+        try:
+            prompt = get_system_prompt("watchlist")
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt
+            logger.warning("get_system_prompt(\"watchlist\") 返回空，使用内联默认提示词")
+        except Exception as e:
+            logger.warning(
+                "get_system_prompt(\"watchlist\") 获取失败，使用内联默认提示词: %s",
+                e, exc_info=True,
+            )
+        return _DEFAULT_WATCHLIST_SYSTEM_PROMPT
+
+    async def _fetch_watchlist_quotes(self, stocks: list) -> str:
+        """逐只取实时行情（线程池并行，单只失败降级为『数据暂不可用』，绝不抛出）。"""
+        try:
+            from .data_fetcher import fetch_stock_quote
+        except ImportError as e:
+            logger.warning("fetch_stock_quote 未就绪，自选股行情整体降级: %s", e)
+            fetch_stock_quote = None
+        loop = asyncio.get_running_loop()
+
+        async def _one(stock) -> str:
+            name = stock.get("name", "?") if isinstance(stock, dict) else "?"
+            code = stock.get("code", "") if isinstance(stock, dict) else ""
+            market = (stock.get("market") or "cn") if isinstance(stock, dict) else "cn"
+            if fetch_stock_quote is None or not code:
+                return f"{name}（{code or '?'}）：行情数据暂不可用"
+            try:
+                quote = await loop.run_in_executor(None, fetch_stock_quote, market, code)
+            except Exception as e:
+                logger.warning(
+                    "自选股行情获取失败（%s %s，单只降级）: %s", market, code, e, exc_info=True
+                )
+                quote = None
+            if not isinstance(quote, dict) or not quote:
+                return f"{name}（{code}）：行情数据暂不可用"
+            return (
+                f"{name}（{code}）：现价 {quote.get('price', '?')}，"
+                f"涨跌幅 {quote.get('pct', '?')}%，"
+                f"最高 {quote.get('high', '?')}，最低 {quote.get('low', '?')}"
+            )
+
+        lines = await asyncio.gather(*(_one(s) for s in stocks))
+        return "\n".join(lines)
+
+    async def _watchlist_review(self, stream: bool):
+        """自选股复盘：format_watchlist_block + 行情块走 LLM；空清单返回引导文案。"""
+        try:
+            stocks = watchlist.list_stocks()
+        except Exception as e:
+            logger.warning("自选股清单获取异常（fail-safe）: %s", e, exc_info=True)
+            stocks = []
+        if not stocks:
+            return {"role": "assistant", "content": _WATCHLIST_EMPTY_GUIDE}
+
+        quotes_text = await self._fetch_watchlist_quotes(stocks)
+
+        try:
+            block = watchlist.format_watchlist_block()
+        except Exception as e:
+            logger.warning("format_watchlist_block 异常（fail-safe，手工拼装兜底）: %s", e, exc_info=True)
+            block = None
+        if not block:
+            lines = [f"【用户自选股】共 {len(stocks)} 只："]
+            for i, s in enumerate(stocks, 1):
+                name = s.get("name", "?") if isinstance(s, dict) else "?"
+                code = s.get("code", "?") if isinstance(s, dict) else "?"
+                lines.append(f"{i}. {name}（{code}）")
+            block = "\n".join(lines)
+
+        user_prompt = (
+            f"{block}\n\n【自选股实时行情】\n{quotes_text}\n\n"
+            "请逐只复盘以上自选股：当日表现、关键价位、一句话简评；最后给一段整体小结。"
+            "仅使用上方数据，数据缺失处标注数据暂缺，禁止编造。"
+        )
+        system = self._watchlist_system_prompt()
+        return await self._call_llm(system, user_prompt, stream)
 
     async def _market_review(self, stream: bool, context_note: str = None):
         """全市场复盘。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。"""
@@ -868,11 +1128,13 @@ class MarketReviewAgent:
         system = get_system_prompt("market_review").replace("[日期]", date_display)
 
         note_line = f"{context_note}\n\n" if context_note else ""
+        # 第七波：以史为鉴注入（fail-safe；模块自带头部，不加引导语）
+        history_note = _history_note_block(sector=None, mode="market_review")
         user_prompt = f"""{note_line}交易日：{date_display} {weekday}{date_note}
 
 {market_data}
 
-生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失标[UNSOURCED]。"""
+生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失标[UNSOURCED]。{history_note}"""
 
         # 第四波：存档接入——流式走 _stream_response 结束回调，非流式在最终 content 产出后落档
         if stream:
@@ -959,6 +1221,10 @@ class MarketReviewAgent:
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
         note_line = f"{context_note}\n\n" if context_note else ""
+        # 第七波：行业知识库注入（追加在【五、新闻与景气背景】之后；fail-safe）
+        kb_block = _industry_kb_block(sector)
+        # 第七波：以史为鉴注入（user_prompt 末尾；fail-safe；模块自带头部，不加引导语）
+        history_note = _history_note_block(sector=sector, mode="sector_deep_dive")
         user_prompt = f"""{note_line}交易日：{date_display} {weekday} | 行业：{sector}
 
 【一、行情与趋势数据】
@@ -971,9 +1237,9 @@ class MarketReviewAgent:
 {earnings_block}
 
 【五、新闻与景气背景】
-上方"行情与趋势数据"中的东方财富实时快讯与新浪历史新闻已按{sector}行业过滤，请作为催化/风险判断的素材引用，不要原样罗列。
+上方"行情与趋势数据"中的东方财富实时快讯与新浪历史新闻已按{sector}行业过滤，请作为催化/风险判断的素材引用，不要原样罗列。{kb_block}
 
-深度分析{sector}板块。输出标题需包含日期{date_display}。新闻条目仅作为第五维催化与风险的引用素材，不要单独罗列新闻清单。数据缺失处标注数据暂缺，禁止编造。"""
+深度分析{sector}板块。输出标题需包含日期{date_display}。新闻条目仅作为第五维催化与风险的引用素材，不要单独罗列新闻清单。数据缺失处标注数据暂缺，禁止编造。{history_note}"""
 
         if stream:
             # 流式路径跳过自我审查以保延迟（审查+修正需两轮非流式调用，会显著抬高首字延迟）

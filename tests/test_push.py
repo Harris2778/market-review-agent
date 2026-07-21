@@ -17,6 +17,7 @@
 """
 
 import asyncio
+import logging
 import os
 import sys
 import time as time_mod
@@ -499,3 +500,95 @@ class TestMainIntegration:
                 sub.rmdir()  # 仅在空目录时清理，别动并行工程师的文件
             except OSError:
                 pass
+
+
+# ═══════════════════════════════════════════
+# DATA_DIR 统一约定 + Railway 临时存储警告（存储持久化波次）
+# ═══════════════════════════════════════════
+
+_WARN_KEYWORD = "运行在 Railway 但未挂卷"
+
+
+class TestResolveChartDirConvention:
+    """CHART_DIR 显式优先；缺省推导为 ${DATA_DIR:-data}/charts。URL 组装逻辑不变。"""
+
+    def test_default_derives_from_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CHART_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        assert push._resolve_chart_dir() == str(tmp_path / "mydata" / "charts")
+
+    def test_default_without_data_dir_is_data_charts(self, monkeypatch):
+        monkeypatch.delenv("CHART_DIR", raising=False)
+        monkeypatch.delenv("DATA_DIR", raising=False)
+        assert push._resolve_chart_dir() == os.path.join("data", "charts")
+
+    def test_explicit_chart_dir_wins_over_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        monkeypatch.setenv("CHART_DIR", str(tmp_path / "explicit"))
+        assert push._resolve_chart_dir() == str(tmp_path / "explicit")
+
+    def test_payload_urls_unaffected_by_data_dir_derivation(self, tmp_path, monkeypatch):
+        """DATA_DIR 推导出的 chart_dir 仍能正确组装 /charts/<日期>/<文件> URL。
+
+        用多级子目录路径验证：relative_to 基于推导目录计算相对层级，
+        若推导错误会退化为 <父目录名>/<文件名>，URL 层级会丢失。
+        """
+        monkeypatch.delenv("CHART_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "mydata"))
+        deep_file = str(tmp_path / "mydata" / "charts" / "deep" / "nested" / "a.svg")
+        _install_fake_charts_module(monkeypatch, [deep_file])
+        monkeypatch.setattr("agent.orchestrator.get_agent", lambda: _fake_agent())
+        monkeypatch.setattr(
+            "agent.orchestrator.collect_market_snapshot",
+            AsyncMock(return_value=SimpleNamespace(date="20260720")),
+        )
+
+        payload = asyncio.run(build_push_payload())
+
+        assert payload["charts"] == ["/charts/deep/nested/a.svg"]
+
+
+class TestEphemeralStorageWarning:
+    def test_warns_on_railway_without_volume(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(push, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))
+        with caplog.at_level(logging.WARNING, logger="agent.push"):
+            push._resolve_chart_dir()
+        assert any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_dir_under_volume(self, monkeypatch, caplog):
+        monkeypatch.setattr(push, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("CHART_DIR", "/data/charts")
+        with caplog.at_level(logging.WARNING, logger="agent.push"):
+            push._resolve_chart_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_off_railway(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(push, "_EPHEMERAL_WARNED", False)
+        monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+        monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))
+        with caplog.at_level(logging.WARNING, logger="agent.push"):
+            push._resolve_chart_dir()
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)
+
+    def test_warns_only_once_per_module(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setattr(push, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.setenv("CHART_DIR", str(tmp_path / "charts"))
+        with caplog.at_level(logging.WARNING, logger="agent.push"):
+            push._resolve_chart_dir()
+            push._resolve_chart_dir()
+        warns = [r for r in caplog.records if _WARN_KEYWORD in r.getMessage()]
+        assert len(warns) == 1
+
+    def test_data_dir_on_volume_no_warning(self, monkeypatch, caplog):
+        """DATA_DIR=/data 时推导目录在挂载卷下，不警告（生产正确配置）。"""
+        monkeypatch.setattr(push, "_EPHEMERAL_WARNED", False)
+        monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+        monkeypatch.delenv("CHART_DIR", raising=False)
+        monkeypatch.setenv("DATA_DIR", "/data")
+        with caplog.at_level(logging.WARNING, logger="agent.push"):
+            assert push._resolve_chart_dir() == "/data/charts"
+        assert not any(_WARN_KEYWORD in r.getMessage() for r in caplog.records)

@@ -7,6 +7,11 @@
 - A 股配色惯例：涨红跌绿、零值灰，低饱和朴素风格。
 - 契约函数 generate_daily_charts(snapshot, out_dir=None) 供推送工程师
   try/except import 调用：snapshot 字段缺失时跳过对应图并记 log，绝不抛异常。
+- 目录约定：out_dir 缺省推导为 ${DATA_DIR:-data}/charts/YYYYMMDD——
+  CHART_DIR 显式设置时优先，否则以 DATA_DIR（缺省 data）为根拼 charts/；
+  Railway 挂卷后设 DATA_DIR=/data 即可落卷（见 DEPLOY.md）。目录解析时若在
+  Railway 上未挂卷（RAILWAY_ENVIRONMENT 存在且根目录不以 RAILWAY_VOLUME_PREFIX
+  /data 开头），logger.warning 提醒数据将在重启后丢失，每模块仅警告一次。
 
 数据结构（对齐 data_fetcher.MarketSnapshot）：
 - snapshot.indices: dict {指数名: {"pct_chg": float, ...}}
@@ -44,6 +49,63 @@ _BREADTH_BUCKETS = [
 ]
 
 _NAME_MAX_CHARS = 8  # 左侧名称标签最大字符数，超出截断加省略号
+
+# ── 数据目录约定（DATA_DIR 统一根目录，与 archive/scorer/push 行为一致）──
+CHART_DIR_ENV = "CHART_DIR"
+DATA_DIR_ENV = "DATA_DIR"
+DEFAULT_DATA_DIR = "data"
+RAILWAY_ENV_ENV = "RAILWAY_ENVIRONMENT"
+# Railway 挂载卷路径前缀判定：最终目录以此开头才视为已挂卷持久化。
+# 判定规则集中在这一处常量，如需调整（例如更换挂载路径）改这里即可。
+RAILWAY_VOLUME_PREFIX = "/data"
+
+# 临时存储警告只发一次的模块级标志位（测试可用 monkeypatch 重置）
+_EPHEMERAL_WARNED = False
+
+
+def _data_dir() -> str:
+    """数据根目录：环境变量 DATA_DIR，缺省 "data"（空串回退缺省）。"""
+    return os.getenv(DATA_DIR_ENV) or DEFAULT_DATA_DIR
+
+
+def _default_chart_dir() -> str:
+    """图表根目录缺省值：${DATA_DIR:-data}/charts。"""
+    return os.path.join(_data_dir(), "charts")
+
+
+def _warn_if_ephemeral_storage(path) -> None:
+    """Railway 临时存储警告：未挂卷时提醒数据将在重启后丢失（每模块仅警告一次）。
+
+    判定规则：环境变量 RAILWAY_ENVIRONMENT 存在（Railway 运行时自动注入），
+    且最终目录不以 RAILWAY_VOLUME_PREFIX（默认 "/data"，挂载卷路径前缀）开头。
+    挂载路径前缀的判定集中在 RAILWAY_VOLUME_PREFIX 常量，如需调整改该常量。
+    本函数自身 fail-safe：任何异常静默吞掉，绝不影响图表生成主流程。
+    """
+    global _EPHEMERAL_WARNED
+    if _EPHEMERAL_WARNED:
+        return
+    try:
+        if not os.getenv(RAILWAY_ENV_ENV):
+            return
+        if str(path).startswith(RAILWAY_VOLUME_PREFIX):
+            return
+        logger.warning(
+            "运行在 Railway 但未挂卷，重启后数据将丢失"
+            "（当前图表目录=%r，不在挂载卷路径 %s 下；"
+            "请挂载 Volume 到 %s 并设置 %s=%s，详见 DEPLOY.md）",
+            path, RAILWAY_VOLUME_PREFIX,
+            RAILWAY_VOLUME_PREFIX, DATA_DIR_ENV, RAILWAY_VOLUME_PREFIX,
+        )
+        _EPHEMERAL_WARNED = True
+    except Exception:
+        pass
+
+
+def _resolve_chart_base() -> str:
+    """图表根目录：CHART_DIR 显式设置优先，缺省推导为 ${DATA_DIR:-data}/charts。"""
+    base = os.getenv(CHART_DIR_ENV) or _default_chart_dir()
+    _warn_if_ephemeral_storage(base)
+    return base
 
 
 def _snap_get(snapshot, key, default=None):
@@ -231,19 +293,19 @@ def _write_svg(path: str, svg: str) -> None:
 def generate_daily_charts(snapshot, out_dir=None) -> list[str]:
     """生成当日常用行情图，返回生成的文件路径列表。
 
-    - out_dir 为 None 时取环境变量 CHART_DIR（缺省 "charts"）+ 当天日期子目录
-      （charts/YYYYMMDD/）；显式传入时按原样使用。
+    - out_dir 为 None 时按约定推导：${CHART_DIR:-${DATA_DIR:-data}/charts}
+      + 当天日期子目录（charts/YYYYMMDD/）；显式传入时按原样使用。
     - 产出：indices.svg（主要指数涨跌）、sectors.svg（申万 31 行业横向条形图，
       正红负绿按涨跌幅降序）、breadth.svg（涨跌分布，需 snapshot 带 _breadth）。
     - snapshot 字段缺失时跳过对应图并记 log，绝不抛异常。
+    - 写入前 makedirs exist_ok 自动创建目录（含多级日期子目录）。
     """
     paths: list[str] = []
 
     try:
         date_str = _norm_date(_snap_get(snapshot, "date", ""))
         if out_dir is None:
-            base = os.getenv("CHART_DIR", "charts") or "charts"
-            out_dir = os.path.join(base, date_str)
+            out_dir = os.path.join(_resolve_chart_base(), date_str)
         os.makedirs(out_dir, exist_ok=True)
     except Exception:
         logger.warning("charts: 输出目录准备失败，放弃生成图表", exc_info=True)
