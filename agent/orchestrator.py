@@ -552,28 +552,11 @@ class MarketReviewAgent:
         return result
 
     async def _stock_query(self, message: str, stream: bool):
-        """个股查询。"""
-        from agent.data_fetcher import fetch_stock_quote, fetch_stock_kline, fetch_stock_news, search_stock
-        # 先搜索股票
-        results = search_stock(message[:20])
-        if not results:
-            return {"role": "assistant", "content": "未找到该股票，请尝试输入完整代码如 600519.SH 或公司名如 贵州茅台"}
-        s = results[0]
-        market = "cn" if s.get("market","") in ["11","cn"] else "us"
-        quote = fetch_stock_quote(market, s["code"])
-        kline = fetch_stock_kline(market, s["code"], 5)
-        news = fetch_stock_news(s["code"], market, 5)
-        info = f"""{s['name']}({s['code']})
-实时行情: 价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}% 成交量{quote.get('vol','?')}
-开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}
-近5日K线: {', '.join(f"{k['date'][-5:]}:{k['close']}({k['pct']}%)" for k in kline)}
-相关新闻({len(news)}条): {'; '.join(f"{n['title'][:40]} {n['time']}" for n in news[:3])}
-"""
-        system = "你是股票分析师。根据数据简要分析该股票。禁止markdown格式。"
-        result = await self._call_llm(system, f"股票数据:\n{info}\n\n请简要分析这只股票。", stream)
-        if not stream and isinstance(result, dict):
-            result["content"] = info + "\n" + result["content"]
-        return result
+        """个股查询——链式调用：搜索→行情→K线→新闻。"""
+        return await self._generic_mcp(
+            f"查询股票'{message}'的实时行情、近5日K线和相关新闻。请先搜索股票代码，再依次获取行情、K线和新闻。",
+            stream
+        )
 
     async def _futures_query(self, message: str, stream: bool):
         """期货查询。"""
@@ -600,32 +583,60 @@ class MarketReviewAgent:
         result = await self._call_llm(system, user_prompt, stream)
         return result
 
-    async def _fund_query(self, message: str, stream: bool):
-        """基金/期货/股票/汇率等通用MCP查询——LLM自动选择工具。"""
+    async def _generic_mcp(self, message: str, stream: bool, max_rounds: int = 5):
+        """通用MCP查询——支持多轮链式调用，跨域组合。"""
         from agent.data_fetcher import get_mcp_tools, _mcp_call
         tools = get_mcp_tools()
         if not tools:
             return {"role": "assistant", "content": "MCP服务暂不可用"}
 
-        tool_desc = "\n".join(f"- {t['name']}: {t['desc']} (参数:{','.join(t['params'])})" for t in tools[:60])
-        system = f"""你是金融数据助手。根据用户问题，从以下MCP工具中选择最合适的并生成调用参数（JSON格式）。
+        tool_desc = "\n".join(f"- {t['name']}: {t['desc'][:150]} (参数:{','.join(t['params'][:5])})" for t in tools[:70])
+        system = f"""你是金融数据智能助手。你可以调用以下MCP工具获取实时数据。支持多轮调用：先调用工具A获取数据，再根据结果调用工具B。
+
 可用工具:
 {tool_desc}
 
-输出格式: {{"tool":"工具名","args":{{"参数":"值"}}}}。只输出JSON，不要解释。"""
-        result = await self._call_llm(system, f"用户问题: {message}\n请选择合适的工具和参数。", stream)
-        if stream or not isinstance(result, dict):
-            return result
-        try:
-            import json as _json
-            content = result["content"].strip()
-            if "```" in content:
-                content = content.split("```")[1].split("```")[0].replace("json","").strip()
-            call = _json.loads(content)
-            data = _mcp_call(call["tool"], call["args"])
-            return {"role": "assistant", "content": f"查询结果({call['tool']}):\n{_json.dumps(data,ensure_ascii=False,indent=2)[:2000]}"}
-        except Exception:
-            return {"role": "assistant", "content": f"无法解析工具调用: {result['content'][:300]}"}
+规则：
+1. 每次输出JSON: {{"tool":"工具名","args":{{"参数":"值"}}}} 或 {{"done":true,"answer":"最终回答"}}
+2. 可以多轮调用，每轮一个工具。拿到数据后如果需要更多数据，继续调用。
+3. 所有数据收集完毕后输出done。
+4. 如果用户问的问题超出数据范围，直接输出done说明能力边界。
+5. 不要编造数据。无数据就说无数据。"""
+
+        context = f"用户问题: {message}"
+        all_results = []
+
+        for round_num in range(max_rounds):
+            result = await self._call_llm(system, context, stream)
+            if stream or not isinstance(result, dict):
+                return result
+            try:
+                import json as _json
+                content = result["content"].strip()
+                if "```" in content:
+                    content = content.split("```")[1].split("```")[0].replace("json","").strip()
+                call = _json.loads(content)
+                if call.get("done"):
+                    answer = call.get("answer", "")
+                    if all_results:
+                        answer += f"\n\n[数据来源: {len(all_results)}次MCP调用]"
+                    return {"role": "assistant", "content": answer}
+                # 执行工具调用
+                data = _mcp_call(call["tool"], call["args"])
+                result_summary = _json.dumps(data, ensure_ascii=False)[:3000]
+                all_results.append({"tool": call["tool"], "result": result_summary[:500]})
+                context = f"用户问题: {message}\n第{round_num+1}轮调用{call['tool']}结果:\n{result_summary}\n\n请判断是否需要继续调用其他工具，还是输出最终答案。"
+            except Exception:
+                break
+
+        # 超过最大轮数，综合所有结果输出
+        summary = "\n".join(f"- {r['tool']}: {r['result'][:200]}" for r in all_results)
+        return {"role": "assistant", "content": f"多轮查询结果:\n{summary}\n\n[共{len(all_results)}次工具调用，如需深入分析请提出具体问题]"}
+        return {"role": "assistant", "content": f"无法解析工具调用: {result['content'][:300]}"}
+
+    async def _fund_query(self, message: str, stream: bool):
+        """基金/期货/股票/汇率等通用MCP查询。"""
+        return await self._generic_mcp(message, stream)
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False
