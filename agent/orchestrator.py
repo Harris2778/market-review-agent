@@ -909,9 +909,26 @@ _GENERIC_MCP_SYSTEM_PROMPT = (
     "调用财报类工具时严格按参数枚举值填参，不要编造枚举外的取值。"
     "查询A股财务指标的推荐链路：先用 cnFinanceReportDateList 拿报告期，"
     "再用 cnFinanceReportsFull（source 填 gjzb/lrb/fzb/llb/zxzb 等枚举值）取数。\n"
+    "报告期选择：cnFinanceReportDateList 返回的报告期按新到旧排列。用户问近期/最新"
+    "财务指标时，必须覆盖列表最前面的最新年报和最新季报（至少各取一期），"
+    "不要只取早期年度；回答时优先呈现最新年报与最新季报的数据，已取各期都要讲到。\n"
     "工具返回错误或空数据时，不要反复重试同一个工具；最多换参数重试一次，"
-    "仍拿不到就基于已经拿到的数据回答，或如实说明该项数据暂缺。"
+    "仍拿不到就基于已经拿到的数据回答，或如实说明该项数据暂缺。\n"
+    "诚实约束：只有实际调用过且工具确实返回错误/占位数据的报告期，才可以说"
+    "该期数据暂缺；没有查询过的报告期，不得声称其无数据，直接不提即可。"
 )
+
+def _generic_mcp_system_prompt() -> str:
+    """通用 MCP 查询 system 提示词 + 当天日期注入。
+
+    注入日期是为了防止模型按训练记忆误判报告期是否已发布
+    （例如把已披露的最新年报当未来数据跳过，转而去取早期年度）。
+    """
+    return (
+        _GENERIC_MCP_SYSTEM_PROMPT
+        + f"\n今天是{datetime.now().strftime('%Y年%m月%d日')}，以此判断哪些报告期已经发布、可以查询。"
+    )
+
 
 # 最终综合也失败时的优雅降级提示（任何情况下都不把原始 JSON 给用户）
 _MCP_DATA_UNAVAILABLE = (
@@ -1734,8 +1751,9 @@ class MarketReviewAgent:
                 }
             })
 
+        system_prompt = _generic_mcp_system_prompt()
         messages = [
-            {"role": "system", "content": _GENERIC_MCP_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": message}
         ]
         all_results = []
@@ -1822,7 +1840,7 @@ class MarketReviewAgent:
             return {"role": "assistant", "content": "未获取到数据，请尝试更具体的查询。"}
         summary = "\n".join(f"[{r['tool']}] {r['result']}" for r in all_results)
         synth_messages = [
-            {"role": "system", "content": _GENERIC_MCP_SYSTEM_PROMPT},
+            {"role": "system", "content": _generic_mcp_system_prompt()},
             {"role": "user", "content": (
                 f"用户问题：{message}\n\n"
                 f"以下是通过数据工具查询到的结果（可能包含错误说明或不完整数据）：\n"
