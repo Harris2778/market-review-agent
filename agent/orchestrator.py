@@ -428,6 +428,16 @@ class MarketReviewAgent:
         d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
 
+        # MCP新闻搜索（按行业关键字）
+        from agent.data_fetcher import fetch_mcp_news as _mcp
+        mcp_items = []
+        if sector:
+            search_kw = sector  # 直接用申万一级行业名搜索
+            mcp_items = await loop.run_in_executor(None, _mcp, search_kw, 60)
+        else:
+            mcp_items = await loop.run_in_executor(None, _mcp, "A股", 60)
+
+        # Sina公网历史
         all_sina = []
         for date_str in [d0, d1, d2]:
             for page in [1, 2, 3]:
@@ -476,7 +486,7 @@ class MarketReviewAgent:
         by_date = defaultdict(list)
         label = f"{sector}板块" if sector else "全市场"
 
-        all_items = all_sina + (em1 or [])
+        all_items = mcp_items + all_sina + (em1 or [])
         for item in all_items:
             t = (item.get("time", "") or "")[:10]
             title = (item.get("title", "") or "").strip()
