@@ -102,6 +102,18 @@ FastAPI Server
 - SSE 流式输出支持
 - Docker 容器化部署
 
+## 运行测试
+
+```bash
+# 首次运行前安装测试依赖
+/usr/local/bin/pip3 install -r requirements-dev.txt
+
+# 运行全部测试
+/usr/local/bin/python3 -m pytest tests/ -v
+```
+
+测试通过 `tests/conftest.py` 自动注入假的 API Key 环境变量，不会发起真实网络请求、不消耗真实 API 配额。
+
 ## 许可
 
 MIT

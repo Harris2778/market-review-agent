@@ -1,0 +1,4 @@
+# 测试专用依赖（生产依赖见 requirements.txt）
+# 安装: /usr/local/bin/pip3 install -r requirements-dev.txt
+pytest
+httpx  # FastAPI TestClient 需要

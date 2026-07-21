@@ -32,7 +32,7 @@ class MarketSnapshot:
     fund_flows: dict = field(default_factory=dict)
     global_indices: dict = field(default_factory=dict)
     macro_data: dict = field(default_factory=dict)
-    news_items: list = field(default_factory=list)
+    news_items: dict = field(default_factory=dict)
     calendar: list = field(default_factory=list)
 
 
@@ -238,9 +238,9 @@ def fetch_fund_flows(date: str) -> dict:
             row = df.iloc[0]
             nm = float(row.get("north_money", 0))
             sm = float(row.get("south_money", 0))
-            if nm > 0:
+            if nm != 0:
                 result["north_bound"] = round(nm / 10000, 2)
-            if sm > 0:
+            if sm != 0:
                 result["south_bound"] = round(sm / 10000, 2)
     except Exception:
         try:
@@ -249,9 +249,9 @@ def fetch_fund_flows(date: str) -> dict:
                 row = df.iloc[0]
                 nm = float(row.get("north_money", 0))
                 sm = float(row.get("south_money", 0))
-                if nm > 0:
+                if nm != 0:
                     result["north_bound"] = round(nm / 10000, 2)
-                if sm > 0:
+                if sm != 0:
                     result["south_bound"] = round(sm / 10000, 2)
         except Exception:
             pass

@@ -411,7 +411,8 @@ async def debug_mcp_news():
                 result["sample"] = [(i.get("title","") or i.get("content",""))[:60] for i in items[:3]]
         return result
     except Exception as e:
-        return {"error": str(e)[:200], "trace": traceback.format_exc()[-300:]}
+        logger.warning("/debug/mcp-news 失败: %s", e, exc_info=True)
+        return {"error": str(e)[:200]}
 
 
 @app.get("/debug/stock-all", dependencies=[Depends(verify_api_key)])
@@ -425,7 +426,8 @@ async def debug_stock_all():
         n = fetch_stock_news("sh600519","cn",5)
         return {"quote": bool(q), "kline": len(k), "news": len(n)}
     except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()[-500:]}
+        logger.warning("/debug/stock-all 失败: %s", e, exc_info=True)
+        return {"error": str(e)[:200]}
 
 
 @app.get("/debug/futures", dependencies=[Depends(verify_api_key)])
@@ -475,7 +477,7 @@ async def debug_pipeline():
     from agent.data_fetcher import (
         fetch_a_share_indices, fetch_shenwan_sectors,
         fetch_fund_flows, fetch_global_indices,
-        fetch_us_macro, fetch_cls_news,
+        fetch_us_macro, fetch_cls_telegraph,
     )
 
     results = {}
@@ -511,7 +513,7 @@ async def debug_pipeline():
     results["macro"] = macro if macro else "EMPTY"
 
     # 新闻
-    news = fetch_cls_news(5)
+    news = fetch_cls_telegraph(5)
     results["news_cls"] = f"{len(news)} items" if news else "EMPTY"
 
     return {
