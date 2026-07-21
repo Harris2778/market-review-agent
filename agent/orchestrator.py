@@ -495,12 +495,23 @@ class MarketReviewAgent:
         if total == 0:
             news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到与该行业相关的新闻。请尝试更宽泛的关键词，或查询\"全市场新闻\"。"
         else:
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
-            for d in sorted(by_date.keys(), reverse=True):
-                items = sorted(by_date[d])
-                news_text += f"\n--- {d}（{len(items)}条）---\n"
-                for title in items:
-                    news_text += f"[{d}] {title}\n"
+            # MCP独家新闻块
+        mcp_block = ""
+        if mcp_items:
+            from collections import Counter
+            mcp_dates = Counter(it.get("time","")[:10] for it in mcp_items if it.get("time"))
+            mcp_block = f"\n\n新浪智研快讯（关键字精准匹配，共{len(mcp_items)}条）:\n"
+            for it in mcp_items[:30]:
+                t = (it.get("time","") or "")[:16]
+                mcp_block += f"[{t}] {it.get('title','')}\n"
+
+        news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
+        for d in sorted(by_date.keys(), reverse=True):
+            items = sorted(by_date[d])
+            news_text += f"\n--- {d}（{len(items)}条）---\n"
+            for title in items:
+                news_text += f"[{d}] {title}\n"
+        news_text += mcp_block
 
         system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。"
         user_prompt = f"{news_text}\n\n以上{label}48小时新闻汇总。原样输出。"
