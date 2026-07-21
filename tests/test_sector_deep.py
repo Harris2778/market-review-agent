@@ -41,6 +41,18 @@ from agent.data_fetcher import (
 )
 from agent.system_prompts import get_system_prompt
 
+# ── 板块 extras 当日缓存：进程级状态，每个用例前后清空，避免跨用例污染 ──
+
+
+@pytest.fixture(autouse=True)
+def _clear_sector_extras_cache():
+    data_fetcher._sector_extras_cache.clear()
+    data_fetcher._sector_extras_key_locks.clear()
+    yield
+    data_fetcher._sector_extras_cache.clear()
+    data_fetcher._sector_extras_key_locks.clear()
+
+
 # ── 测试数据常量 ──
 
 SECTOR = "煤炭"

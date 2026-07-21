@@ -440,3 +440,137 @@ class TestNewsAnalysisPrompt:
         assert len(hits) >= 3, (
             f"prompt 禁用词清单应至少含 3 个禁用词，实际命中 {hits}"
         )
+
+
+# ════════════════════════════════════════════════════════════════
+# 8. 空时间新闻修复：渲染无空括号 [] + 无时间条目归入交易日分组
+# ════════════════════════════════════════════════════════════════
+
+
+class TestFmtNewsTimeFallback:
+    """_fmt_news_time 的 fallback：空时间返回兜底；正常/异常格式行为不变。"""
+
+    def test_empty_time_returns_fallback(self):
+        assert orch_mod._fmt_news_time("", fallback=DAY0) == DAY0
+        assert orch_mod._fmt_news_time(None, fallback=DAY0) == DAY0
+        assert orch_mod._fmt_news_time("   ", fallback=DAY0) == DAY0
+
+    def test_empty_time_default_fallback_keeps_empty(self):
+        """不传 fallback 时行为与修复前一致：空进空出。"""
+        assert orch_mod._fmt_news_time("") == ""
+
+    def test_valid_time_unaffected_by_fallback(self):
+        assert orch_mod._fmt_news_time(f"{DAY0} 09:30:00") == "01-10 09:30"
+        assert orch_mod._fmt_news_time(f"{DAY0} 09:30:00", fallback="X") == "01-10 09:30"
+        # 短日期（不足16字符）原样返回
+        assert orch_mod._fmt_news_time(DAY0, fallback="X") == DAY0
+
+
+class TestEmptyTimeRendering:
+    """三个渲染点分别覆盖：空时间新闻渲染后不得出现空括号 []。"""
+
+    @staticmethod
+    def _snapshot(news_items):
+        from types import SimpleNamespace
+        return SimpleNamespace(news_items=news_items)
+
+    def test_format_all_news_no_empty_brackets(self):
+        snapshot = self._snapshot({
+            "sina": [
+                {"title": "新浪正常时间新闻标题", "time": f"{DAY0} 09:30:00"},
+                {"title": "新浪空时间新闻标题", "time": ""},
+            ],
+            "eastmoney": [
+                {"title": "东财空时间快讯标题", "time": ""},
+                {"title": "东财正常时间快讯标题", "time": f"{DAY0} 10:00:00"},
+            ],
+        })
+        out = orch_mod._format_all_news(snapshot, "2025年01月10日")
+        assert "[]" not in out, f"输出出现空括号:\n{out}"
+        # 四条标题全部保留，空时间条目不被丢弃
+        for title in ("新浪正常时间新闻标题", "新浪空时间新闻标题",
+                      "东财空时间快讯标题", "东财正常时间快讯标题"):
+            assert title in out, f"输出缺少 {title!r}:\n{out}"
+        # 空时间条目渲染为兜底日期而非 []
+        assert "[2025年01月10日] 东财空时间快讯标题" in out
+        assert "[2025年01月10日] 新浪空时间新闻标题" in out
+        # 正常条目格式不变：新浪段用分组日期，东财段用 MM-DD HH:mm
+        assert f"[{DAY0}] 新浪正常时间新闻标题" in out
+        assert "[01-10 10:00] 东财正常时间快讯标题" in out
+
+    def test_format_multi_day_news_no_empty_brackets(self):
+        snapshot = self._snapshot({
+            "sina": [
+                {"title": "新浪空时间多日新闻", "time": ""},
+                {"title": "新浪正常时间多日新闻", "time": f"{DAY1} 08:00:00"},
+            ],
+            "eastmoney": [
+                {"title": "东财空时间多日快讯", "time": ""},
+            ],
+        })
+        out = orch_mod._format_multi_day_news(snapshot, None, DAY0)
+        assert "[]" not in out, f"输出出现空括号:\n{out}"
+        # 空时间条目用函数日期参数 date_str 兜底
+        assert f"- [{DAY0}] 新浪空时间多日新闻" in out
+        assert f"- [{DAY0}] 东财空时间多日快讯" in out
+        # 正常时间条目走 MM-DD HH:mm
+        assert "- [01-09 08:00] 新浪正常时间多日新闻" in out
+
+
+class TestNewsOnlyNoTimeItems:
+    """_news_only：无时间条目归入交易日分组，照常去重与展示；标题过滤不变。"""
+
+    NO_TIME_TITLE = "无时间新闻应归入交易日分组展示"
+
+    def _run(self, pool) -> dict:
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(pool):
+            return _run_message(agent, "今天有什么新闻")
+
+    def test_no_time_item_grouped_under_trade_date(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item(self.NO_TIME_TITLE, "", "新浪财经"),
+            _item("前一天正常时间的新闻标题", f"{DAY1} 10:00:00", "新浪财经"),
+        ]
+        content = self._run(pool)["content"]
+        assert "[]" not in content, f"输出出现空括号:\n{content}"
+        assert self.NO_TIME_TITLE in content, f"无时间条目被丢弃:\n{content}"
+        # 归入交易日（2025-01-10）分组且该组只有它 1 条
+        assert f"--- {DAY0}（1条）---" in content, (
+            f"无时间条目未归入交易日分组:\n{content}"
+        )
+        assert f"--- {DAY1}（1条）---" in content
+        # 渲染时间位置为交易日兜底，且带来源标注
+        line = next(l for l in content.splitlines() if self.NO_TIME_TITLE in l)
+        assert f"[{DAY0}]" in line, f"无时间条目未用交易日兜底渲染: {line}"
+        assert "【新浪】" in line
+        # 头部总条数含无时间条目
+        assert "共2条" in content
+
+    def test_no_time_item_dedup_across_sources(self):
+        """无时间条目照常参与跨源去重：同标题多源只保留一条。"""
+        dup = "跨源重复的无时间新闻标题"
+        pool = _empty_pool()
+        pool["sina"] = [_item(dup, "", "新浪财经")]
+        pool["eastmoney"] = [_item(dup, "", "东方财富")]
+        pool["cls"] = [_item(dup, f"{DAY0} 12:00:00", "财联社电报")]
+        content = self._run(pool)["content"]
+        assert "[]" not in content
+        assert content.count(dup) == 1, f"无时间重复标题未被去重:\n{content}"
+
+    def test_no_time_item_bad_title_still_filtered(self):
+        """空标题 / 过短标题（<4 字符）即使无时间也仍被过滤。"""
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item("", "", "新浪财经"),
+            _item("短", "", "新浪财经"),
+            _item("这是一条正常的无时间新闻", "", "新浪财经"),
+        ]
+        content = self._run(pool)["content"]
+        assert "这是一条正常的无时间新闻" in content
+        assert "共1条" in content, f"空/短标题应仍被过滤:\n{content}"
+        assert "[]" not in content

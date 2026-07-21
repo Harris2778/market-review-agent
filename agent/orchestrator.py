@@ -33,6 +33,27 @@ except ImportError as e:
     AGENT_QUERY_PROMPT = None
     CRITIQUE_PROMPT = None
 
+# 第三波：输出后数字溯源校验层（agent/validators.py 未就绪时校验能力整体降级，不影响主流程）
+try:
+    from . import validators
+except ImportError as e:
+    logger.warning("agent/validators.py 未就绪，数字溯源校验将整体降级跳过: %s", e)
+    validators = None
+
+
+def _log_stream_violations(label: str, violations: list) -> None:
+    """流式路径 log-only：记录疑似无出处数字的数量与前几条原文，绝不抛出、不拦截。"""
+    try:
+        preview = "；".join(
+            str(v.get("raw", "?")) for v in violations[:5] if isinstance(v, dict)
+        )
+        logger.warning(
+            "流式%s提示文本含 %d 个疑似无出处数字（log-only，不拦截）: %s",
+            label, len(violations), preview,
+        )
+    except Exception as e:
+        logger.warning("流式数字溯源校验日志记录异常（忽略）: %s", e, exc_info=True)
+
 
 def _get_latest_trade_date(ref_date: datetime) -> datetime:
     """获取最近一个交易日。用 Tushare 交易日历，失败则用周末规则兜底。"""
@@ -489,7 +510,7 @@ def _format_all_news(snapshot, date_display: str) -> str:
         for d in sorted(by_date.keys(), reverse=True):
             lines.append(f"--- {d} ---")
             for title in by_date[d]:
-                lines.append(f"[{d}] {title}")
+                lines.append(f"[{_fmt_news_time(d, fallback=date_display)}] {title}")
         lines.append("")
 
     # 东方财富实时（最新补全）
@@ -504,7 +525,7 @@ def _format_all_news(snapshot, date_display: str) -> str:
                 em_dedup.append(item)
         lines.append(f"--- 实时快讯 ---")
         for item in em_dedup[:40]:
-            lines.append(f"[{item['time']}] {item['title']}")
+            lines.append(f"[{_fmt_news_time(item.get('time', ''), fallback=date_display)}] {item['title']}")
 
     return "\n".join(lines)
 
@@ -659,7 +680,7 @@ def _format_multi_day_news(snapshot, sector, date_str) -> str:
     if sina:
         lines.append(f"新浪历史({len(sina)}条):")
         for item in sina[:15]:
-            lines.append(f"- [{item['time']}] {item['title']}")
+            lines.append(f"- [{_fmt_news_time(item.get('time', ''), fallback=date_str)}] {item['title']}")
 
     # 东方财富实时
     em = snapshot.news_items.get("eastmoney", [])
@@ -667,7 +688,7 @@ def _format_multi_day_news(snapshot, sector, date_str) -> str:
         em_sorted = sorted(em, key=lambda x: x.get("time", ""), reverse=True)[:10]
         lines.append(f"东方财富实时({len(em_sorted)}条):")
         for item in em_sorted:
-            lines.append(f"- [{item['time']}] {item['title']}")
+            lines.append(f"- [{_fmt_news_time(item.get('time', ''), fallback=date_str)}] {item['title']}")
 
     return "\n".join(lines)
 
@@ -701,9 +722,14 @@ def _news_importance(title: str) -> int:
     return score
 
 
-def _fmt_news_time(t: str) -> str:
-    """新闻时间统一显示为 MM-DD HH:mm；格式异常时原样截断返回。"""
+def _fmt_news_time(t: str, fallback: str = "") -> str:
+    """新闻时间统一显示为 MM-DD HH:mm；格式异常时原样截断返回。
+
+    t 为空时返回 fallback（通常为所在日期分组的日期），避免出现空括号 []。
+    """
     t = (t or "").strip()
+    if not t:
+        return fallback
     if len(t) >= 16 and t[4] == "-" and t[7] == "-":
         return f"{t[5:10]} {t[11:16]}"
     return t[:16]
@@ -903,6 +929,16 @@ class MarketReviewAgent:
 
         if stream:
             # 流式路径跳过自我审查以保延迟（审查+修正需两轮非流式调用，会显著抬高首字延迟）
+            # 第三波：数字溯源校验 log-only 接入——仅记录疑似无出处数字，不修改输出、不阻塞
+            if validators is not None:
+                try:
+                    stream_violations = validators.find_unsourced_numbers(
+                        system + "\n\n" + user_prompt, user_prompt
+                    )
+                    if stream_violations:
+                        _log_stream_violations(f"板块深挖({sector})", stream_violations)
+                except Exception as e:
+                    logger.warning("流式板块深挖数字溯源校验异常（log-only，忽略）: %s", e, exc_info=True)
             return await self._call_llm(system, user_prompt, stream)
         result = await self._call_llm(system, user_prompt, stream)
         if isinstance(result, dict):
@@ -977,7 +1013,10 @@ class MarketReviewAgent:
             for item in sources.get(src) or []:
                 title = (item.get("title", "") or "").strip()
                 t = (item.get("time", "") or "")[:10]
-                if not t or not title or len(title) < 4:
+                if not t:
+                    # 无时间条目不再丢弃：归入交易日分组，照常参与去重与展示
+                    t = trade_date.strftime("%Y-%m-%d")
+                if not title or len(title) < 4:
                     continue
                 if title in seen_titles:
                     continue
@@ -1028,7 +1067,7 @@ class MarketReviewAgent:
                 block += "）---\n"
                 for it in items:
                     src_name = _NEWS_SOURCE_NAMES.get(it["source"], it["source"])
-                    block += f"[{_fmt_news_time(it['time'])}] 【{src_name}】{it['title']}\n"
+                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] 【{src_name}】{it['title']}\n"
                 blocks.append(block)
 
             # 头部：总条数、覆盖时间段、各源条数
@@ -1311,6 +1350,18 @@ class MarketReviewAgent:
                     if stream:
                         # 最终纯文本生成那一轮改用流式输出（不传 tools，模型只能写正文）。
                         # 流式路径同时跳过自我审查以保延迟，见 _critique_and_revise 注释。
+                        # 第三波：数字溯源校验 log-only 接入——上下文用 tool_context_parts 拼接，
+                        # 仅记录不拦截
+                        if validators is not None:
+                            try:
+                                stream_context = user_message + "\n\n" + "\n".join(tool_context_parts)
+                                stream_violations = validators.find_unsourced_numbers(
+                                    system + "\n\n" + user_message, stream_context
+                                )
+                                if stream_violations:
+                                    _log_stream_violations("Agent 查询", stream_violations)
+                            except Exception as e:
+                                logger.warning("流式 Agent 查询数字溯源校验异常（log-only，忽略）: %s", e, exc_info=True)
                         return self._stream_response(messages)
                     draft = choice.message.content or ""
                     context = user_message + "\n\n" + "\n".join(tool_context_parts)
@@ -1355,12 +1406,25 @@ class MarketReviewAgent:
         if not draft or len(draft) <= self._CRITIQUE_MIN_CHARS:
             return draft
         context_part = (context or "")[:4000]
+        # 第三波：确定性数字溯源校验——违规清单追加到 critique user 消息末尾；
+        # validators 未就绪或执行异常时仅记 log，不影响审查主流程
+        validator_appendix = ""
+        if validators is not None:
+            try:
+                violations = validators.find_unsourced_numbers(draft, context_part)
+                if violations:
+                    validator_appendix = (
+                        "\n\n【确定性校验结果】以下数字在数据上下文中未找到出处，审查时必须要求删除或改写：\n"
+                        + validators.format_violations_for_critique(violations)
+                    )
+            except Exception as e:
+                logger.warning("数字溯源校验执行异常，跳过校验结果追加: %s", e, exc_info=True)
         try:
             critique_completion = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": CRITIQUE_PROMPT},
-                    {"role": "user", "content": f"【数据上下文】\n{context_part}\n\n【待审查初稿】\n{draft}"},
+                    {"role": "user", "content": f"【数据上下文】\n{context_part}\n\n【待审查初稿】\n{draft}{validator_appendix}"},
                 ],
                 temperature=0.1,
                 max_tokens=4096,

@@ -10,6 +10,7 @@
 import os
 import json
 import logging
+import threading
 import time
 import requests
 from datetime import datetime, timedelta
@@ -1499,6 +1500,55 @@ def _api_with_date_fallback(pro, api_name: str, trade_date: str, max_back: int =
     return None, None
 
 
+# ── 板块 extras 进程内当日缓存 ──
+# fetch_sector_valuation / fetch_sector_moneyflow / fetch_sector_earnings
+# 由 orchestrator 经线程池并发调用；同板块同交易日重复提问时直接命中缓存，
+# 避免重复执行数十次 Tushare 调用。当日数据不会变，降级结果（note 说明原因
+# 的 dict）同样允许缓存；底层抛异常的调用不会被缓存（异常在 compute 阶段
+# 抛出，不会写入缓存）。
+# 线程模型：全局锁只保护 dict 读写，每个 key 一把细粒度锁串行化同 key 的
+# 计算（并发重复提问只算一次），不同 key（函数/板块/日期不同）互不阻塞，
+# 不损害 orchestrator 对估值/资金/景气度三个函数的并发调度。
+_sector_extras_cache: dict = {}
+_sector_extras_key_locks: dict = {}
+_sector_extras_lock = threading.Lock()
+_SECTOR_EXTRAS_CACHE_MAX = 256  # 安全阀：防长驻进程缓存无限增长
+
+
+def _sector_extras_cached(func_name: str, sector_name: str, trade_date: str,
+                          compute) -> dict:
+    """板块 extras 当日缓存：key = 函数名 + 板块名 + 交易日（YYYYMMDD）。"""
+    key = (func_name, sector_name, trade_date)
+    with _sector_extras_lock:
+        hit = _sector_extras_cache.get(key)
+        if hit is None:
+            key_lock = _sector_extras_key_locks.setdefault(
+                key, threading.Lock())
+    if hit is not None:
+        return hit
+    with key_lock:
+        # 拿到 key 锁后复查：并发线程可能已完成计算并写入
+        with _sector_extras_lock:
+            hit = _sector_extras_cache.get(key)
+        if hit is not None:
+            return hit
+        result = compute()  # 抛异常则不写缓存，直接向上抛
+        with _sector_extras_lock:
+            if len(_sector_extras_cache) >= _SECTOR_EXTRAS_CACHE_MAX:
+                _sector_extras_cache.clear()
+                _sector_extras_key_locks.clear()
+            _sector_extras_cache[key] = result
+        return result
+
+
+def _recent_report_periods(dt: datetime, count: int = 2) -> list:
+    """由日期推最近 count 个已过的季度末报告期 YYYYMMDD（新→旧）。"""
+    candidates = [f"{y}{md}" for y in (dt.year, dt.year - 1)
+                  for md in ("1231", "0930", "0630", "0331")]
+    return [p for p in candidates
+            if datetime.strptime(p, "%Y%m%d") < dt][:count]
+
+
 def _weighted_pe_pb(df):
     """
     按总市值（total_mv，单位万元，加权时单位可约掉）计算板块加权 PE/PB。
@@ -1528,7 +1578,15 @@ def fetch_sector_valuation(sector_name: str, trade_date: str) -> dict:
     板块估值水位：成分股 daily_basic 按总市值加权 PE/PB + 近 1 年历史分位。
     申万行业指数（801xx0.SI）本身无 daily_basic 数据，必须用成分股聚合。
     trade_date 格式 YYYYMMDD；任何一步失败对应字段为 None，note 说明原因。
+    进程内当日缓存：同板块同日重复调用直接命中（见 _sector_extras_cached）。
     """
+    return _sector_extras_cached(
+        "fetch_sector_valuation", sector_name, trade_date,
+        lambda: _fetch_sector_valuation_impl(sector_name, trade_date))
+
+
+def _fetch_sector_valuation_impl(sector_name: str, trade_date: str) -> dict:
+    """fetch_sector_valuation 的实际计算体（不缓存）。"""
     result = {"pe": None, "pb": None, "pe_percentile": None, "pb_percentile": None,
               "sample_count": 0, "note": ""}
     notes = []
@@ -1627,7 +1685,15 @@ def fetch_sector_moneyflow(sector_name: str, trade_date: str) -> dict:
     主力 = 特大单 + 大单；中小单 = 中单 + 小单。
     金额单位万元，÷10000 得亿元。trade_date 格式 YYYYMMDD；
     任何一步失败对应字段为 None/空列表，note 说明原因。
+    进程内当日缓存：同板块同日重复调用直接命中（见 _sector_extras_cached）。
     """
+    return _sector_extras_cached(
+        "fetch_sector_moneyflow", sector_name, trade_date,
+        lambda: _fetch_sector_moneyflow_impl(sector_name, trade_date))
+
+
+def _fetch_sector_moneyflow_impl(sector_name: str, trade_date: str) -> dict:
+    """fetch_sector_moneyflow 的实际计算体（不缓存）。"""
     result = {"main_net": None, "retail_net": None, "top_inflow": [],
               "top_outflow": [], "stock_count": 0, "note": ""}
 
@@ -1710,11 +1776,20 @@ def _period_label(end_date: str) -> str:
 def fetch_sector_earnings(sector_name: str, trade_date: str) -> dict:
     """
     板块景气度：成分股业绩预告聚合 + 业绩快报增强。
-    从 trade_date 往前回溯约 120 天、按周采样 ann_date 调 pro.forecast，
+    业绩预告优先按报告期直查 pro.forecast(period=YYYYMMDD)（1~2 次调用），
+    period 查询失败或全部期间为空时降级为按周采样 ann_date（约 17 次调用）；
     过滤成分股后每只股票只保留最新一条预告；
     p_change_min/max 本身是百分数数值，取二者中值代表变动幅度。
     trade_date 格式 YYYYMMDD；任何一步失败对应字段为安全默认值，note 说明原因。
+    进程内当日缓存：同板块同日重复调用直接命中（见 _sector_extras_cached）。
     """
+    return _sector_extras_cached(
+        "fetch_sector_earnings", sector_name, trade_date,
+        lambda: _fetch_sector_earnings_impl(sector_name, trade_date))
+
+
+def _fetch_sector_earnings_impl(sector_name: str, trade_date: str) -> dict:
+    """fetch_sector_earnings 的实际计算体（不缓存）。"""
     result = {"total_forecast": 0, "positive_count": 0, "negative_count": 0,
               "positive_ratio": 0.0, "median_change": None,
               "top_improvers": [], "top_decliners": [],
@@ -1736,29 +1811,59 @@ def fetch_sector_earnings(sector_name: str, trade_date: str) -> dict:
     # 确保股票名称缓存已加载
     _load_stock_names()
 
-    # 2. 业绩预告：往前 120 天按周采样 ann_date（约 17 次调用），
-    #    过滤成分股，每只股票只保留公告日期最新的一条
+    # 2. 业绩预告：优先按报告期直查 pro.forecast(period=YYYYMMDD)——
+    #    由 trade_date 推最近 1~2 个已过的季度末报告期（0331/0630/0930/1231），
+    #    1~2 次调用即可覆盖该报告期全部预告；period 查询抛异常或全部期间
+    #    返回空时，降级为原按周采样 ann_date 逻辑（往前 120 天约 17 次调用）。
+    #    两种方式都过滤成分股，每只股票只保留公告日期最新的一条。
     latest = {}  # ts_code -> (ann_date, 记录dict)
     dt = datetime.strptime(trade_date, "%Y%m%d")
     api_fail = 0
-    for offset in range(0, 119, 7):
-        d = (dt - timedelta(days=offset)).strftime("%Y%m%d")
-        try:
-            df = pro.forecast(ann_date=d)
-            if df is not None and not df.empty:
-                df = df[df["ts_code"].isin(stock_set)]
-                for _, r in df.iterrows():
-                    code = r["ts_code"]
-                    ann = str(r.get("ann_date", ""))
-                    if code not in latest or ann >= latest[code][0]:
-                        latest[code] = (ann, r.to_dict())
-        except Exception:
-            api_fail += 1
-            logger.warning("forecast 调用失败 ann_date=%s", d, exc_info=True)
-        time.sleep(0.3)  # 防限流
 
-    if api_fail:
-        notes.append(f"业绩预告采样有 {api_fail} 次调用失败")
+    period_hit = None
+    try:
+        for p in _recent_report_periods(dt, count=2):
+            df = pro.forecast(period=p)
+            time.sleep(0.3)  # 防限流
+            if df is None or df.empty:
+                continue
+            df = df[df["ts_code"].isin(stock_set)]
+            if df.empty:
+                continue
+            for _, r in df.iterrows():
+                code = r["ts_code"]
+                ann = str(r.get("ann_date", ""))
+                if code not in latest or ann >= latest[code][0]:
+                    latest[code] = (ann, r.to_dict())
+            period_hit = p
+            break
+    except Exception:
+        latest.clear()  # 直查中途异常，丢弃半成品再降级
+        logger.warning("forecast 按报告期直查失败，降级按周采样 sector=%s",
+                       sector_name, exc_info=True)
+
+    if period_hit:
+        notes.append(f"业绩预告按报告期直查（{_period_label(period_hit)}）")
+    else:
+        # 降级：原按周采样逻辑（往前 120 天，每 7 天一次 ann_date 采样）
+        for offset in range(0, 119, 7):
+            d = (dt - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                df = pro.forecast(ann_date=d)
+                if df is not None and not df.empty:
+                    df = df[df["ts_code"].isin(stock_set)]
+                    for _, r in df.iterrows():
+                        code = r["ts_code"]
+                        ann = str(r.get("ann_date", ""))
+                        if code not in latest or ann >= latest[code][0]:
+                            latest[code] = (ann, r.to_dict())
+            except Exception:
+                api_fail += 1
+                logger.warning("forecast 调用失败 ann_date=%s", d, exc_info=True)
+            time.sleep(0.3)  # 防限流
+        notes.append("业绩预告按周采样（报告期直查无数据或失败，已降级）")
+        if api_fail:
+            notes.append(f"业绩预告采样有 {api_fail} 次调用失败")
 
     # 3. 聚合统计
     records = [rec for _, rec in latest.values()]
