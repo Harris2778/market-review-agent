@@ -193,6 +193,11 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             sector = _extract_sector(msg)
             return ("news_only", sector)  # sector may be None for full market news
 
+    # 纯数据查询（热搜/榜单/搜索等）→ MCP
+    pure_data_kw = ["热搜", "榜单", "搜索", "排名前", "前10", "前5", "列表", "列出", "查询", "涨跌分布", "涨了多少", "跌了多少", "哪些股票涨停", "哪些股票跌停", "北向资金多少"]
+    if any(kw in msg for kw in pure_data_kw):
+        return ("mcp_query", msg)
+
     # 期货查询（优先于行业匹配）
     if any(kw in msg for kw in ["期货", "黄金", "原油", "铜价", "螺纹钢", "铁矿石", "白银", "焦煤"]):
         return ("futures_query", msg)
