@@ -1048,7 +1048,7 @@ def fetch_sector_volume_all(date: str) -> dict:
             sector = _stock_sector_cache.get(code, "")
             if not sector:
                 continue
-            amt = float(row.get("amount", 0) or 0) / 1e8  # 元→亿
+            amt = float(row.get("amount", 0) or 0) / 1e7  # 千元→亿
             vol = float(row.get("vol", 0) or 0) / 10000    # 手→万手
             sector_amount[sector] = sector_amount.get(sector, 0) + amt
             sector_vol[sector] = sector_vol.get(sector, 0) + vol
@@ -1211,7 +1211,7 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         # 板块合计成交额（成分股口径）
         total_amount = float(daily_df["amount"].sum()) if "amount" in daily_df.columns else 0
         total_vol = float(daily_df["vol"].sum()) if "vol" in daily_df.columns else 0
-        result["total_amount"] = round(total_amount / 1e8, 2)  # 元→亿
+        result["total_amount"] = round(total_amount / 1e7, 2)  # 千元→亿
         result["total_vol"] = round(total_vol / 10000, 2)      # 手→万手
 
         result["up_count"] = int((daily_df["pct_chg"] > 0).sum())
@@ -1914,7 +1914,10 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
 
         if stock_detail.get("fund_flow"):
             ff = stock_detail["fund_flow"]
-            lines.append(f"资金拆解（前10权重股）：大单净额{ff['lg_net']:+.2f}亿（机构） 中单净额{ff['md_net']:+.2f}亿（游资） 小单净额{ff['sm_net']:+.2f}亿（散户）")
+            if ff['lg_net'] == 0 and ff['md_net'] == 0 and ff['sm_net'] == 0:
+                lines.append("资金流向：数据暂缺（接口返回为空）")
+            else:
+                lines.append(f"资金拆解（前10权重股）：大单净额{ff['lg_net']:+.2f}亿（机构） 中单净额{ff['md_net']:+.2f}亿（游资） 小单净额{ff['sm_net']:+.2f}亿（散户）")
         lines.append("")
 
     # ── 券商推荐 ──

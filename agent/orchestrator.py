@@ -460,7 +460,7 @@ class MarketReviewAgent:
 
 {market_data}
 
-深度分析{sector}板块。不列出新闻。如需新闻请用户说\"{sector}板块新闻\"。"""
+深度分析{sector}板块。输出标题需包含日期{date_display}。不列出新闻。数据缺失处标注数据暂缺，禁止编造。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -750,7 +750,7 @@ class MarketReviewAgent:
                 max_tokens=65536,
             )
             raw = completion.choices[0].message.content
-            disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
+            disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
             clean = _clean_markdown(raw)
             return {"role": "assistant", "content": clean + disclaimer}
 
