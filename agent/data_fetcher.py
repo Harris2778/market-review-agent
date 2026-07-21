@@ -472,7 +472,7 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
 
 
 def _mcp_call(tool_name: str, args: dict) -> dict:
-    """通用MCP工具调用。"""
+    """通用MCP工具调用。自动兼容JSON和分号分隔字符串两种响应格式。"""
     token = _env("SINA_MCP_TOKEN", "")
     if not token:
         return {}
@@ -493,8 +493,18 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
         content = d.get("result",{}).get("content",[])
         if content and isinstance(content,list):
             text = content[0].get("text","")
-            if text:
+            if not text:
+                return {}
+            # 格式1: JSON → 尝试解析
+            try:
                 return json.loads(text)
+            except:
+                pass
+            # 格式2: var xxx="csv,data" → 提取数据部分
+            if "var " in text and "=\"" in text:
+                csv = text.split('="')[1].split('"')[0] if '="' in text else text
+                return {"raw": csv, "type": "csv"}
+            return {"raw": text, "type": "text"}
     except Exception:
         pass
     return {}
@@ -503,31 +513,29 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
 def fetch_market_breadth() -> dict:
     """A股全市场涨跌分布。"""
     d = _mcp_call("cnMarketUpdownDistribution", {})
-    data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
-    if data:
-        return {"total": len(data), "data": data[:20]}
+    raw = d.get("raw","")
+    if raw and "," in raw:
+        parts = raw.split(",")
+        return {"date": parts[1] if len(parts)>1 else "", "跌停": parts[2], "跌7-10": parts[3],
+                "跌5-7": parts[4], "跌2-5": parts[5], "跌0-2": parts[6], "平": parts[7],
+                "涨0-2": parts[8], "涨2-5": parts[9], "涨5-7": parts[10], "涨7-10": parts[11], "涨停": parts[12],
+                "total_up": str(int(parts[8])+int(parts[9])+int(parts[10])+int(parts[11])+int(parts[12])),
+                "total_down": str(int(parts[2])+int(parts[3])+int(parts[4])+int(parts[5])+int(parts[6]))}
     return {}
-
-
-def fetch_northbound_sector() -> list:
-    """沪深港通持股——北向资金流向。"""
-    items = []
-    for mkt in ["sh", "sz"]:
-        d = _mcp_call("cnStockConnectHoldings", {"type": mkt, "sort": "hold_market", "asc": 0, "num": 10, "page": 1})
-        data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
-        for it in data:
-            items.append({"market": mkt, "name": it.get("name",""), "code": it.get("symbol",""),
-                         "hold": it.get("hold_market",""), "pct": it.get("hold_ratio","")})
-    return items[:20]
 
 
 def fetch_hot_stocks() -> list:
     """股票热搜榜。"""
-    items = []
     d = _mcp_call("globalStockHotBoard", {"type": "hot", "market": "cn", "num": 10, "page": 1})
-    data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
-    for it in data:
-        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "heat": it.get("heat",0)})
+    raw = d.get("raw","")
+    items = []
+    if raw and "var " in raw:
+        for block in raw.split("\n"):
+            if "=" in block and "," in block:
+                csv = block.split('="')[1].split('"')[0]
+                parts = csv.split(",")
+                if len(parts) >= 3:
+                    items.append({"name": parts[1], "code": parts[0], "heat": parts[2]})
     return items[:15]
 
 
@@ -1398,8 +1406,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
 
     # ── 涨跌分布 + 热搜 ──
     breadth = getattr(snapshot, "_breadth", {})
-    if breadth and breadth.get("data"):
-        lines.append(f"### A股全市场涨跌分布（共{len(breadth['data'])}档）")
+    if breadth:
+        lines.append(f"### A股全市场涨跌分布（{breadth.get('date','')}）")
+        lines.append(f"涨停{breadth.get('涨停','?')} 跌停{breadth.get('跌停','?')} 涨{breadth.get('total_up','?')}家 跌{breadth.get('total_down','?')}家 平{breadth.get('平','?')}家")
     hot = getattr(snapshot, "_hot", [])
     if hot:
         lines.append("### 股票热搜榜TOP15")
