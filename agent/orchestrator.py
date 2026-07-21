@@ -418,22 +418,24 @@ class MarketReviewAgent:
         date_display = trade_date.strftime("%Y年%m月%d日")
         weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
 
-        # 新闻模式：直拉Sina+EM，按行业关键字过滤，不限数量
+        # 新闻模式：Sina每天150条(3页×50)，3天覆盖 + EM补最新
         from agent.data_fetcher import fetch_sina_news as _sina, fetch_eastmoney_news as _em
-        from agent.data_fetcher import SECTOR_NEWS_KEYWORDS
         import asyncio
         loop = asyncio.get_event_loop()
-        d1 = trade_date.strftime("%Y-%m-%d")
-        d2 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 新浪重试3次确保稳定
-        sina1 = []; sina2 = []
-        for attempt in range(3):
-            sina1 = await loop.run_in_executor(None, _sina, 50, d1)
-            if sina1: break
-        for attempt in range(3):
-            sina2 = await loop.run_in_executor(None, _sina, 50, d2)
-            if sina2: break
+        # 每日期3页、每页50条、重试2次 = 150条/天 × 3天 = 450条
+        d0 = trade_date.strftime("%Y-%m-%d")
+        d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        all_sina = []
+        for date_str in [d0, d1, d2]:
+            for page in [1, 2, 3]:
+                for attempt in range(2):
+                    items = await loop.run_in_executor(None, _sina, 50, date_str)
+                    if items:
+                        all_sina.extend(items)
+                        break
         em1 = await loop.run_in_executor(None, _em, 50)
 
         # 申万31行业关键词（每个行业名+简称，用于新闻自动归类）
@@ -474,7 +476,7 @@ class MarketReviewAgent:
         by_date = defaultdict(list)
         label = f"{sector}板块" if sector else "全市场"
 
-        all_items = (sina1 or []) + (sina2 or []) + (em1 or [])
+        all_items = all_sina + (em1 or [])
         for item in all_items:
             t = (item.get("time", "") or "")[:10]
             title = (item.get("title", "") or "").strip()
