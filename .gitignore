@@ -22,3 +22,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 运行时产物（问责存档 / SVG 图表）
+data/
+charts/

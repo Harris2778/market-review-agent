@@ -29,6 +29,9 @@ FAKE_ENV = {
     "FINNHUB_API_KEY": "test-finnhub-api-key",
     "FRED_API_KEY": "test-fred-api-key",
     "SINA_MCP_TOKEN": "test-sina-mcp-token",
+    # 存档/图表目录隔离到 tmp，防止测试往真实 data/archive 与 charts 写垃圾
+    "ARCHIVE_DIR": "/tmp/market_review_agent_test_archive",
+    "CHART_DIR": "/tmp/market_review_agent_test_charts",
 }
 
 for _key, _value in FAKE_ENV.items():

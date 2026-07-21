@@ -40,6 +40,13 @@ except ImportError as e:
     logger.warning("agent/validators.py 未就绪，数字溯源校验将整体降级跳过: %s", e)
     validators = None
 
+# 第四波：分析存档层（自我问责系统，agent/archive.py 未就绪时存档能力整体降级，不影响主流程）
+try:
+    from . import archive
+except ImportError as e:
+    logger.warning("agent/archive.py 未就绪，分析存档将整体降级跳过: %s", e)
+    archive = None
+
 
 def _log_stream_violations(label: str, violations: list) -> None:
     """流式路径 log-only：记录疑似无出处数字的数量与前几条原文，绝不抛出、不拦截。"""
@@ -754,6 +761,34 @@ class MarketReviewAgent:
         trade_date = _get_latest_trade_date(datetime.now())
         return f"snapshot_{trade_date.strftime('%Y%m%d')}" in self._cache
 
+    # ── 第四波：自我问责存档接入（fail-safe，绝不影响主流程）──
+
+    def _archive_safe(self, mode: str, sector, content: str, context: str, trade_date: str) -> None:
+        """非流式路径存档：最终 content 产出后调用。任何异常只记 log。"""
+        if archive is None:
+            return
+        try:
+            archive.save_analysis(
+                mode=mode, sector=sector, content=content,
+                context=context, trade_date=trade_date,
+            )
+        except Exception as e:
+            logger.warning("分析存档异常（忽略，不影响主流程）: %s", e, exc_info=True)
+
+    def _stream_archive_callback(self, mode: str, sector, context: str, trade_date: str):
+        """流式路径存档回调：流结束后以最终全文存档；archive 未就绪时返回 None。
+
+        回调在 _stream_response 生成器被完整消费后触发；客户端中途断开导致
+        流未完整消费时该次不存档（best-effort，见 agent/archive.py docstring）。
+        """
+        if archive is None:
+            return None
+
+        def _callback(final_text: str) -> None:
+            self._archive_safe(mode, sector, final_text or "", context, trade_date)
+
+        return _callback
+
     async def process_message(
         self, user_message: str, stream: bool = False, history: list = None
     ) -> dict | AsyncGenerator:
@@ -839,7 +874,20 @@ class MarketReviewAgent:
 
 生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失标[UNSOURCED]。"""
 
-        return await self._call_llm(system, user_prompt, stream)
+        # 第四波：存档接入——流式走 _stream_response 结束回调，非流式在最终 content 产出后落档
+        if stream:
+            return await self._call_llm(
+                system, user_prompt, stream,
+                archive_callback=self._stream_archive_callback(
+                    "market_review", None, user_prompt, date_str
+                ),
+            )
+        result = await self._call_llm(system, user_prompt, stream)
+        if isinstance(result, dict):
+            self._archive_safe(
+                "market_review", None, result.get("content", ""), user_prompt, date_str
+            )
+        return result
 
     async def _fetch_sector_extras(
         self, sector: str, trade_date: str
@@ -939,12 +987,22 @@ class MarketReviewAgent:
                         _log_stream_violations(f"板块深挖({sector})", stream_violations)
                 except Exception as e:
                     logger.warning("流式板块深挖数字溯源校验异常（log-only，忽略）: %s", e, exc_info=True)
-            return await self._call_llm(system, user_prompt, stream)
+            # 第四波：流结束后以最终全文存档（best-effort 回调）
+            return await self._call_llm(
+                system, user_prompt, stream,
+                archive_callback=self._stream_archive_callback(
+                    "sector_deep_dive", sector, user_prompt, date_str
+                ),
+            )
         result = await self._call_llm(system, user_prompt, stream)
         if isinstance(result, dict):
             # 第二波：多 pass 自我审查修正；数据上下文用完整 user_prompt 供数字出处核对
             draft = result.get("content", "")
             result["content"] = _clean_markdown(await self._critique_and_revise(draft, user_prompt))
+            # 第四波：存档最终产出（审查修正后的终稿）
+            self._archive_safe(
+                "sector_deep_dive", sector, result.get("content", ""), user_prompt, date_str
+            )
         return result
 
     async def _news_only(self, sector: str, stream: bool, message: str = ""):
@@ -1323,6 +1381,7 @@ class MarketReviewAgent:
             return await self._chat(user_message, stream, history=history)
 
         date_display = datetime.now().strftime("%Y年%m月%d日")
+        date_str = datetime.now().strftime("%Y%m%d")  # 第四波存档用：agent_query 的 trade_date 取当前日期
         system = AGENT_QUERY_PROMPT + f"\n\n当前日期：{date_display}。"
         messages = [{"role": "system", "content": system}]
         messages.extend(_trim_history(history))  # 最多保留最近 10 轮（20 条）
@@ -1347,6 +1406,8 @@ class MarketReviewAgent:
 
                 if not tool_calls:
                     # 模型返回纯文本 → 工具循环收敛，最终成文
+                    # 数据上下文（用户问题 + 工具返回摘要拼接）：供数字校验与第四波存档共用
+                    query_context = user_message + "\n\n" + "\n".join(tool_context_parts)
                     if stream:
                         # 最终纯文本生成那一轮改用流式输出（不传 tools，模型只能写正文）。
                         # 流式路径同时跳过自我审查以保延迟，见 _critique_and_revise 注释。
@@ -1354,20 +1415,27 @@ class MarketReviewAgent:
                         # 仅记录不拦截
                         if validators is not None:
                             try:
-                                stream_context = user_message + "\n\n" + "\n".join(tool_context_parts)
                                 stream_violations = validators.find_unsourced_numbers(
-                                    system + "\n\n" + user_message, stream_context
+                                    system + "\n\n" + user_message, query_context
                                 )
                                 if stream_violations:
                                     _log_stream_violations("Agent 查询", stream_violations)
                             except Exception as e:
                                 logger.warning("流式 Agent 查询数字溯源校验异常（log-only，忽略）: %s", e, exc_info=True)
-                        return self._stream_response(messages)
+                        # 第四波：流结束后以最终全文存档（trade_date 用当前日期）
+                        return self._stream_response(
+                            messages,
+                            archive_callback=self._stream_archive_callback(
+                                "agent_query", None, query_context, date_str
+                            ),
+                        )
                     draft = choice.message.content or ""
-                    context = user_message + "\n\n" + "\n".join(tool_context_parts)
-                    final = await self._critique_and_revise(draft, context)
+                    final = await self._critique_and_revise(draft, query_context)
                     disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
-                    return {"role": "assistant", "content": _clean_markdown(final) + disclaimer}
+                    content = _clean_markdown(final) + disclaimer
+                    # 第四波：存档最终产出（trade_date 用当前日期）
+                    self._archive_safe("agent_query", None, content, query_context, date_str)
+                    return {"role": "assistant", "content": content}
 
                 # 有工具调用：回显 assistant 消息，逐个在线程池执行并追加 tool 结果
                 messages.append(_assistant_tool_message(choice.message))
@@ -1459,11 +1527,13 @@ class MarketReviewAgent:
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False,
-        history: list = None,
+        history: list = None, archive_callback=None,
     ):
         """
         调用 DeepSeek API。
         history 非空时按 system + history + 当前 user 组装 messages（闲聊上下文）。
+        archive_callback：第四波存档回调，仅流式路径有效，透传给 _stream_response，
+        在流结束后以最终全文调用（签名为 callback(accumulated_text)）。
         """
         messages = [{"role": "system", "content": system_prompt}]
         if history:
@@ -1471,7 +1541,7 @@ class MarketReviewAgent:
         messages.append({"role": "user", "content": user_message})
 
         if stream:
-            return self._stream_response(messages)
+            return self._stream_response(messages, archive_callback=archive_callback)
         else:
             completion = await self.client.chat.completions.create(
                 model=self.model,
@@ -1501,8 +1571,12 @@ class MarketReviewAgent:
             clean = _clean_markdown(raw)
             return {"role": "assistant", "content": clean + disclaimer}
 
-    async def _stream_response(self, messages: list) -> AsyncGenerator:
-        """流式响应生成器。注意：流式不清理markdown，但非流式会清理。"""
+    async def _stream_response(self, messages: list, archive_callback=None) -> AsyncGenerator:
+        """流式响应生成器。注意：流式不清理markdown，但非流式会清理。
+
+        archive_callback：可选存档回调（第四波），在流结束（生成器被完整消费、
+        含截断续写完成）后以最终全文调用一次；客户端中途断开时不触发。
+        """
         accumulated = ""
         continued = False
         current_messages = messages
@@ -1535,6 +1609,13 @@ class MarketReviewAgent:
                 ]
                 continue
             break
+
+        # 第四波：流正常结束后以最终全文存档（fail-safe，回调异常只记 log）
+        if archive_callback is not None:
+            try:
+                archive_callback(accumulated)
+            except Exception as e:
+                logger.warning("流式存档回调异常（忽略）: %s", e, exc_info=True)
 
 
 # ── 全局单例 ──

@@ -17,12 +17,19 @@
   FINNHUB_API_KEY     Finnhub API Key
   FRED_API_KEY        FRED API Key
   BRAVE_SEARCH_API_KEY Brave Search API Key
+
+环境变量（可选 · 定时推送与图表静态服务）：
+  PUSH_WEBHOOK_URL    定时推送的目标 Webhook URL（未配置则只生成内容记日志，不发送）
+  PUSH_TIME           定时推送触发时间，上海时区 HH:MM（默认 15:40，仅工作日触发）
+  CHART_DIR           图表文件目录，启动时自动创建并挂载到 /charts（默认 charts/）
 """
 
 import os
 import json
 import time
 import uuid
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -32,6 +39,7 @@ load_dotenv()
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 import traceback
 import logging
@@ -48,6 +56,15 @@ except Exception as e:
     _agent_error = traceback.format_exc()
     get_agent = None
     detect_intent = None
+
+# 推送模块（agent.push）同为并行开发文件：import 失败只降级，不影响主服务
+try:
+    from agent import push as push_tasks
+    _push_loaded = True
+except Exception:
+    push_tasks = None
+    _push_loaded = False
+    logger.error("推送模块 agent.push 加载失败，定时推送将不可用", exc_info=True)
 
 # ── 配置 ──
 
@@ -67,11 +84,70 @@ AGENT_VERSION = "1.1.0"
 
 # ── FastAPI App ──
 
+PUSH_LOOP_INTERVAL_SECONDS = 60  # 定时推送循环唤醒间隔
+
+
+async def _push_loop():
+    """
+    定时推送后台任务：每 60 秒醒一次，工作日越过 PUSH_TIME 即触发一次。
+
+    由 lifespan 在服务启动时创建、关闭时取消。循环体内所有异常都被吞掉
+    并记日志（fail-safe），绝不会因推送问题影响主服务。
+    """
+    if push_tasks is None:
+        logger.error("推送模块不可用，定时推送任务直接退出")
+        return
+    last_fired_date = None  # 当天触发后回存，防同一交易日重复推送
+    logger.info(
+        "定时推送任务已启动（PUSH_TIME=%s，webhook=%s）",
+        os.getenv("PUSH_TIME", push_tasks.DEFAULT_FIRE_TIME),
+        "已配置" if os.getenv("PUSH_WEBHOOK_URL") else "未配置（仅生成不发送）",
+    )
+    while True:
+        try:
+            _fired, last_fired_date = await push_tasks.push_tick(
+                fire_time=os.getenv("PUSH_TIME", push_tasks.DEFAULT_FIRE_TIME),
+                webhook_url=(os.getenv("PUSH_WEBHOOK_URL", "").strip() or None),
+                last_fired_date=last_fired_date,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("定时推送循环本轮异常（已吞掉，下轮继续）", exc_info=True)
+        await asyncio.sleep(PUSH_LOOP_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """服务生命周期：启动时拉起定时推送后台任务，关闭时取消并等待退出。"""
+    push_task = asyncio.create_task(_push_loop())
+    try:
+        yield
+    finally:
+        push_task.cancel()
+        try:
+            await push_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("定时推送任务已停止")
+
+
 app = FastAPI(
     title=AGENT_NAME,
     description=AGENT_DESCRIPTION,
     version=AGENT_VERSION,
+    lifespan=lifespan,
 )
+
+# ── 图表静态文件（第五波可视化产出，目录不存在先创建再挂载）──
+
+CHART_DIR = os.getenv("CHART_DIR", "charts")
+try:
+    os.makedirs(CHART_DIR, exist_ok=True)
+except OSError:
+    logger.warning("图表目录创建失败：%s（/charts 将返回 404）", CHART_DIR, exc_info=True)
+# check_dir=False：目录创建失败时也不让主服务启动崩溃
+app.mount("/charts", StaticFiles(directory=CHART_DIR, check_dir=False), name="charts")
 
 app.add_middleware(
     CORSMiddleware,
@@ -643,4 +719,7 @@ if __name__ == "__main__":
     print(f"  Tushare: {'已配置' if os.getenv('TUSHARE_TOKEN') else '未配置'}")
     print(f"  Finnhub: {'已配置' if os.getenv('FINNHUB_API_KEY') else '未配置'}")
     print(f"  FRED: {'已配置' if os.getenv('FRED_API_KEY') else '未配置'}")
+    print(f"  定时推送: PUSH_TIME={os.getenv('PUSH_TIME', '15:40')}，"
+          f"webhook={'已配置' if os.getenv('PUSH_WEBHOOK_URL') else '未配置（仅生成不发送）'}")
+    print(f"  图表目录: {CHART_DIR} → /charts")
     uvicorn.run(app, host="0.0.0.0", port=port)
