@@ -418,31 +418,41 @@ class MarketReviewAgent:
         date_display = trade_date.strftime("%Y年%m月%d日")
         weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
 
-        # 新闻模式：Sina直拉（同步，避免并行采集丢失）+ EM补最新
+        # 新闻模式：直拉Sina+EM，按行业关键字过滤，不限数量
         from agent.data_fetcher import fetch_sina_news as _sina, fetch_eastmoney_news as _em
+        from agent.data_fetcher import SECTOR_NEWS_KEYWORDS
         import asyncio
         loop = asyncio.get_event_loop()
         d1 = trade_date.strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # 同步拉取，避免并行丢失
         sina1 = await loop.run_in_executor(None, _sina, 50, d1)
         sina2 = await loop.run_in_executor(None, _sina, 50, d2)
         em1 = await loop.run_in_executor(None, _em, 50)
 
+        # 行业关键字过滤
+        keywords = SECTOR_NEWS_KEYWORDS.get(sector, []) if sector else []
         from collections import defaultdict
         by_date = defaultdict(set)
-        for item in (sina1 or []) + (sina2 or []) + (em1 or []):
-            t = (item.get("time", "") or "")[:10]
-            title = (item.get("title", "") or "").strip()
-            if t and title and len(title) > 3:
-                by_date[t].add(title)
-
-        total = sum(len(v) for v in by_date.values())
         label = f"{sector}板块" if sector else "全市场"
 
+        all_items = (sina1 or []) + (sina2 or []) + (em1 or [])
+        for item in all_items:
+            t = (item.get("time", "") or "")[:10]
+            title = (item.get("title", "") or "").strip()
+            if not t or not title or len(title) < 4:
+                continue
+            # 无行业指定 → 全量。有指定 → 关键字匹配
+            if sector:
+                text = title
+                matched = any(kw in text for kw in keywords)
+                if not matched:
+                    continue
+            by_date[t].add(title)
+
+        total = sum(len(v) for v in by_date.values())
         if total == 0:
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}\n暂未获取到新闻数据，请稍后重试。"
+            news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到与该行业相关的新闻。请尝试更宽泛的关键词，或查询\"全市场新闻\"。"
         else:
             news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}条）\n"
             for d in sorted(by_date.keys(), reverse=True):
@@ -452,7 +462,7 @@ class MarketReviewAgent:
                     news_text += f"[{d}] {title}\n"
 
         system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。"
-        user_prompt = f"{news_text}\n\n以上48小时新闻汇总。原样输出。"
+        user_prompt = f"{news_text}\n\n以上{label}48小时新闻汇总。原样输出。"
 
         result = await self._call_llm(system, user_prompt, stream)
         if not stream and isinstance(result, dict):
