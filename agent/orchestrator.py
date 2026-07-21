@@ -183,6 +183,14 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             sector = _extract_sector(msg)
             return ("news_only", sector)  # sector may be None for full market news
 
+    # 期货查询（优先于行业匹配）
+    if any(kw in msg for kw in ["期货", "黄金", "原油", "铜价", "螺纹钢", "铁矿石", "白银", "焦煤"]):
+        return ("futures_query", msg)
+
+    # 基金查询
+    if any(kw in msg for kw in ["基金", "ETF", "净值", "申赎"]) and not any(kw in msg for kw in ["板块", "行业", "复盘"]):
+        return ("fund_query", msg)
+
     # 直接提行业名——但如果含"新闻"则走新闻模式
     for kw, sw_name in SECTOR_NAME_MAP.items():
         if kw in msg:
@@ -202,14 +210,6 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     for p in stock_patterns:
         if re.search(p, msg, re.IGNORECASE):
             return ("stock_query", msg)
-
-    # 期货查询
-    if any(kw in msg for kw in ["期货", "黄金", "原油", "铜价", "螺纹钢", "铁矿石", "白银", "焦煤"]):
-        return ("futures_query", msg)
-
-    # 基金查询
-    if any(kw in msg for kw in ["基金", "ETF", "净值", "申赎"]):
-        return ("fund_query", msg)
 
     return ("general_chat", None)
 
