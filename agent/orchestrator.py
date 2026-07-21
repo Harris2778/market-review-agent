@@ -169,13 +169,20 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
-    # 直接提行业名 → 板块聚焦（不强制要求问句）
+    # 新闻专属模式：用户明确要新闻
+    news_patterns = [r"(今天|今日|昨天|昨日|最近).*(新闻|快讯|资讯|消息)", r".*(新闻|快讯|资讯).*(汇总|总结|盘点|梳理)", r"有什么.*新闻", r"新闻.*怎么样"]
+    for pattern in news_patterns:
+        if re.search(pattern, msg):
+            sector = _extract_sector(msg)
+            return ("news_only", sector)  # sector may be None for full market news
+
+    # 直接提行业名 → 板块聚焦
     for kw, sw_name in SECTOR_NAME_MAP.items():
         if kw in msg:
             return ("sector_deep_dive", sw_name)
 
     # 提板块/行业 + 任何疑问词 → 板块聚焦
-    for pattern in [r"(板块|行业|赛道).*(怎么样|如何|分析|复盘|表现|走势|情况|新闻|回顾)", r"(怎么看|分析一下|回顾一下).*(板块|行业|市场)"]:
+    for pattern in [r"(板块|行业|赛道).*(怎么样|如何|分析|复盘|表现|走势|情况|回顾)", r"(怎么看|分析一下|回顾一下).*(板块|行业|市场)"]:
         if re.search(pattern, msg):
             sector = _extract_sector(msg)
             if sector:
@@ -286,6 +293,8 @@ class MarketReviewAgent:
             return await self._chat(message, stream)
         elif intent == "market_review":
             return await self._market_review(stream)
+        elif intent == "news_only":
+            return await self._news_only(sector, stream)
         else:
             return await self._sector_deep_dive(sector, stream)
 
@@ -343,7 +352,6 @@ class MarketReviewAgent:
             snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
             self._cache = {cache_key: snapshot}
         market_data = format_market_data_for_prompt(snapshot)
-        news_block = _format_multi_day_news(snapshot, sector, date_str)
 
         system = get_system_prompt("sector_deep_dive", sector)
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
@@ -352,9 +360,30 @@ class MarketReviewAgent:
 
 {market_data}
 
+深度分析{sector}板块。相关新闻节只列5条最重要的标题即可。需要完整新闻列表请用户说\"{sector}板块新闻\"。"""
+
+        return await self._call_llm(system, user_prompt, stream)
+
+    async def _news_only(self, sector: str, stream: bool):
+        """新闻专属模式：只生成新闻汇总，不生成分析报告。"""
+        today = datetime.now()
+        trade_date = _get_latest_trade_date(today)
+        date_str = trade_date.strftime("%Y%m%d")
+        date_display = trade_date.strftime("%Y年%m月%d日")
+
+        snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
+        news_block = _format_multi_day_news(snapshot, sector or "全市场", date_str)
+
+        label = f"{sector}板块" if sector else "全市场"
+        system = f"""你是财经新闻编辑。根据提供的新闻数据，生成{label}新闻汇总。
+
+格式要求：按日期分组（先列{date_display}，再列前一天），每条新闻列出时间和标题。不要添加分析评论。纯文本，禁止markdown。"""
+
+        user_prompt = f"""{label}新闻汇总 — 覆盖{date_display}及前一天
+
 {news_block}
 
-深度分析{sector}板块。以上预格式化新闻全部列在相关新闻节，不许跳过任何一条。"""
+请将以上所有新闻按日期分组列出。每条格式：[时间] 标题。全部列出，不许跳过。"""
 
         result = await self._call_llm(system, user_prompt, stream)
         if not stream and isinstance(result, dict):
