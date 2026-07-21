@@ -578,7 +578,9 @@ class MarketReviewAgent:
         quote = fetch_stock_quote(market, code)
         kline = fetch_stock_kline(market, code, 5)
         news = fetch_stock_news(code, market, 5)
-        info = f"{s['name']}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}% 成交量{quote.get('volume','?')}\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{', '.join(f'{k[\"date\"][-5:]}:{k[\"close\"]}({k[\"open\"]}→{k[\"close\"]})' for k in kline)}\n相关新闻：{' | '.join(f'{n[\"title\"][:40]}' for n in news[:3])}\n数据来源：新浪智研"
+        kline_str = ", ".join(k["date"][-5:] + ":" + str(k["close"]) for k in kline)
+        news_str = " | ".join(n["title"][:40] for n in news[:3])
+        info = f"{s['name']}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}%\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{kline_str}\n相关新闻：{news_str}\n数据来源：新浪智研"
         return {"role": "assistant", "content": info}
 
     async def _futures_query(self, message: str, stream: bool):
