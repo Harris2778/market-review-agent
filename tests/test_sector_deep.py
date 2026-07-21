@@ -26,7 +26,7 @@
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
@@ -34,7 +34,11 @@ import pytest
 
 import agent.data_fetcher as data_fetcher
 import agent.orchestrator as orchestrator
-from agent.data_fetcher import fetch_sector_moneyflow, fetch_sector_valuation
+from agent.data_fetcher import (
+    fetch_sector_earnings,
+    fetch_sector_moneyflow,
+    fetch_sector_valuation,
+)
 from agent.system_prompts import get_system_prompt
 
 # ── 测试数据常量 ──
@@ -462,9 +466,9 @@ def _patch_target(name: str) -> str:
 
 
 class TestOrchestratorWiring:
-    """板块深挖必须把估值/资金数据接进最终 user prompt。"""
+    """板块深挖必须把估值/资金/景气度数据接进最终 user prompt。"""
 
-    def test_sector_deep_dive_calls_valuation_and_moneyflow(self):
+    def test_sector_deep_dive_calls_valuation_moneyflow_and_earnings(self):
         agent = orchestrator.MarketReviewAgent()
         agent.client = MagicMock()  # 双保险：不触达真实 DeepSeek
         agent._call_llm = AsyncMock(
@@ -473,6 +477,7 @@ class TestOrchestratorWiring:
 
         val_mock = MagicMock(return_value=dict(VALUATION_MOCK_RET))
         mf_mock = MagicMock(return_value=dict(MONEYFLOW_MOCK_RET))
+        earn_mock = MagicMock(return_value=dict(EARNINGS_MOCK_RET))
 
         with patch(
             "agent.orchestrator._get_latest_trade_date",
@@ -487,15 +492,20 @@ class TestOrchestratorWiring:
             _patch_target("fetch_sector_valuation"), val_mock
         ), patch(
             _patch_target("fetch_sector_moneyflow"), mf_mock
+        ), patch(
+            _patch_target("fetch_sector_earnings"), earn_mock
         ):
             asyncio.run(agent._sector_deep_dive(SECTOR, stream=False))
 
-        # 两个数据函数都被调用，且都拿到了板块名
+        # 三个数据函数都被调用，且都拿到了板块名
         assert val_mock.call_count >= 1, (
             "_sector_deep_dive 未调用 fetch_sector_valuation——接线缺失"
         )
         assert mf_mock.call_count >= 1, (
             "_sector_deep_dive 未调用 fetch_sector_moneyflow——接线缺失"
+        )
+        assert earn_mock.call_count >= 1, (
+            "_sector_deep_dive 未调用 fetch_sector_earnings——接线缺失"
         )
         assert SECTOR in str(val_mock.call_args), (
             f"fetch_sector_valuation 调用参数应包含板块名：{val_mock.call_args}"
@@ -503,8 +513,11 @@ class TestOrchestratorWiring:
         assert SECTOR in str(mf_mock.call_args), (
             f"fetch_sector_moneyflow 调用参数应包含板块名：{mf_mock.call_args}"
         )
+        assert SECTOR in str(earn_mock.call_args), (
+            f"fetch_sector_earnings 调用参数应包含板块名：{earn_mock.call_args}"
+        )
 
-        # 最终 user prompt 必须包含估值与资金段落标记
+        # 最终 user prompt 必须包含估值、资金、景气度段落标记
         assert agent._call_llm.await_count == 1
         user_prompt = agent._call_llm.await_args.args[1]
         assert "估值" in user_prompt, (
@@ -512,4 +525,299 @@ class TestOrchestratorWiring:
         )
         assert "资金" in user_prompt, (
             f"user prompt 缺少资金段落标记：\n{user_prompt}"
+        )
+        assert "景气度" in user_prompt, (
+            f"user prompt 缺少景气度段落标记（如【四、板块景气度】）：\n{user_prompt}"
+        )
+
+    def test_fetch_sector_extras_returns_three_items(self):
+        """_fetch_sector_extras 必须从二元组升级为三元组（估值/资金/景气度）。"""
+        agent = orchestrator.MarketReviewAgent()
+        with patch(
+            _patch_target("fetch_sector_valuation"),
+            MagicMock(return_value=dict(VALUATION_MOCK_RET)),
+        ), patch(
+            _patch_target("fetch_sector_moneyflow"),
+            MagicMock(return_value=dict(MONEYFLOW_MOCK_RET)),
+        ), patch(
+            _patch_target("fetch_sector_earnings"),
+            MagicMock(return_value=dict(EARNINGS_MOCK_RET)),
+        ):
+            extras = asyncio.run(
+                agent._fetch_sector_extras(SECTOR, TRADE_DATE)
+            )
+        assert isinstance(extras, tuple) and len(extras) == 3, (
+            f"_fetch_sector_extras 应返回三元组（估值, 资金, 景气度），实际 {extras!r}"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# 6. fetch_sector_earnings：板块景气度（业绩预告 + 业绩快报聚合）
+# ════════════════════════════════════════════════════════════════
+#
+# 背景契约（生产代码由并行代理实现）：
+#   fetch_sector_earnings(sector_name, trade_date) ->
+#   {'total_forecast','positive_count','negative_count','positive_ratio',
+#    'median_change','top_improvers','top_decliners','express_count',
+#    'period','note'}
+# - pro.forecast 的 p_change_min/max 是百分数数值；type 为 预增/预减/扭亏/首亏 等；
+# - 同一股票多次公告只保留 ann_date 最新一条（去重后再统计）；
+# - 预喜 = 预增 + 扭亏（+ 减亏/续盈若出现），预忧 = 预减 + 首亏（+ 续亏 等）；
+# - 任何失败返回 note 非空的安全结构，绝不抛异常。
+
+EARNINGS_KEYS = ("total_forecast", "positive_count", "negative_count",
+                 "positive_ratio", "median_change", "top_improvers",
+                 "top_decliners", "express_count", "period", "note")
+
+FORECAST_PERIOD = "20250630"  # 中报预告期
+
+FORECAST_COLUMNS = ["ts_code", "ann_date", "end_date", "type",
+                    "p_change_min", "p_change_max",
+                    "net_profit_min", "net_profit_max"]
+
+# 5 条预告（2 预增 1 扭亏 1 首亏 1 预减），覆盖 3 只成分股：
+# - A 有两天公告（20250701 预增10% / 20250710 预增50~80%），
+#   去重后只留最新的 20250710 一条 → 变动中值 65%；
+# - C 有两天公告（20250702 预减 / 20250712 首亏-60~-40%），
+#   去重后留最新的首亏 → 变动中值 -50%；
+# - B 一条扭亏，p_change_min==max==30 → 无论按 min/max/中值口径都是 30。
+# 去重后 3 条：A 预增（中值65）、B 扭亏（30）、C 首亏（-50）。
+# 期望：total=3，预喜=2（预增+扭亏），预忧=1（首亏），预喜比例=2/3，
+# median_change=30（三种口径下中位数都是 B 的 30）。
+FORECAST_ROWS = [
+    {"ts_code": STOCK_A, "ann_date": "20250701", "end_date": FORECAST_PERIOD,
+     "type": "预增", "p_change_min": 10.0, "p_change_max": 10.0,
+     "net_profit_min": 5000.0, "net_profit_max": 5000.0},
+    {"ts_code": STOCK_A, "ann_date": "20250710", "end_date": FORECAST_PERIOD,
+     "type": "预增", "p_change_min": 50.0, "p_change_max": 80.0,
+     "net_profit_min": 10000.0, "net_profit_max": 15000.0},
+    {"ts_code": STOCK_B, "ann_date": "20250711", "end_date": FORECAST_PERIOD,
+     "type": "扭亏", "p_change_min": 30.0, "p_change_max": 30.0,
+     "net_profit_min": 8000.0, "net_profit_max": 8000.0},
+    {"ts_code": STOCK_C, "ann_date": "20250702", "end_date": FORECAST_PERIOD,
+     "type": "预减", "p_change_min": -20.0, "p_change_max": -10.0,
+     "net_profit_min": 3000.0, "net_profit_max": 4000.0},
+    {"ts_code": STOCK_C, "ann_date": "20250712", "end_date": FORECAST_PERIOD,
+     "type": "首亏", "p_change_min": -60.0, "p_change_max": -40.0,
+     "net_profit_min": -6000.0, "net_profit_max": -4000.0},
+]
+
+# 2 条业绩快报（A、B）→ express_count 期望为 2
+EXPRESS_ROWS = [
+    {"ts_code": STOCK_A, "ann_date": "20250715", "end_date": FORECAST_PERIOD,
+     "revenue": 100000.0, "n_income": 12000.0},
+    {"ts_code": STOCK_B, "ann_date": "20250716", "end_date": FORECAST_PERIOD,
+     "revenue": 80000.0, "n_income": 9000.0},
+]
+
+EXPECTED_POSITIVE_RATIO = 2 / 3   # 预喜 2 / 去重后总数 3
+EXPECTED_MEDIAN_CHANGE = 30.0     # 去重后 [65, 30, -50] 的中位数（min/max/中值口径一致）
+
+
+def _fake_forecast(**kwargs):
+    """模拟 pro.forecast：兼容按 ann_date 单日 / start-end 区间 / ts_code 过滤。
+
+    生产实现按周采样 ann_date（120 天回溯，每 7 天一次），单日查询可能落在
+    两条公告之间——因此 ann_date 单日查询按「该日起往前 6 天」的周窗口匹配，
+    避免测试与具体采样偏移耦合。生产端按 ann_date 去重留最新，不受影响。
+    """
+    df = pd.DataFrame(FORECAST_ROWS, columns=FORECAST_COLUMNS)
+    ann_date = kwargs.get("ann_date")
+    if ann_date:
+        target = datetime.strptime(str(ann_date), "%Y%m%d")
+
+        def _in_week_window(a) -> bool:
+            try:
+                delta = target - datetime.strptime(str(a), "%Y%m%d")
+            except ValueError:
+                return False
+            return timedelta(0) <= delta <= timedelta(days=6)
+
+        df = df[df["ann_date"].map(_in_week_window)]
+    start_date = kwargs.get("start_date")
+    if start_date:
+        df = df[df["ann_date"] >= str(start_date)]
+    end_date = kwargs.get("end_date")
+    if end_date:
+        df = df[df["ann_date"] <= str(end_date)]
+    period = kwargs.get("period")
+    if period:
+        df = df[df["end_date"] == str(period)]
+    ts_code = kwargs.get("ts_code")
+    if ts_code:
+        codes = set(str(ts_code).split(","))
+        df = df[df["ts_code"].isin(codes)]
+    return df.reset_index(drop=True)
+
+
+def _fake_express(**kwargs):
+    """模拟 pro.express：返回 A、B 两只成分股的快报，可按 ts_code 过滤。"""
+    df = pd.DataFrame(EXPRESS_ROWS)
+    ts_code = kwargs.get("ts_code")
+    if ts_code:
+        codes = set(str(ts_code).split(","))
+        df = df[df["ts_code"].isin(codes)]
+    return df.reset_index(drop=True)
+
+
+def _empty_forecast_df():
+    return pd.DataFrame(columns=FORECAST_COLUMNS)
+
+
+class TestFetchSectorEarnings:
+    """业绩预告聚合：去重、预喜/预忧统计、中位数、改善/恶化榜。"""
+
+    def _run(self, pro=None):
+        if pro is None:
+            pro = MagicMock(name="tushare_pro")
+            pro.forecast.side_effect = _fake_forecast
+            pro.express.side_effect = _fake_express
+        # _stock_name 置为恒等：榜单条目里的名称即 ts_code，与名称缓存状态无关；
+        # time.sleep 打桩：跳过生产端防限流等待，加速按周采样循环。
+        with patch.object(data_fetcher, "_get_pro", return_value=pro), \
+             patch.object(data_fetcher, "_get_sector_member_codes",
+                          return_value=list(MEMBERS)), \
+             patch.object(data_fetcher, "_stock_name",
+                          side_effect=lambda c: c), \
+             patch("time.sleep"):
+            return fetch_sector_earnings(SECTOR, TRADE_DATE)
+
+    def test_contract_keys(self):
+        result = self._run()
+        for key in EARNINGS_KEYS:
+            assert key in result, f"返回结构缺少契约字段 {key}: {result}"
+
+    def test_dedup_keeps_latest_announcement(self):
+        """同一股票两天公告只保留最新一条：total_forecast=3 而非 5。"""
+        result = self._run()
+        assert result["total_forecast"] == 3, (
+            f"5 条预告去重后应为 3（每只股票留最新一条），实际 {result['total_forecast']}"
+        )
+        # 若错误地保留了 A 的旧公告（预增10%），A 的中值会变 10，
+        # top_improvers 第一就不再是 A —— 由排序用例兜底验证。
+        assert result["positive_count"] == 2, (
+            f"预喜（预增+扭亏）应为 2，实际 {result['positive_count']}"
+        )
+        assert result["negative_count"] == 1, (
+            f"预忧（首亏）应为 1，实际 {result['negative_count']}"
+        )
+
+    def test_positive_ratio(self):
+        """预喜比例 = 2/3 ≈ 66.7%（兼容小数 0-1 或百分数 0-100 两种表示）。"""
+        result = self._run()
+        ratio = result["positive_ratio"]
+        ok = (ratio == pytest.approx(EXPECTED_POSITIVE_RATIO, abs=0.01)) or \
+             (ratio == pytest.approx(EXPECTED_POSITIVE_RATIO * 100, abs=1.0))
+        assert ok, (
+            f"预喜比例应为 2/3≈0.667（或 66.7%），实际 {ratio!r}"
+        )
+
+    def test_median_change(self):
+        """变动中位数 = 30（B 的扭亏预告，min/max/中值三种口径下都是 30）。"""
+        result = self._run()
+        assert result["median_change"] == pytest.approx(
+            EXPECTED_MEDIAN_CHANGE, abs=0.5), (
+            f"median_change 应为 {EXPECTED_MEDIAN_CHANGE}，实际 {result['median_change']}"
+        )
+
+    def test_top_improvers_decliners_ordering(self):
+        """改善榜第一 = A（预增中值65%），恶化榜第一 = C（首亏中值-50%）。"""
+        result = self._run()
+        improver_codes = _entry_codes(result["top_improvers"])
+        decliner_codes = _entry_codes(result["top_decliners"])
+
+        assert improver_codes, "top_improvers 不应为空"
+        assert decliner_codes, "top_decliners 不应为空"
+        assert improver_codes[0] == STOCK_A, (
+            f"改善榜第一应为 {STOCK_A}（最新预增50~80%），实际 {improver_codes}"
+        )
+        assert decliner_codes[0] == STOCK_C, (
+            f"恶化榜第一应为 {STOCK_C}（最新首亏-60~-40%），实际 {decliner_codes}"
+        )
+        # 首亏的 C 不应出现在改善榜；预增的 A 不应出现在恶化榜
+        assert STOCK_C not in improver_codes
+        assert STOCK_A not in decliner_codes
+
+    def test_express_count(self):
+        """业绩快报（A、B 两条）也应计入统计。"""
+        result = self._run()
+        assert result["express_count"] == 2, (
+            f"快报条数应为 2，实际 {result['express_count']}"
+        )
+
+    def test_disclosure_vacuum_no_exception(self):
+        """披露真空期：forecast/express 都为空 → total=0、note 非空、不抛异常。"""
+        pro = MagicMock(name="tushare_pro")
+        pro.forecast.return_value = _empty_forecast_df()
+        pro.express.return_value = pd.DataFrame(
+            columns=["ts_code", "ann_date", "end_date"])
+        result = self._run(pro)  # 不得抛异常
+        assert result["total_forecast"] == 0, (
+            f"真空期 total_forecast 应为 0，实际 {result['total_forecast']}"
+        )
+        assert isinstance(result["note"], str) and result["note"].strip(), (
+            f"真空期 note 必须非空说明原因，实际 {result.get('note')!r}"
+        )
+
+    def test_member_fetch_failure_safe_structure(self):
+        """成分股获取失败（index_member 抛异常）→ 返回安全结构，不向上抛。
+
+        与估值/资金的 TestFailurePaths 同一约定：_get_sector_member_codes
+        内部 catch 异常返回 None，生产函数据此返回 note 非空的安全结构。
+        """
+        pro = MagicMock(name="tushare_pro")
+        pro.index_member.side_effect = Exception("member api down")
+        pro.forecast.side_effect = _fake_forecast
+        pro.express.side_effect = _fake_express
+        with patch.object(data_fetcher, "_get_pro", return_value=pro), \
+             patch("time.sleep"):
+            result = fetch_sector_earnings(SECTOR, TRADE_DATE)  # 不得抛异常
+        assert isinstance(result, dict), f"应返回 dict，实际 {type(result)}"
+        for key in EARNINGS_KEYS:
+            assert key in result, f"安全结构缺少契约字段 {key}: {result}"
+        assert isinstance(result["note"], str) and result["note"].strip(), (
+            f"失败时 note 必须非空说明原因，实际 {result.get('note')!r}"
+        )
+
+
+# ── orchestrator 景气度 mock 返回值（接线测试用）──
+
+EARNINGS_MOCK_RET = {
+    "total_forecast": 3, "positive_count": 2, "negative_count": 1,
+    "positive_ratio": 0.667, "median_change": 30.0,
+    "top_improvers": [{"ts_code": STOCK_A, "change": 65.0}],
+    "top_decliners": [{"ts_code": STOCK_C, "change": -50.0}],
+    "express_count": 2, "period": FORECAST_PERIOD, "note": "",
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# 7. 板块深度分析 prompt：景气度一节的内容要求
+# ════════════════════════════════════════════════════════════════
+
+
+class TestSectorDeepDiveEarningsPrompt:
+    """SECTOR_DEEP_DIVE_PROMPT 的景气度一节：预喜比例解读指引 + 样本局限提示。"""
+
+    def _prompt(self) -> str:
+        return get_system_prompt("sector_deep_dive", SECTOR)
+
+    def test_positive_ratio_threshold_guidance(self):
+        """景气度一节必须给出预喜比例的高低阈值解读指引（>60% / <40% 或相近表述）。"""
+        prompt = self._prompt()
+        assert "预喜" in prompt, (
+            "prompt 景气度一节缺少「预喜」概念（预喜比例解读指引缺失）"
+        )
+        has_high = any(w in prompt for w in ("60%", "六成", "60 %"))
+        has_low = any(w in prompt for w in ("40%", "四成", "40 %"))
+        assert has_high and has_low, (
+            "prompt 景气度一节缺少预喜比例阈值指引（如 >60% 景气向好 / <40% 景气承压）"
+        )
+
+    def test_sample_limitation_hint(self):
+        """景气度一节必须提示样本局限（披露不全/样本有限/不代表全板块等）。"""
+        prompt = self._prompt()
+        assert any(w in prompt for w in
+                   ("样本", "披露率", "代表性", "不代表", "局限")), (
+            "prompt 景气度一节缺少样本局限提示（如预告披露不全、样本不代表全板块）"
         )

@@ -399,6 +399,67 @@ def _format_sector_moneyflow_block(moneyflow: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_earnings_items(items) -> str:
+    """改善/恶化居前个股列表，宽容处理 dict/str 两种条目形态。"""
+    out = []
+    for it in items[:5]:
+        if isinstance(it, dict):
+            name = it.get("name") or it.get("ts_code") or "?"
+            change = it.get("p_change")
+            if change is None:
+                change = it.get("change")
+            if isinstance(change, (int, float)):
+                out.append(f"{name} {change:+.1f}%")
+            else:
+                out.append(str(name))
+        else:
+            out.append(str(it))
+    return "、".join(out)
+
+
+def _format_sector_earnings_block(earnings: Optional[dict]) -> str:
+    """板块景气度（业绩预告/快报）数据块。字段为 None 时跳过；整体缺失时标注数据未获取。"""
+    header = "【四、板块景气度（业绩预告）】（Tushare 业绩预告/快报，percent 为百分数数值）"
+    missing = "板块景气度数据未获取，分析时请标注『景气度数据暂缺』，禁止编造。"
+    if not isinstance(earnings, dict):
+        return f"{header}\n{missing}"
+    lines = [header]
+    period = earnings.get("period")
+    if period:
+        lines.append(f"披露期：{period}")
+    parts = []
+    total = earnings.get("total_forecast")
+    if isinstance(total, (int, float)):
+        parts.append(f"披露业绩预告 {int(total)} 家")
+    pos = earnings.get("positive_count")
+    if isinstance(pos, (int, float)):
+        parts.append(f"预喜 {int(pos)} 家")
+    neg = earnings.get("negative_count")
+    if isinstance(neg, (int, float)):
+        parts.append(f"预忧 {int(neg)} 家")
+    ratio = earnings.get("positive_ratio")
+    if isinstance(ratio, (int, float)):
+        parts.append(f"预喜比例 {ratio:.1f}%")
+    if parts:
+        lines.append("；".join(parts))
+    median = earnings.get("median_change")
+    if isinstance(median, (int, float)):
+        lines.append(f"净利润变动幅度中位数 {median:+.1f}%")
+    express = earnings.get("express_count")
+    if isinstance(express, (int, float)) and express:
+        lines.append(f"另有业绩快报 {int(express)} 家")
+    for key, label in (("top_improvers", "改善居前"), ("top_decliners", "恶化居前")):
+        items = earnings.get(key)
+        if items:
+            lines.append(f"{label}：{_format_earnings_items(items)}")
+    note = earnings.get("note")
+    if note:
+        lines.append(f"备注：{note}")
+    if len(lines) == 1:
+        lines.append(missing)
+    return "\n".join(lines)
+
+
 def _format_multi_day_news(snapshot, sector, date_str) -> str:
     """预格式化多日新闻，LLM无法跳过，直接注入prompt。"""
     from datetime import datetime, timedelta
@@ -512,9 +573,9 @@ class MarketReviewAgent:
 
     async def _fetch_sector_extras(
         self, sector: str, trade_date: str
-    ) -> tuple[Optional[dict], Optional[dict]]:
+    ) -> tuple[Optional[dict], Optional[dict], Optional[dict]]:
         """
-        并行采集板块估值与资金流向（Tushare）。
+        并行采集板块估值、资金流向与景气度（业绩预告/快报，Tushare）。
         单点失败（import 缺失 / 抛异常 / 返回非dict）降级为 None，绝不向上抛出。
         trade_date 格式 %Y%m%d。
         """
@@ -522,11 +583,20 @@ class MarketReviewAgent:
             from .data_fetcher import fetch_sector_valuation, fetch_sector_moneyflow
         except ImportError as e:
             logger.warning("板块深挖附加数据函数未就绪（data_fetcher 未提供）: %s", e)
-            return None, None
+            return None, None, None
+
+        # 景气度函数独立 import，缺失时仅景气度降级为 None，不影响估值/资金
+        try:
+            from .data_fetcher import fetch_sector_earnings
+        except ImportError as e:
+            logger.warning("板块景气度函数未就绪（data_fetcher 未提供）: %s", e)
+            fetch_sector_earnings = None
 
         loop = asyncio.get_running_loop()
 
         async def _safe(fn, label: str) -> Optional[dict]:
+            if fn is None:
+                return None
             try:
                 result = await loop.run_in_executor(None, fn, sector, trade_date)
                 if not isinstance(result, dict):
@@ -537,11 +607,12 @@ class MarketReviewAgent:
                 logger.warning("%s 获取失败（%s板块 %s）: %s", label, sector, trade_date, e, exc_info=True)
                 return None
 
-        valuation, moneyflow = await asyncio.gather(
+        valuation, moneyflow, earnings = await asyncio.gather(
             _safe(fetch_sector_valuation, "板块估值"),
             _safe(fetch_sector_moneyflow, "板块资金流向"),
+            _safe(fetch_sector_earnings, "板块景气度"),
         )
-        return valuation, moneyflow
+        return valuation, moneyflow, earnings
 
     async def _sector_deep_dive(self, sector: str, stream: bool):
         """单板块深度聚焦。"""
@@ -560,10 +631,11 @@ class MarketReviewAgent:
             self._cache[cache_key] = snapshot
         market_data = format_market_data_for_prompt(snapshot)
 
-        # 板块估值 + 资金流向（独立采集，单点失败降级为『数据未获取』，不影响主流程）
-        valuation, moneyflow = await self._fetch_sector_extras(sector, date_str)
+        # 板块估值 + 资金流向 + 景气度（独立采集，单点失败降级为『数据未获取』，不影响主流程）
+        valuation, moneyflow, earnings = await self._fetch_sector_extras(sector, date_str)
         valuation_block = _format_sector_valuation_block(valuation)
         moneyflow_block = _format_sector_moneyflow_block(moneyflow)
+        earnings_block = _format_sector_earnings_block(earnings)
 
         system = get_system_prompt("sector_deep_dive", sector)
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
@@ -577,8 +649,10 @@ class MarketReviewAgent:
 
 {moneyflow_block}
 
-【四、新闻与景气背景】
-上方"行情与趋势数据"中的东方财富实时快讯与新浪历史新闻已按{sector}行业过滤，请作为景气度与催化/风险判断的素材引用，不要原样罗列。
+{earnings_block}
+
+【五、新闻与景气背景】
+上方"行情与趋势数据"中的东方财富实时快讯与新浪历史新闻已按{sector}行业过滤，请作为催化/风险判断的素材引用，不要原样罗列。
 
 深度分析{sector}板块。输出标题需包含日期{date_display}。新闻条目仅作为第五维催化与风险的引用素材，不要单独罗列新闻清单。数据缺失处标注数据暂缺，禁止编造。"""
 

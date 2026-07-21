@@ -1530,6 +1530,172 @@ def fetch_sector_moneyflow(sector_name: str, trade_date: str) -> dict:
     return result
 
 
+# 业绩预告类型 → 预喜/预忧分类
+_FORECAST_POSITIVE_TYPES = {"预增", "略增", "扭亏", "减亏"}
+_FORECAST_NEGATIVE_TYPES = {"预减", "略减", "首亏", "续亏", "增亏"}
+
+# 报告期 MMDD → 中文名称
+_PERIOD_NAME_MAP = {"0331": "一季报", "0630": "中报", "0930": "三季报", "1231": "年报"}
+
+
+def _period_label(end_date: str) -> str:
+    """报告期 YYYYMMDD → 「2026中报」样式。"""
+    if not end_date or len(end_date) < 8:
+        return ""
+    return f"{end_date[:4]}{_PERIOD_NAME_MAP.get(end_date[4:8], end_date[4:8])}"
+
+
+def fetch_sector_earnings(sector_name: str, trade_date: str) -> dict:
+    """
+    板块景气度：成分股业绩预告聚合 + 业绩快报增强。
+    从 trade_date 往前回溯约 120 天、按周采样 ann_date 调 pro.forecast，
+    过滤成分股后每只股票只保留最新一条预告；
+    p_change_min/max 本身是百分数数值，取二者中值代表变动幅度。
+    trade_date 格式 YYYYMMDD；任何一步失败对应字段为安全默认值，note 说明原因。
+    """
+    result = {"total_forecast": 0, "positive_count": 0, "negative_count": 0,
+              "positive_ratio": 0.0, "median_change": None,
+              "top_improvers": [], "top_decliners": [],
+              "express_count": 0, "period": "", "note": ""}
+    notes = []
+
+    pro = _get_pro()
+    if not pro:
+        result["note"] = "Tushare 未配置或初始化失败"
+        return result
+
+    # 1. 成分股列表
+    stocks = _get_sector_member_codes(pro, sector_name)
+    if not stocks:
+        result["note"] = f"未找到板块「{sector_name}」或成分股为空"
+        return result
+    stock_set = set(stocks)
+
+    # 确保股票名称缓存已加载
+    _load_stock_names()
+
+    # 2. 业绩预告：往前 120 天按周采样 ann_date（约 17 次调用），
+    #    过滤成分股，每只股票只保留公告日期最新的一条
+    latest = {}  # ts_code -> (ann_date, 记录dict)
+    dt = datetime.strptime(trade_date, "%Y%m%d")
+    api_fail = 0
+    for offset in range(0, 119, 7):
+        d = (dt - timedelta(days=offset)).strftime("%Y%m%d")
+        try:
+            df = pro.forecast(ann_date=d)
+            if df is not None and not df.empty:
+                df = df[df["ts_code"].isin(stock_set)]
+                for _, r in df.iterrows():
+                    code = r["ts_code"]
+                    ann = str(r.get("ann_date", ""))
+                    if code not in latest or ann >= latest[code][0]:
+                        latest[code] = (ann, r.to_dict())
+        except Exception:
+            api_fail += 1
+            logger.warning("forecast 调用失败 ann_date=%s", d, exc_info=True)
+        time.sleep(0.3)  # 防限流
+
+    if api_fail:
+        notes.append(f"业绩预告采样有 {api_fail} 次调用失败")
+
+    # 3. 聚合统计
+    records = [rec for _, rec in latest.values()]
+    result["total_forecast"] = len(records)
+
+    if records:
+        import statistics
+        for rec in records:
+            ftype = str(rec.get("type", "")).strip()
+            if ftype in _FORECAST_POSITIVE_TYPES:
+                result["positive_count"] += 1
+            elif ftype in _FORECAST_NEGATIVE_TYPES:
+                result["negative_count"] += 1
+        classified = result["positive_count"] + result["negative_count"]
+        if classified:
+            result["positive_ratio"] = round(
+                result["positive_count"] / classified * 100, 1)
+
+        # 变动幅度：取 p_change_min/max 中值（百分数数值）
+        def _mid_change(rec):
+            try:
+                lo = float(rec.get("p_change_min"))
+                hi = float(rec.get("p_change_max"))
+                return (lo + hi) / 2
+            except (TypeError, ValueError):
+                return None
+
+        with_chg = [(rec, _mid_change(rec)) for rec in records]
+        with_chg = [(rec, c) for rec, c in with_chg if c is not None]
+        if with_chg:
+            result["median_change"] = round(
+                float(statistics.median(c for _, c in with_chg)), 1)
+            by_chg = sorted(with_chg, key=lambda x: x[1], reverse=True)
+            result["top_improvers"] = [
+                (_stock_name(r["ts_code"]), str(r.get("type", "")).strip(),
+                 round(c, 1))
+                for r, c in by_chg[:3] if c > 0
+            ]
+            result["top_decliners"] = [
+                (_stock_name(r["ts_code"]), str(r.get("type", "")).strip(),
+                 round(c, 1))
+                for r, c in by_chg[::-1][:3] if c < 0
+            ]
+        else:
+            notes.append("预告变动幅度字段缺失，无法统计中位数")
+
+        # 报告期：取最新预告中出现最多的 end_date
+        periods = [str(rec.get("end_date", "")) for rec in records
+                   if rec.get("end_date")]
+        if periods:
+            common = max(set(periods), key=periods.count)
+            result["period"] = _period_label(common)
+
+        if len(records) < 5:
+            notes.append("处于财报披露真空期，样本有限")
+    else:
+        notes.append("近120天内成分股无业绩预告，处于财报披露真空期，样本有限")
+
+    # 4. 业绩快报（可选增强）：拉最近一个报告期数据，失败就跳过
+    try:
+        if result["period"]:
+            # 由预告报告期反推 end_date；没有预告则按 trade_date 推最近季度末
+            year = result["period"][:4]
+            mmdd = next(k for k, v in _PERIOD_NAME_MAP.items()
+                        if v in result["period"])
+            express_period = f"{year}{mmdd}"
+        else:
+            q_ends = [(dt.year, md) for md in ("1231", "0930", "0630", "0331")]
+            q_ends += [(dt.year - 1, "1231")]
+            express_period = next(
+                f"{y}{md}" for y, md in q_ends
+                if datetime.strptime(f"{y}{md}", "%Y%m%d") < dt)
+        df_exp = pro.express(period=express_period)
+        if df_exp is not None and not df_exp.empty:
+            df_exp = df_exp[df_exp["ts_code"].isin(stock_set)]
+            result["express_count"] = len(df_exp)
+            if not df_exp.empty and "yoy_net_profit" in df_exp.columns:
+                import pandas as pd
+                import statistics
+                yoy = pd.to_numeric(df_exp["yoy_net_profit"],
+                                    errors="coerce").dropna()
+                # 剔除负基数导致的极端值（|同比|>1000% 无分析意义）
+                yoy = yoy[yoy.abs() <= 1000]
+                if len(yoy) >= 3:
+                    notes.append(
+                        f"快报样本 {result['express_count']} 家，"
+                        f"净利润同比增速中位数 {round(float(statistics.median(yoy)), 1)}%")
+                elif result["express_count"] > 0:
+                    notes.append(
+                        f"快报样本仅 {result['express_count']} 家，"
+                        "样本过少，同比增速中位数不具参考价值")
+    except Exception:
+        logger.warning("业绩快报获取失败 sector=%s", sector_name, exc_info=True)
+        notes.append("业绩快报获取失败，已跳过")
+
+    result["note"] = "；".join(notes)
+    return result
+
+
 # ═══════════════════════════════════════════
 # 中国宏观数据
 # ═══════════════════════════════════════════
