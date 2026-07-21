@@ -915,7 +915,15 @@ _GENERIC_MCP_SYSTEM_PROMPT = (
     "工具返回错误或空数据时，不要反复重试同一个工具；最多换参数重试一次，"
     "仍拿不到就基于已经拿到的数据回答，或如实说明该项数据暂缺。\n"
     "诚实约束：只有实际调用过且工具确实返回错误/占位数据的报告期，才可以说"
-    "该期数据暂缺；没有查询过的报告期，不得声称其无数据，直接不提即可。"
+    "该期数据暂缺；没有查询过的报告期，不得声称其无数据，直接不提即可。\n"
+    "查询港股财务指标推荐用 hk_finance_all（symbol 填港股代码如 06715，"
+    "frType 填 gjzb/lrb/fzb/llb/yh，currencyType 2=港币，yearNum 填年数）；"
+    "不要用 A 股专用工具（cnCompanyBasicInfo、cnFinanceReportsFull 等）查港股代码。"
+    "财报数据里 item_display、item_display_type 等是界面展示样式标记（如灰底），"
+    "不代表数据缺失；数值看 item_value，同比涨跌看 item_tongbi。\n"
+    "数字保真约束：回答里的每个数值必须逐项抄自工具返回的 item_value/"
+    "item_tongbi，禁止估算、约算或编造；工具结果里看不到的指标就不要写，"
+    "宁少勿假。"
 )
 
 def _generic_mcp_system_prompt() -> str:
@@ -928,6 +936,14 @@ def _generic_mcp_system_prompt() -> str:
         _GENERIC_MCP_SYSTEM_PROMPT
         + f"\n今天是{datetime.now().strftime('%Y年%m月%d日')}，以此判断哪些报告期已经发布、可以查询。"
     )
+
+
+# 单次 MCP 工具结果喂回模型的字符上限。财报类载荷（hk_finance_all 等）
+# 压缩后仍需约 10K 字符才能装下 3 年 × 57 项指标；3000 的历史取值曾把
+# 真实数值截掉，导致模型编造财务数字。12000 ≈ 6K tokens，5 轮循环内可控。
+_MCP_TOOL_FEED_MAX_CHARS = 12000
+# all_results 单次结果存档上限（供循环跑满后的最终综合调用使用）
+_MCP_SYNTH_RESULT_MAX_CHARS = 4000
 
 
 # 最终综合也失败时的优雅降级提示（任何情况下都不把原始 JSON 给用户）
@@ -1783,7 +1799,7 @@ class MarketReviewAgent:
                     data_str = self._mcp_result_for_prompt(fn.name, data)
                     if data_str is None:
                         return {"role": "assistant", "content": "抱歉，该数据暂不支持查询。新浪智研API返回为空，可能原因：非交易时段数据未更新、该接口暂不可用、或查询参数不支持。请尝试其他问题。"}
-                    all_results.append({"tool": fn.name, "result": data_str[:500]})
+                    all_results.append({"tool": fn.name, "result": data_str[:_MCP_SYNTH_RESULT_MAX_CHARS]})
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": data_str})
             else:
@@ -1824,7 +1840,7 @@ class MarketReviewAgent:
                     "compact_mcp_result 压缩异常（%s，退回原始数据）: %s",
                     tool_name, e, exc_info=True,
                 )
-        data_str = json.dumps(payload, ensure_ascii=False)[:3000]
+        data_str = json.dumps(payload, ensure_ascii=False)[:_MCP_TOOL_FEED_MAX_CHARS]
         if not data_str or data_str == "{}" or ('"data":[]' in data_str and '"s_list":[]' not in data_str):
             return None
         return data_str

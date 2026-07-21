@@ -769,6 +769,12 @@ _MCP_SUCCESS_CODES = frozenset({0, "0", 200, "200"})
 _MCP_META_KEYS = frozenset({"status", "error", "type"})
 # compact_mcp_result 单字符串长度上限（超限在标点边界截断）
 _MCP_MAX_STR_LEN = 300
+# 纯界面展示样式键（压缩时剔除）：智研财报数据里 item_display="灰底" 等
+# 取值是前端行样式标记，无数据含义，且会误导模型以为"数据缺失/占位"
+_MCP_DISPLAY_STYLE_KEYS = frozenset({"item_display", "item_display_type", "item_group_no"})
+# 指标条目保留键（财报 item_title+item_value 条目瘦身）：模型解读只需这四项，
+# item_field 保留供 hkFinanceReportsByIndex 等单指标深挖链路取字段代码
+_MCP_INDICATOR_KEEP_KEYS = frozenset({"item_title", "item_value", "item_tongbi", "item_field"})
 # 常见英文错误消息 → 中文（供 mcp_error_brief 输出人类可读摘要）
 _MCP_MSG_CN = {
     "input error": "参数错误",
@@ -797,8 +803,20 @@ def _is_mcp_placeholder(value) -> bool:
 def _compact_mcp_value(value):
     """递归压缩：剔除占位字段，超长字符串按句子边界截断。"""
     if isinstance(value, dict):
+        # 指标条目瘦身：同时含 item_title+item_value 的财报指标条目，
+        # 只保留模型解读所需的四个键，其余元数据（item_source/item_precision
+        # 等）全部剔除——财报类载荷体积可缩小约 70%，防止喂回模型时被
+        # 截断导致模型看不到真实数值而编造数字
+        if "item_title" in value and "item_value" in value:
+            return {k: _compact_mcp_value(v) for k, v in value.items()
+                    if k in _MCP_INDICATOR_KEEP_KEYS
+                    and not _is_mcp_placeholder(_compact_mcp_value(v))}
         out = {}
         for k, v in value.items():
+            # 剔除纯界面展示样式键：item_display 取值为"灰底"等前端样式标记，
+            # 不含数据含义，且曾被模型误读为"数据缺失/占位"而放弃解读
+            if k in _MCP_DISPLAY_STYLE_KEYS:
+                continue
             cv = _compact_mcp_value(v)
             if not _is_mcp_placeholder(cv):
                 out[k] = cv
