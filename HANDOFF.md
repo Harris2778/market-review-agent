@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波更新，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -51,12 +51,14 @@ agent/tools.py             21 个 OpenAI function calling 工具（完整 JSON S
 agent/data_fetcher.py      数据采集：30+ 函数（Tushare/新浪MCP/yfinance/FRED）
                            + 板块extras当日缓存（进程内dict+锁）+ 景气度报告期直查
                            + 新闻注入净化 _sanitize_news_text（所有新闻源+pool双保险）
+                           + 标题标点边界截断 _truncate_at_boundary + 源HTTP状态码日志
+                           + Tushare无权限进程级短路 + pool保留content/summary/brief
 agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/审查/新闻分析
                            + watchlist 自选股 + 知识库/以史为鉴指引 + 注入防护行
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     741 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     793 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -67,6 +69,7 @@ tests/                     741 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
 4. Agent 工具循环：复杂跨实体问题（"比较白酒和半导体"）模型自主调工具，≤8 轮，降级 _chat
 5. 多 pass 生成：草稿→CRITIQUE 审查（数字出处/禁用词/越界/AI腔，含确定性数字校验注入）→修正（≥500字启用）
 6. 新闻系统：五源聚合（去重后约 176 条/48h）+ 重要性评分截断 + 新闻分析模式（"分析新闻影响"）
+   + 板块查询默认在确定性清单后追加 LLM 解读 + 头部覆盖描述按实际数据生成
 7. 数字校验层：validators 确定性溯源（容差±0.05/相对0.5%，亿/万归一，日期/小整数豁免）
 8. eval 评估集：12 case 正反例，`/usr/local/bin/python3 eval/run_eval.py` 可独立运行
 9. 问责系统：三路径产出落 JSONL 存档 → CLI 按方向判断 vs 后市实际涨跌打 hit/miss/neutral
@@ -95,13 +98,44 @@ tests/                     741 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
 ✅ 第五波: 可视化 + 主动推送（定时复盘）
 ✅ 第六波: 工程化（新闻注入防护/配额/日志覆盖）
 ✅ 第七波: 个性化(自选股) + 行业知识库 + 以史为鉴
+🔧 新闻模式三问题修复（计划外插入，已完成）
 ```
 
 路线图七波全部完成。后续方向：研报库工作线（另线进行）/ 生产挂卷后问责数据积累 / LLM judge 实现。
 
+**新闻模式三问题修复（2026-07-22，后续记录）**
+
+- 现象：① 条目截断——新闻标题被拦腰切断，出现半句话；② 五源出货率低——
+  部分查询只有 1~2 个源出条目；③ 板块新闻查询只回确定性清单、无解读
+  （此前仅全市场查询含触发词时才走 LLM 分析）。
+- 根因（逐源实测结论）：
+  - 新浪财经：接口 date 参数已失效（传不同日期返回同一当前滚动列表）；且条目
+    time 此前直接用查询日期填充——当天新闻被错标到回溯的历史日期（时间错标）；
+  - 智研 MCP：大量条目只返回 content 不带 title，旧逻辑 content[:80] 硬切当标题；
+    且接口单页上限 20 条，旧代码未翻页；
+  - Tushare：token 无 news 接口权限（积分不足），新闻池逐日回溯每次白耗配额；
+  - 东方财富/财联社：本地正常、Railway 生产空返回，疑似海外 IP 受限（未坐实）；
+  - 修复已给各源加 HTTP 状态码 warning 日志，生产出货情况可在 Railway View logs 查证。
+- 修复方案要点：
+  - 抓取层（data_fetcher）：_truncate_at_boundary 标点边界截断替代硬切——东财/新浪/
+    智研/财联社标题完整保留，仅超长时在句末/分句标点处截断加『…』；新浪 time 一律
+    取真实 ctime（date_str 仅作兜底，接口恢复按日查询则回溯自动生效）；智研自动翻页
+    （页间限速）+ 跨页标题去重 + content 字段保留；Tushare 权限错误置进程级 denied
+    标记，后续调用（含逐日回溯）整体短路不再耗配额；东财/财联社 HTTP 非 200 记
+    warning 并安全降级；pool 统一条目保留 content/summary/brief 正文字段（供下游行业
+    关键词匹配）；板块查询加深抓取（东财加翻第 2 页、财联社拉满约 100 条、智研翻 3 页）。
+  - 编排层（orchestrator）：头部诚实化——覆盖描述按实际数据生成（当日/实际日期/
+    起止日期），不再硬写「48小时覆盖」，来源统计只列实际有贡献的源；板块查询默认在
+    确定性清单后追加 LLM 解读段（清单本体绝不经 LLM 改写，解读失败降级只返清单）；
+    防御性展示修复——title 是 content/summary/brief 裸前缀时，改用摘要按句子边界
+    截断（≤200 字）展示完整句。
+- 测试：793 passed 全绿（tests/test_news.py +18 用例；新增 tests/test_news_fetch_layer.py
+  34 用例；全部 mock 零网络）。
+
 ## 已知问题
 
 - Tushare news 接口无权限（积分不足），新闻池 tushare 源恒为空，已安全降级
+  （进程级 denied 标记短路：首次命中权限错误后本进程不再调用，不白耗配额）
 - 新浪智研 3 个接口权限不足 + swSymbolList 服务端 bug（新浪侧，不可修）
 - 板块 extras 已当日缓存（进程内）；重启进程后同板块首问仍需 1 轮采集（已大幅降耗）
 - 流式路径跳过多 pass 审查（保延迟），非流式才有；流式数字校验为 log-only

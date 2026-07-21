@@ -10,6 +10,12 @@
    即使它们在新闻池列表的末尾。
 6. 分析模式：消息含『解读/分析/影响』时走 LLM 分析（NEWS_ANALYSIS_PROMPT），而非透传。
 7. NEWS_ANALYSIS_PROMPT 本身：主题归纳/方向判断结构、数据红线表述、至少 3 个禁用词。
+10. 头部诚实化：覆盖描述按实际数据生成（当日/实际日期/起止日期），不照抄
+    「48小时」模板；来源统计只列实际有贡献的源。
+11. 板块新闻默认附带解读：sector 查询即使无触发词，也在确定性清单后追加
+    LLM 解读段（清单本体不经 LLM 改写）；全市场查询保持触发词逻辑。
+12. 防御性句子边界截断：_truncate_at_sentence 单元行为 + 抓取层拦腰标题
+    （title 为 content/brief 裸前缀）在展示层被摘要修复为完整句子。
 
 规则（与 tests/test_orchestrator.py 一致）：
 - 所有外部依赖全部 mock（fetch_*_news / fetch_news_pool / _mcp_call / DeepSeek 客户端），
@@ -604,3 +610,292 @@ class TestNewsPoolInjectionDoublePass:
         assert "〔已过滤〕" in title, f"pool 出口未净化注入标题: {title!r}"
         assert "忽略" not in title
         assert pool["eastmoney"][0]["title"] == "央行开展5000亿元MLF操作"
+
+
+# ════════════════════════════════════════════════════════════════
+# 10. 头部诚实化：覆盖描述按实际数据生成，不照抄「48小时」模板
+# ════════════════════════════════════════════════════════════════
+
+
+class TestNewsHeaderHonesty:
+    """头部覆盖描述与实际数据一致：单日写「当日」/实际日期，多日写起止日期。"""
+
+    def _run(self, pool, message="今天有什么新闻") -> str:
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(pool):
+            return _run_message(agent, message)["content"]
+
+    def test_single_trade_day_shows_dangri_not_48h(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item("沪深两市成交额突破一万五千亿元", f"{DAY0} 09:30:00", "新浪财经"),
+            _item("央行开展5000亿元MLF操作", f"{DAY0} 10:00:00", "新浪财经"),
+        ]
+        header = self._run(pool).splitlines()[0]
+        assert "48小时" not in header, f"单日覆盖不应照抄48小时模板: {header}"
+        assert "当日" in header, f"单日（交易日）覆盖应写「当日」: {header}"
+        assert "共2条" in header
+
+    def test_single_non_trade_day_shows_actual_date(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item("前一日的旧新闻条目内容", f"{DAY1} 09:30:00", "新浪财经"),
+        ]
+        header = self._run(pool).splitlines()[0]
+        assert "48小时" not in header
+        assert DAY1 in header, f"单日非交易日应显示实际日期 {DAY1}: {header}"
+
+    def test_multi_day_shows_actual_span(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item("当天的新闻条目标题内容", f"{DAY0} 09:30:00", "新浪财经"),
+            _item("前一天的新闻条目标题内容", f"{DAY1} 10:00:00", "新浪财经"),
+        ]
+        header = self._run(pool).splitlines()[0]
+        assert "48小时" not in header
+        assert f"{DAY1}至{DAY0}" in header, (
+            f"多日覆盖应显示实际起止日期 {DAY1}至{DAY0}: {header}"
+        )
+
+    def test_source_stats_match_actual_contributions(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item("新闻条目标题甲内容", f"{DAY0} 09:30:00", "新浪财经"),
+            _item("新闻条目标题乙内容", f"{DAY0} 10:00:00", "新浪财经"),
+        ]
+        pool["eastmoney"] = [
+            _item("北向资金单日净流入超百亿元", f"{DAY0} 11:00:00", "东方财富"),
+        ]
+        content = self._run(pool)
+        assert "新浪2条" in content, f"来源统计应与实际一致:\n{content[:300]}"
+        assert "东方财富1条" in content
+        # 零贡献源不出现在来源统计中
+        assert "财联社0条" not in content
+        assert "Tushare0条" not in content
+
+
+# ════════════════════════════════════════════════════════════════
+# 11. 板块新闻默认附带解读：确定性清单 + LLM 解读段
+# ════════════════════════════════════════════════════════════════
+
+
+class TestSectorNewsDefaultAnalysis:
+    """sector 查询即使无解读触发词，也在确定性清单后追加 LLM 解读段；
+    清单本体绝不经过 LLM 改写。全市场（sector=None）保持触发词逻辑。"""
+
+    BANK_TITLE = "央行宣布降准释放长期流动性支持银行体系"
+    BANK_TITLE2 = "工商银行发布年度业绩报告净利增长"
+
+    def _pool(self):
+        pool = _empty_pool()
+        pool["sina"] = [
+            _item(self.BANK_TITLE, f"{DAY0} 09:30:00", "新浪财经"),
+            _item(self.BANK_TITLE2, f"{DAY0} 10:00:00", "新浪财经"),
+        ]
+        return pool
+
+    def test_sector_query_appends_analysis_after_list(self):
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "板块解读文本"}
+        )
+        with _mock_news_pool(self._pool()):
+            result = _run_message(agent, "银行板块的新闻")
+
+        content = result["content"]
+        # 确定性清单与 LLM 解读都在最终 content 中
+        assert self.BANK_TITLE in content, f"清单标题缺失:\n{content}"
+        assert "板块解读文本" in content, f"解读段缺失:\n{content}"
+        # 清单在前、解读在后
+        assert content.index(self.BANK_TITLE) < content.index("板块解读文本")
+        # 清单本体未经 LLM 改写：content 以确定性清单开头
+        assert content.startswith("银行板块新闻汇总"), (
+            f"清单应原样置顶而非经 LLM 改写:\n{content[:200]}"
+        )
+        # 解读走 news_analysis 系统提示词，user prompt 带新闻清单
+        assert agent._call_llm.await_count == 1
+        args, _ = agent._call_llm.await_args
+        assert "主题" in args[0] or "主线" in args[0], (
+            f"板块解读应使用 news_analysis 系统提示词:\n{args[0][:300]}"
+        )
+        assert self.BANK_TITLE in args[1], (
+            f"解读 user prompt 应包含确定性清单:\n{args[1][:300]}"
+        )
+
+    def test_sector_stream_yields_list_then_analysis(self):
+        """流式路径：先输出确定性清单（整块），再流式输出解读 chunk。"""
+
+        async def _fake_analysis():
+            yield "解读chunk1"
+            yield "解读chunk2"
+
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(return_value=_fake_analysis())
+
+        async def _drive():
+            gen = await agent.process_message("银行板块的新闻", stream=True)
+            chunks = []
+            async for c in gen:
+                chunks.append(c)
+            return chunks
+
+        with _mock_news_pool(self._pool()):
+            with patch(
+                "agent.orchestrator._get_latest_trade_date",
+                return_value=FIXED_TRADE_DATE,
+            ):
+                chunks = asyncio.run(_drive())
+
+        assert chunks, "流式板块新闻应产出 chunk"
+        # 第一块是完整确定性清单（不经过 LLM）
+        assert chunks[0].startswith("银行板块新闻汇总")
+        assert self.BANK_TITLE in chunks[0]
+        assert self.BANK_TITLE2 in chunks[0]
+        # 解读 chunk 在清单之后流出
+        full = "".join(chunks)
+        assert "解读chunk1解读chunk2" in full
+        assert full.index(self.BANK_TITLE) < full.index("解读chunk1")
+
+    def test_full_market_without_trigger_stays_passthrough(self):
+        """全市场（sector=None）无触发词：保持透传，不追加解读段。"""
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(self._pool()):
+            result = _run_message(agent, "今天有什么新闻")
+
+        content = result["content"]
+        assert self.BANK_TITLE in content
+        # 非流式透传直接覆盖为原文，LLM 的占位文本不应出现
+        assert "占位" not in content
+        assert "新闻解读" not in content, f"全市场无触发词不应附带解读段:\n{content}"
+
+    def test_sector_no_news_no_analysis(self):
+        """板块查询无新闻时不走解读，直接返回「未找到」提示。"""
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(_empty_pool()):
+            result = _run_message(agent, "银行板块的新闻")
+
+        assert "未找到" in result["content"]
+        assert "新闻解读" not in result["content"]
+
+    def test_sector_analysis_llm_failure_degrades_to_list_only(self):
+        """板块解读的 LLM 调用失败：降级为只返回确定性清单，不抛异常。"""
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(side_effect=RuntimeError("DeepSeek 超时"))
+
+        with _mock_news_pool(self._pool()):
+            result = _run_message(agent, "银行板块的新闻")
+
+        content = result["content"]
+        assert content.startswith("银行板块新闻汇总")
+        assert self.BANK_TITLE in content
+        assert self.BANK_TITLE2 in content
+        # 失败降级：不附带空的解读段
+        assert "新闻解读" not in content
+
+
+# ════════════════════════════════════════════════════════════════
+# 12. 防御性句子边界截断：展示层绝不拦腰截断句子
+# ════════════════════════════════════════════════════════════════
+
+
+class TestTruncateAtSentence:
+    """_truncate_at_sentence：句子边界截断 + 省略号 + 上限。"""
+
+    def test_short_text_returned_as_is(self):
+        assert orch_mod._truncate_at_sentence("短文本") == "短文本"
+        assert orch_mod._truncate_at_sentence("") == ""
+        assert orch_mod._truncate_at_sentence(None) == ""
+
+    def test_truncates_at_sentence_boundary_with_ellipsis(self):
+        text = "第一句完整的话。第二句也很完整。第三句" + "长" * 300
+        out = orch_mod._truncate_at_sentence(text, limit=50)
+        assert out.endswith("……"), f"截断后应带省略号: {out!r}"
+        assert "第一句完整的话。第二句也很完整。" in out
+        assert "第三句" not in out, f"未完整的句子不应被拦腰带出: {out!r}"
+
+    def test_no_boundary_hard_cut_still_has_ellipsis(self):
+        text = "没" * 300  # 无任何句末标点
+        out = orch_mod._truncate_at_sentence(text, limit=200)
+        assert out.endswith("……")
+        assert len(out) == 200 + len("……")
+
+    def test_custom_limit_respected(self):
+        text = "甲。乙。丙。丁。戊。己。庚。辛。壬。癸。" + "子" * 100
+        out = orch_mod._truncate_at_sentence(text, limit=10)
+        assert out == "甲。乙。丙。丁。戊。……"
+
+
+class TestNewsOnlyDefensiveDisplay:
+    """抓取层把正文拦腰截断当标题时（title 为摘要裸前缀），编排层用
+    content/summary/brief 字段按句子边界修复展示；否则标题完整输出。"""
+
+    FRAG = "上海地区生产总值（GDP）达2788"  # 抓取层 content[:80] 式拦腰片段
+    FULL = ("上海地区生产总值（GDP）达2788.5亿元，同比增长5.2%。"
+            "分产业看，第二产业增加值增长6.1%，第三产业增加值增长4.8%。"
+            "专家预计下半年增速将保持稳定。")
+
+    def _run(self, item) -> str:
+        pool = _empty_pool()
+        pool["mcp"] = [item]
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(pool):
+            return _run_message(agent, "今天有什么新闻")["content"]
+
+    def test_fragment_title_healed_by_content_field(self):
+        item = {"title": self.FRAG, "time": f"{DAY0} 09:30:00",
+                "source": "智研", "content": self.FULL}
+        content = self._run(item)
+        # 展示为完整第一句（句子边界），而非裸露的拦腰片段
+        assert "上海地区生产总值（GDP）达2788.5亿元，同比增长5.2%。" in content, (
+            f"拦腰标题未被摘要修复:\n{content}"
+        )
+        frag_line = next(l for l in content.splitlines() if self.FRAG in l)
+        assert not frag_line.endswith(self.FRAG), (
+            f"展示行不应以拦腰片段结尾: {frag_line}"
+        )
+
+    def test_fragment_title_healed_by_brief_field(self):
+        item = {"title": self.FRAG, "time": f"{DAY0} 09:30:00",
+                "source": "财联社电报", "brief": self.FULL}
+        content = self._run(item)
+        assert "上海地区生产总值（GDP）达2788.5亿元，同比增长5.2%。" in content
+
+    def test_full_title_without_summary_untouched(self):
+        title = "这是一条完整的新闻标题不应当被编排层改动"
+        content = self._run(_item(title, f"{DAY0} 09:30:00", "新浪财经"))
+        line = next(l for l in content.splitlines() if title in l)
+        assert line.endswith(title), f"完整标题应原样输出: {line}"
+        assert "……" not in line, f"完整标题不应被截断加省略号: {line}"
+
+    def test_unrelated_summary_does_not_replace_title(self):
+        title = "央行开展5000亿元MLF操作"
+        item = {"title": title, "time": f"{DAY0} 09:30:00",
+                "source": "智研", "content": "完全不同的正文内容，不是标题的前缀。"}
+        content = self._run(item)
+        line = next(l for l in content.splitlines() if title in l)
+        assert line.endswith(title), (
+            f"摘要并非标题前缀时不应替换标题: {line}"
+        )
+
+    def test_summary_display_cap_respected(self):
+        item = {"title": self.FRAG, "time": f"{DAY0} 09:30:00",
+                "source": "智研", "content": self.FULL * 20}
+        content = self._run(item)
+        line = next(l for l in content.splitlines() if self.FRAG in l)
+        text_part = line.split("】", 1)[1]
+        assert len(text_part) <= 200 + len("……"), (
+            f"摘要展示不应超过 200 字上限（含省略号）: {len(text_part)} 字"
+        )
+        assert text_part.endswith("……")

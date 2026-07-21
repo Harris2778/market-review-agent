@@ -830,6 +830,33 @@ def _fmt_news_time(t: str, fallback: str = "") -> str:
     return t[:16]
 
 
+# 摘要展示上限（字）：展示抓取层传入的 content/summary/brief 时使用
+_NEWS_SUMMARY_CAP = 200
+
+# 句末标点：句子边界截断的候选边界（换行在快讯正文中也是天然分句）
+_SENTENCE_ENDINGS = "。！？!?；;\n"
+
+
+def _truncate_at_sentence(text: str, limit: int = _NEWS_SUMMARY_CAP) -> str:
+    """长文本防御性截断：展示层绝不拦腰截断句子。
+
+    优先在 limit 内最后一个句末标点处截断并加省略号；实在找不到句末
+    标点时按 limit 硬截，同样补省略号，明确告知用户「后面还有内容」。
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    boundary = -1
+    for i, ch in enumerate(text):
+        if i >= limit:
+            break
+        if ch in _SENTENCE_ENDINGS:
+            boundary = i + 1
+    if boundary > 0:
+        return text[:boundary].rstrip() + "……"
+    return text[:limit].rstrip() + "……"
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -1272,16 +1299,22 @@ class MarketReviewAgent:
         return result
 
     async def _news_only(self, sector: str, stream: bool, message: str = ""):
-        """新闻专属模式：五源新闻池 + 行业关键词过滤，48小时尽量多展示。
+        """新闻专属模式：五源新闻池 + 行业关键词过滤，按实际覆盖尽量多展示。
 
         - 数据层优先用 fetch_news_pool（五源聚合、跨源去重、时间已修复），
           未就绪或调用失败时降级到旧三源直采逻辑。
         - 行业过滤除标题外，同时匹配 time/content/summary 字段（有的话）。
         - 展示策略：按天分组、按时间倒序；全市场查询每天上限30条（超限按重要性
-          评分截断），行业查询每天全量展示。
-        - message 含解读类触发词（解读/分析/影响/怎么看/意味着什么/说明什么）时
-          走 LLM 分析模式（NEWS_ANALYSIS_PROMPT）；否则非流式直接透传原文，
-          不经过 LLM 改写。
+          评分截断），行业查询每天全量展示。标题一律完整输出，绝不拦腰截断；
+          抓取层把正文拦腰截断当标题时（title 是 content/summary/brief 的裸
+          前缀），用摘要字段按句子边界截断（上限 _NEWS_SUMMARY_CAP 字）修复展示。
+        - 头部覆盖描述按实际数据生成：单日写「当日」/实际日期，多日写起止日期，
+          不照抄「48小时」模板；来源统计只列实际有贡献的源。
+        - 解读段：板块查询（sector 非 None）默认在确定性清单后追加 LLM 解读
+          （news_analysis 系统提示词），清单本体绝不经过 LLM 改写；全市场查询
+          （sector 为 None）保持触发词逻辑——message 含解读类触发词
+          （解读/分析/影响/怎么看/意味着什么/说明什么）时走纯 LLM 分析，
+          否则非流式直接透传原文，不经过 LLM 改写。
         """
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
@@ -1355,10 +1388,25 @@ class MarketReviewAgent:
                     "title": title,
                     "time": (item.get("time", "") or ""),
                     "source": src,
+                    # 抓取层可能带摘要字段（cls 的 brief、部分源的 content/summary），
+                    # 展示循环用它防御性修复「被拦腰截断的标题」
+                    "summary": (item.get("summary", "") or item.get("content", "")
+                                or item.get("brief", "") or ""),
                 })
                 source_counts[src] = source_counts.get(src, 0) + 1
 
         total_raw = sum(len(v) for v in by_date.values())
+
+        # 头部覆盖描述按实际数据生成，不照抄「48小时」模板：
+        # 单日且就是交易日写「当日」，单日非交易日给出实际日期，多日给出起止日期
+        days_sorted = sorted(by_date.keys())
+        trade_day = trade_date.strftime("%Y-%m-%d")
+        if not days_sorted:
+            coverage_desc = "当日"
+        elif len(days_sorted) == 1:
+            coverage_desc = "当日" if days_sorted[0] == trade_day else f"{days_sorted[0]}单日"
+        else:
+            coverage_desc = f"{days_sorted[0]}至{days_sorted[-1]}"
 
         # ── 3. 组装展示文本：按天分组、时间倒序、全市场每天上限30条 ──
         if total_raw == 0:
@@ -1391,7 +1439,15 @@ class MarketReviewAgent:
                 block += "）---\n"
                 for it in items:
                     src_name = _NEWS_SOURCE_NAMES.get(it["source"], it["source"])
-                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] 【{src_name}】{it['title']}\n"
+                    text = it["title"]
+                    summary = (it.get("summary") or "").strip()
+                    # 防御：抓取层把正文拦腰截断当标题（如 cls brief[:80]、智研
+                    # content[:80]）时，title 是摘要的裸前缀。改用摘要字段按句子
+                    # 边界截断（上限 _NEWS_SUMMARY_CAP 字），展示完整句子而非片段。
+                    # 摘要缺失或并非标题前缀时，标题原样完整输出，绝不拦腰截断。
+                    if summary and len(summary) > len(text) and summary.startswith(text):
+                        text = _truncate_at_sentence(summary)
+                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] 【{src_name}】{text}\n"
                 blocks.append(block)
 
             # 头部：总条数、覆盖时间段、各源条数
@@ -1404,7 +1460,7 @@ class MarketReviewAgent:
                 for s in ("sina", "eastmoney", "mcp", "cls", "tushare")
                 if source_counts.get(s)
             )
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{display_total}条）\n"
+            news_text = f"{label}新闻汇总 — {date_display} {weekday}（{coverage_desc}，共{display_total}条）\n"
             meta_parts = [p for p in (span, f"来源：{src_stat}" if src_stat else "") if p]
             if truncated:
                 meta_parts.append("单日超30条已按重要性截断")
@@ -1412,22 +1468,55 @@ class MarketReviewAgent:
                 news_text += " | ".join(meta_parts) + "\n"
             news_text += "".join(blocks)
 
-        # ── 4. 分析模式：消息含解读类触发词且有新闻时，走 LLM 解读而非透传 ──
-        analysis_mode = (
-            bool(message) and total_raw > 0
-            and any(w in message for w in _NEWS_ANALYSIS_TRIGGERS)
-        )
-        if analysis_mode:
+        # ── 4. 解读段：板块查询默认附带 LLM 解读；全市场保持触发词逻辑 ──
+        triggered = bool(message) and any(w in message for w in _NEWS_ANALYSIS_TRIGGERS)
+        if total_raw > 0 and (sector or triggered):
             system = get_system_prompt("news_analysis")
             user_prompt = (
-                f"{news_text}\n\n以上是{label}近48小时新闻清单。请按系统提示的框架输出解读，"
+                f"{news_text}\n\n以上是{label}{coverage_desc}新闻清单。请按系统提示的框架输出解读，"
                 "只分析清单内的新闻条目，清单未覆盖的写「本期新闻未覆盖」。"
             )
+            if sector:
+                # 板块：确定性清单原样保留（绝不经过 LLM 改写），LLM 解读段追加在后。
+                # 非流式 content = 清单 + 解读；流式先输出清单，再流式输出解读。
+                # 此前板块查询无触发词时不依赖 LLM，解读调用失败必须降级为只返回
+                # 清单，不能让 LLM 故障拖垮整个板块新闻查询。
+                analysis_header = f"\n\n—— {label}新闻解读 ——\n\n"
+                if stream:
+                    try:
+                        analysis_stream = await self._call_llm(system, user_prompt, True)
+                    except Exception as e:
+                        logger.warning("板块新闻解读 LLM 调用失败，降级为只输出清单: %s", e, exc_info=True)
+                        analysis_stream = None
+
+                    async def _list_then_analysis():
+                        yield news_text + analysis_header
+                        if analysis_stream is None:
+                            yield "（解读暂时不可用，以上为确定性新闻清单。）"
+                            return
+                        try:
+                            async for chunk in analysis_stream:
+                                yield chunk
+                        except Exception as e:
+                            logger.warning("板块新闻解读流中断，保留已输出清单: %s", e, exc_info=True)
+                            yield "\n（解读中断，以上为确定性新闻清单。）"
+
+                    return _list_then_analysis()
+                try:
+                    result = await self._call_llm(system, user_prompt, False)
+                    analysis = result.get("content", "") if isinstance(result, dict) else ""
+                except Exception as e:
+                    logger.warning("板块新闻解读 LLM 调用失败，降级为只输出清单: %s", e, exc_info=True)
+                    analysis = ""
+                if not analysis:
+                    return {"role": "assistant", "content": news_text}
+                return {"role": "assistant", "content": news_text + analysis_header + analysis}
+            # 全市场 + 触发词：维持原有纯 LLM 分析行为
             return await self._call_llm(system, user_prompt, stream)
 
         # 透传模式：非流式直接返回原文，不经过 LLM 改写
         system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。"
-        user_prompt = f"{news_text}\n\n以上{label}48小时新闻汇总。原样输出。"
+        user_prompt = f"{news_text}\n\n以上{label}{coverage_desc}新闻汇总。原样输出。"
 
         result = await self._call_llm(system, user_prompt, stream)
         if not stream and isinstance(result, dict):
