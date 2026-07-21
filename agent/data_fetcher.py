@@ -648,8 +648,8 @@ def fetch_stock_quote(market: str, symbol: str) -> dict:
 
 def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
     """股票日K线。market: cn/hk/us"""
-    d = _mcp_call("globalStockKlineDaily", {"market": market, "symbol": symbol, "num": days})
-    data = d.get("result",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    d = _mcp_call("globalStockKlineDaily", {"market": market, "symbol": symbol, "num": str(days)})
+    data = d.get("data",[]) or []
     items = []
     for it in (data or [])[-days:]:
         items.append({"date": it.get("date",""), "close": it.get("close",""), "pct": it.get("change_pct","")})
