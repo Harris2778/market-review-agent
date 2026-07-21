@@ -325,9 +325,13 @@ async def debug_macro():
 @app.get("/debug/mcp-news")
 async def debug_mcp_news():
     """测试MCP新闻搜索。"""
-    from agent.data_fetcher import fetch_mcp_news
-    items = fetch_mcp_news("银行", 10)
-    return {"count": len(items), "sample": [i["title"][:60] for i in items[:3]]}
+    import traceback
+    try:
+        from agent.data_fetcher import fetch_mcp_news
+        items = fetch_mcp_news("银行", 10)
+        return {"count": len(items), "sample": [i["title"][:60] for i in items[:3]]}
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()[-500:]}
 
 
 @app.get("/debug/news-count")
