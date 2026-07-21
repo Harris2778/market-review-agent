@@ -2,13 +2,13 @@
 数据采集层单位换算回归测试（tests/test_units.py）。
 
 历史背景：本项目曾出现 10 倍量级的单位偏差 bug（如申万行业成交额
-误用 /1e8 而非 /1e7、把成交量标成成交额）。本文件通过 mock 全部外部
+误用 /1e8 而非 /1e5、把成交量标成成交额）。本文件通过 mock 全部外部
 数据源（tushare pro、requests/新浪 MCP），对 agent/data_fetcher.py 的
 单位换算逻辑做精确断言，防止回归。
 
 统一换算口径（以生产代码注释为准）：
 - index_daily.vol    : 手   → 万手  (/10000)
-- index_daily.amount : 千元 → 亿元  (/1e7)
+- index_daily.amount : 千元 → 亿元  (/1e5)
 - moneyflow *_amount : 万元 → 亿元  (/10000)
 - moneyflow_hsgt     : 万元 → 亿元  (/10000)
 - margin.rzye        : 元   → 亿元  (/1e8)
@@ -64,7 +64,7 @@ def _mock_pro(**overrides):
 
 
 # ─────────────────────────────────────────────
-# 1) fetch_a_share_indices：vol /10000（万手）、amount /1e7（千元→亿）
+# 1) fetch_a_share_indices：vol /10000（万手）、amount /1e5（千元→亿）
 # ─────────────────────────────────────────────
 
 class TestFetchAShareIndices:
@@ -85,11 +85,11 @@ class TestFetchAShareIndices:
         assert result["上证综指"]["vol"] == pytest.approx(
             round(self.RAW_VOL / 10000, 2))
 
-    def test_amount_divided_by_1e7(self):
-        """amount（千元）必须换算为亿元：原始值 / 1e7，而不是 /1e8 或原样。"""
+    def test_amount_divided_by_1e5(self):
+        """amount（千元）必须换算为亿元：原始值 / 1e5，而不是 /1e8 或原样。"""
         result = self._run()
         amt = result["上证综指"]["amount"]
-        assert amt == pytest.approx(round(self.RAW_AMOUNT / 1e7, 2))
+        assert amt == pytest.approx(round(self.RAW_AMOUNT / 1e5, 2))
         # 防回归：绝不能是 /1e8（10 倍偏差）或原始值
         assert amt != pytest.approx(round(self.RAW_AMOUNT / 1e8, 2))
         assert amt != pytest.approx(self.RAW_AMOUNT)
@@ -100,11 +100,11 @@ class TestFetchAShareIndices:
         assert len(result) == len(data_fetcher.A_INDEX_CODES)
         for name, d in result.items():
             assert d["vol"] == pytest.approx(round(self.RAW_VOL / 10000, 2)), name
-            assert d["amount"] == pytest.approx(round(self.RAW_AMOUNT / 1e7, 2)), name
+            assert d["amount"] == pytest.approx(round(self.RAW_AMOUNT / 1e5, 2)), name
 
 
 # ─────────────────────────────────────────────
-# 2) fetch_shenwan_sectors：amount 必须 /1e7（历史 bug：曾误用 /1e8）
+# 2) fetch_shenwan_sectors：amount 必须 /1e5（历史 bug：曾误用 /1e8）
 # ─────────────────────────────────────────────
 
 class TestFetchShenwanSectors:
@@ -118,12 +118,12 @@ class TestFetchShenwanSectors:
         with patch.object(data_fetcher, "_get_pro", return_value=pro):
             return data_fetcher.fetch_shenwan_sectors(DATE)
 
-    def test_amount_divided_by_1e7_not_1e8(self):
-        """申万行业成交额：千元→亿 必须 /1e7。这是历史上出 10 倍偏差 bug 的地方。"""
+    def test_amount_divided_by_1e5_not_1e8(self):
+        """申万行业成交额：千元→亿 必须 /1e5。这是历史上出 10 倍偏差 bug 的地方。"""
         sectors = self._run()
         assert len(sectors) == len(data_fetcher.SW_SECTOR_CODES)
-        expected = round(self.RAW_AMOUNT / 1e7, 2)      # 123.0 亿
-        wrong = round(self.RAW_AMOUNT / 1e8, 2)          # 12.3（历史 bug 值）
+        expected = round(self.RAW_AMOUNT / 1e5, 2)      # 12300.0 亿
+        wrong = round(self.RAW_AMOUNT / 1e7, 2)          # 123.0（历史 bug 值，差 100 倍）
         assert expected != wrong  # 测试数据本身能区分两种口径
         for s in sectors:
             assert s["amount"] == pytest.approx(expected), s["name"]
@@ -193,11 +193,11 @@ class TestMoneyflowUnits:
         # 防回归：绝不能是万元原值（差 1e4 倍）
         assert ff["lg_net"] != pytest.approx(self.BUY_LG - self.SELL_LG)
 
-    def test_total_amount_divided_by_1e7_and_vol_by_10000(self):
-        """板块合计成交额：千元→亿 /1e7；合计成交量：手→万手 /10000。"""
+    def test_total_amount_divided_by_1e5_and_vol_by_10000(self):
+        """板块合计成交额：千元→亿 /1e5；合计成交量：手→万手 /10000。"""
         result = self._run()
         assert result["total_amount"] == pytest.approx(
-            round(2 * self.RAW_AMOUNT / 1e7, 2))
+            round(2 * self.RAW_AMOUNT / 1e5, 2))
         assert result["total_vol"] == pytest.approx(
             round(2 * self.RAW_VOL / 10000, 2))
 
@@ -247,7 +247,7 @@ class TestFetchFundFlows:
         """融资余额 rzye：元→亿 /1e8，且为两所合计。"""
         result = self._run()
         assert result["margin_bal"] == pytest.approx(round(self.RZYE / 1e8, 2))
-        assert result["margin_bal"] != pytest.approx(round(self.RZYE / 1e7, 2))
+        assert result["margin_bal"] != pytest.approx(round(self.RZYE / 1e5, 2))
 
     def test_negative_flows_are_included(self):
         """净流出（负值）必须写入结果——北向净卖出是重要信号，不得丢弃；0 才视为无数据。"""
@@ -320,7 +320,7 @@ class TestFormatPromptIndexLines:
             indices = data_fetcher.fetch_a_share_indices(DATE)
         snap = self._snapshot(indices)
         text = data_fetcher.format_market_data_for_prompt(snap)
-        assert "成交额35.0亿" in text          # amount/1e7 的真实值
+        assert "成交额3500.0亿" in text        # amount/1e5 的真实值
         assert "成交额5.0亿" not in text       # 不得把 vol 当成交额
         assert "成交额50000" not in text       # 不得出现未换算原值
 

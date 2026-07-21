@@ -10,6 +10,7 @@
 import os
 import json
 import logging
+import time
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
@@ -135,7 +136,7 @@ def fetch_a_share_indices(date: str) -> dict:
                 "close": round(close, 2),
                 "pct_chg": round(pct_chg, 2),
                 "vol": round(vol, 2),
-                "amount": round(float(latest.get("amount", 0) or 0) / 1e7, 2),  # 千元→亿
+                "amount": round(float(latest.get("amount", 0) or 0) / 1e5, 2),  # 千元→亿
                 "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
                 "chg_5d": chg_5d, "chg_20d": chg_20d,
                 "trend_5d": trend_5d, "trend_20d": trend_20d,
@@ -214,7 +215,7 @@ def fetch_shenwan_sectors(date: str) -> list:
                 "high": round(float(row.get("high", 0)), 2),
                 "low": round(float(row.get("low", 0)), 2),
                 "vol": round(float(row.get("vol", 0)) / 10000, 2),
-                "amount": round(float(row.get("amount", 0)) / 1e7, 2),
+                "amount": round(float(row.get("amount", 0)) / 1e5, 2),
                 "streak": streak_str,
             })
         except Exception as e:
@@ -1049,7 +1050,7 @@ def fetch_sector_volume_all(date: str) -> dict:
             sector = _stock_sector_cache.get(code, "")
             if not sector:
                 continue
-            amt = float(row.get("amount", 0) or 0) / 1e7  # 千元→亿
+            amt = float(row.get("amount", 0) or 0) / 1e5  # 千元→亿
             vol = float(row.get("vol", 0) or 0) / 10000    # 手→万手
             sector_amount[sector] = sector_amount.get(sector, 0) + amt
             sector_vol[sector] = sector_vol.get(sector, 0) + vol
@@ -1212,7 +1213,7 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
         # 板块合计成交额（成分股口径）
         total_amount = float(daily_df["amount"].sum()) if "amount" in daily_df.columns else 0
         total_vol = float(daily_df["vol"].sum()) if "vol" in daily_df.columns else 0
-        result["total_amount"] = round(total_amount / 1e7, 2)  # 千元→亿
+        result["total_amount"] = round(total_amount / 1e5, 2)  # 千元→亿
         result["total_vol"] = round(total_vol / 10000, 2)      # 手→万手
 
         result["up_count"] = int((daily_df["pct_chg"] > 0).sum())
@@ -1274,6 +1275,259 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
 
     except Exception:
         return result
+
+
+# ═══════════════════════════════════════════
+# 板块深度分析（估值水位 + 资金博弈）
+# ═══════════════════════════════════════════
+
+# 常见板块俗称/二级行业名 → 申万一级行业（用于板块名兜底映射）
+SW_SECTOR_ALIAS = {
+    "半导体": "电子", "芯片": "电子", "白酒": "食品饮料",
+    "券商": "非银金融", "保险": "非银金融", "医药": "医药生物",
+    "医疗": "医药生物", "军工": "国防军工", "地产": "房地产",
+    "光伏": "电气设备", "锂电": "电气设备", "新能源": "电气设备",
+    "新能源车": "汽车", "AI": "计算机", "人工智能": "计算机",
+    "游戏": "传媒", "影视": "传媒", "5G": "通信",
+}
+
+
+def _get_sector_member_codes(pro, sector_name: str):
+    """获取申万行业成分股 ts_code 列表，失败返回 None。"""
+    name = sector_name.strip()
+    idx_code = SW_INDEX_MAP.get(name)
+    if not idx_code:
+        # 兜底：俗称别名 → 包含匹配
+        alias = SW_SECTOR_ALIAS.get(name)
+        if not alias:
+            for key in SW_INDEX_MAP:
+                if key in name or name in key:
+                    alias = key
+                    break
+        if alias:
+            idx_code = SW_INDEX_MAP.get(alias)
+    if not idx_code:
+        logger.warning("未找到板块对应的申万指数 sector=%s", sector_name)
+        return None
+    try:
+        df_member = pro.index_member(index_code=idx_code)
+        if df_member is None or df_member.empty:
+            return None
+        return df_member["con_code"].tolist()
+    except Exception:
+        logger.warning("获取板块成分股失败 sector=%s", sector_name, exc_info=True)
+        return None
+
+
+def _api_with_date_fallback(pro, api_name: str, trade_date: str, max_back: int = 5):
+    """
+    调用 tushare 全市场接口（如 daily_basic/moneyflow）；
+    当日无数据（非交易日）时逐日回退，最多回退 max_back 天。
+    返回 (df, 实际交易日)，失败返回 (None, None)。
+    """
+    dt = datetime.strptime(trade_date, "%Y%m%d")
+    for i in range(max_back + 1):
+        d = (dt - timedelta(days=i)).strftime("%Y%m%d")
+        try:
+            df = getattr(pro, api_name)(trade_date=d)
+            if df is not None and not df.empty:
+                return df, d
+        except Exception:
+            logger.warning("%s 调用失败 date=%s", api_name, d, exc_info=True)
+    return None, None
+
+
+def _weighted_pe_pb(df):
+    """
+    按总市值（total_mv，单位万元，加权时单位可约掉）计算板块加权 PE/PB。
+    PE 剔除 pe<=0 的亏损股；PB 用全部有值股。
+    """
+    pe = pb = None
+    if df is None or df.empty:
+        return pe, pb
+    df = df.dropna(subset=["total_mv"])
+    df = df[df["total_mv"] > 0]
+    if df.empty:
+        return pe, pb
+    # PE：剔除亏损股（pe<=0）后按市值加权
+    df_pe = df.dropna(subset=["pe"])
+    df_pe = df_pe[df_pe["pe"] > 0]
+    if not df_pe.empty:
+        pe = round(float((df_pe["pe"] * df_pe["total_mv"]).sum() / df_pe["total_mv"].sum()), 2)
+    # PB：全部有值股按市值加权
+    df_pb = df.dropna(subset=["pb"])
+    if not df_pb.empty:
+        pb = round(float((df_pb["pb"] * df_pb["total_mv"]).sum() / df_pb["total_mv"].sum()), 2)
+    return pe, pb
+
+
+def fetch_sector_valuation(sector_name: str, trade_date: str) -> dict:
+    """
+    板块估值水位：成分股 daily_basic 按总市值加权 PE/PB + 近 1 年历史分位。
+    申万行业指数（801xx0.SI）本身无 daily_basic 数据，必须用成分股聚合。
+    trade_date 格式 YYYYMMDD；任何一步失败对应字段为 None，note 说明原因。
+    """
+    result = {"pe": None, "pb": None, "pe_percentile": None, "pb_percentile": None,
+              "sample_count": 0, "note": ""}
+    notes = []
+
+    pro = _get_pro()
+    if not pro:
+        result["note"] = "Tushare 未配置或初始化失败"
+        return result
+
+    # 1. 成分股列表
+    stocks = _get_sector_member_codes(pro, sector_name)
+    if not stocks:
+        result["note"] = f"未找到板块「{sector_name}」或成分股为空"
+        return result
+
+    # 2. 当日全市场 daily_basic（非交易日最多回退 5 天），过滤成分股
+    df_all, actual_date = _api_with_date_fallback(pro, "daily_basic", trade_date)
+    if df_all is None:
+        result["note"] = f"daily_basic 自 {trade_date} 回退 5 天均无数据"
+        return result
+    df = df_all[df_all["ts_code"].isin(stocks)]
+    if df.empty:
+        result["note"] = "成分股当日无 daily_basic 数据"
+        return result
+    result["sample_count"] = len(df)
+    result["pe"], result["pb"] = _weighted_pe_pb(df)
+    if result["pe"] is None and result["pb"] is None:
+        result["note"] = "成分股 pe/pb 字段全为空"
+        return result
+    if result["pe"] is None:
+        notes.append("成分股 pe 全为空或全为亏损股")
+    if result["pb"] is None:
+        notes.append("成分股 pb 全为空")
+
+    # 3. 历史分位：近 1 年每月月末交易日采样约 12 个点
+    #    优先用 trade_cal 取真实月末交易日；失败则退化为自然月末+逐日回退
+    sample_dates = []
+    try:
+        dt = datetime.strptime(actual_date, "%Y%m%d")
+        start_1y = (dt - timedelta(days=370)).strftime("%Y%m%d")
+        cal = pro.trade_cal(exchange="SSE", start_date=start_1y,
+                            end_date=actual_date, is_open="1")
+        if cal is None or cal.empty:
+            raise ValueError("trade_cal 返回为空")
+        by_month = {}
+        for d in sorted(cal["cal_date"].tolist()):
+            by_month[str(d)[:6]] = str(d)  # 每月最后一个交易日
+        sample_dates = [d for d in sorted(by_month.values()) if d != actual_date][-12:]
+        if not sample_dates:
+            raise ValueError("trade_cal 无可用历史月末交易日")
+    except Exception:
+        logger.warning("trade_cal 获取月末交易日失败，改用自然月末兜底", exc_info=True)
+        dt = datetime.strptime(actual_date, "%Y%m%d")
+        year, month = dt.year, dt.month
+        for _ in range(12):
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+            last_day = (datetime(year, 12, 31) if month == 12
+                        else datetime(year, month + 1, 1) - timedelta(days=1))
+            sample_dates.append(last_day.strftime("%Y%m%d"))
+        sample_dates.sort()
+
+    hist_pe, hist_pb = [], []
+    for d in sample_dates:
+        hdf, _ = _api_with_date_fallback(pro, "daily_basic", d)
+        if hdf is not None:
+            hdf = hdf[hdf["ts_code"].isin(stocks)]
+            hpe, hpb = _weighted_pe_pb(hdf)
+            if hpe is not None:
+                hist_pe.append(hpe)
+            if hpb is not None:
+                hist_pb.append(hpb)
+        time.sleep(0.3)  # 防限流
+
+    # 分位 = 历史样本中 ≤ 当前值的比例（0-100 整数）；样本过少则不给分位
+    if result["pe"] is not None and len(hist_pe) >= 6:
+        result["pe_percentile"] = int(round(
+            sum(1 for v in hist_pe if v <= result["pe"]) / len(hist_pe) * 100))
+    else:
+        notes.append(f"PE 历史样本不足（{len(hist_pe)} 点），分位缺失")
+    if result["pb"] is not None and len(hist_pb) >= 6:
+        result["pb_percentile"] = int(round(
+            sum(1 for v in hist_pb if v <= result["pb"]) / len(hist_pb) * 100))
+    else:
+        notes.append(f"PB 历史样本不足（{len(hist_pb)} 点），分位缺失")
+
+    result["note"] = "；".join(notes)
+    return result
+
+
+def fetch_sector_moneyflow(sector_name: str, trade_date: str) -> dict:
+    """
+    板块资金博弈：成分股 moneyflow 聚合。
+    主力 = 特大单 + 大单；中小单 = 中单 + 小单。
+    金额单位万元，÷10000 得亿元。trade_date 格式 YYYYMMDD；
+    任何一步失败对应字段为 None/空列表，note 说明原因。
+    """
+    result = {"main_net": None, "retail_net": None, "top_inflow": [],
+              "top_outflow": [], "stock_count": 0, "note": ""}
+
+    pro = _get_pro()
+    if not pro:
+        result["note"] = "Tushare 未配置或初始化失败"
+        return result
+
+    # 1. 成分股列表
+    stocks = _get_sector_member_codes(pro, sector_name)
+    if not stocks:
+        result["note"] = f"未找到板块「{sector_name}」或成分股为空"
+        return result
+
+    # 确保股票名称缓存已加载
+    _load_stock_names()
+
+    # 2. 全市场当日资金流（非交易日最多回退 5 天），过滤成分股
+    df_all, actual_date = _api_with_date_fallback(pro, "moneyflow", trade_date)
+    if df_all is None:
+        result["note"] = f"moneyflow 自 {trade_date} 回退 5 天均无数据"
+        return result
+    import pandas as pd
+    df = df_all[df_all["ts_code"].isin(stocks)].copy()
+    if df.empty:
+        result["note"] = "成分股当日无资金流数据"
+        return result
+
+    # 3. 聚合计算（金额单位：万元 → 亿元，÷10000）
+    try:
+        flow_cols = ["buy_elg_amount", "sell_elg_amount",
+                     "buy_lg_amount", "sell_lg_amount",
+                     "buy_md_amount", "sell_md_amount",
+                     "buy_sm_amount", "sell_sm_amount"]
+        for col in flow_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        main_net_wy = (df["buy_elg_amount"].sum() + df["buy_lg_amount"].sum()
+                       - df["sell_elg_amount"].sum() - df["sell_lg_amount"].sum())
+        retail_net_wy = (df["buy_md_amount"].sum() + df["buy_sm_amount"].sum()
+                         - df["sell_md_amount"].sum() - df["sell_sm_amount"].sum())
+        result["main_net"] = round(float(main_net_wy) / 10000, 2)    # 万元→亿
+        result["retail_net"] = round(float(retail_net_wy) / 10000, 2)  # 万元→亿
+        result["stock_count"] = len(df)
+
+        # 个股主力净流入排行（万元→亿），取净流入/净流出前 5
+        df["main_net_ind"] = (df["buy_elg_amount"] + df["buy_lg_amount"]
+                              - df["sell_elg_amount"] - df["sell_lg_amount"]) / 10000
+        df = df.sort_values("main_net_ind", ascending=False)
+        result["top_inflow"] = [
+            (_stock_name(r["ts_code"]), round(float(r["main_net_ind"]), 2))
+            for _, r in df.head(5).iterrows() if r["main_net_ind"] > 0
+        ]
+        result["top_outflow"] = [
+            (_stock_name(r["ts_code"]), round(float(r["main_net_ind"]), 2))
+            for _, r in df.tail(5).iloc[::-1].iterrows() if r["main_net_ind"] < 0
+        ]
+    except Exception:
+        logger.warning("板块资金流聚合失败 sector=%s", sector_name, exc_info=True)
+        result["note"] = "资金流聚合计算失败"
+
+    return result
 
 
 # ═══════════════════════════════════════════

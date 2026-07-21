@@ -320,6 +320,85 @@ def _format_all_news(snapshot, date_display: str) -> str:
     return "\n".join(lines)
 
 
+# ── 板块深挖附加数据（估值 / 资金流向）格式化 ──
+
+def _format_flow_items(items, limit: int = 5) -> str:
+    """防御式格式化资金流入/流出居前个股列表，兼容 dict 或字符串条目。"""
+    out = []
+    for it in list(items)[:limit]:
+        if isinstance(it, dict):
+            name = it.get("name") or it.get("code") or "?"
+            amt = it.get("amount")
+            if amt is None:
+                amt = it.get("net")
+            if isinstance(amt, (int, float)):
+                out.append(f"{name} {amt:+.2f}亿")
+            else:
+                out.append(str(name))
+        else:
+            out.append(str(it))
+    return "、".join(out)
+
+
+def _format_sector_valuation_block(valuation: Optional[dict]) -> str:
+    """板块估值水位数据块。字段为 None 时跳过；整体缺失时标注数据未获取。"""
+    header = "【二、板块估值水位】（Tushare 成分股市值加权，分位为历史百分位）"
+    missing = "板块估值数据未获取，分析时请标注『估值数据暂缺』，禁止编造。"
+    if not isinstance(valuation, dict):
+        return f"{header}\n{missing}"
+    parts = []
+    pe = valuation.get("pe")
+    if isinstance(pe, (int, float)):
+        parts.append(f"PE(TTM) {pe:.1f}倍")
+    pb = valuation.get("pb")
+    if isinstance(pb, (int, float)):
+        parts.append(f"PB {pb:.2f}倍")
+    pe_pct = valuation.get("pe_percentile")
+    if isinstance(pe_pct, (int, float)):
+        parts.append(f"PE历史分位 {pe_pct:.1f}%")
+    pb_pct = valuation.get("pb_percentile")
+    if isinstance(pb_pct, (int, float)):
+        parts.append(f"PB历史分位 {pb_pct:.1f}%")
+    lines = [header, "  ".join(parts) if parts else missing]
+    sample = valuation.get("sample_count")
+    if isinstance(sample, (int, float)) and sample:
+        lines.append(f"样本：{int(sample)}只成分股")
+    note = valuation.get("note")
+    if note:
+        lines.append(f"备注：{note}")
+    return "\n".join(lines)
+
+
+def _format_sector_moneyflow_block(moneyflow: Optional[dict]) -> str:
+    """板块资金博弈数据块。金额单位：亿元。字段为 None 时跳过。"""
+    header = "【三、板块资金博弈】（Tushare 资金流向，单位：亿元）"
+    missing = "板块资金流向数据未获取，分析时请标注『资金数据暂缺』，禁止编造。"
+    if not isinstance(moneyflow, dict):
+        return f"{header}\n{missing}"
+    lines = [header]
+    parts = []
+    main = moneyflow.get("main_net")
+    if isinstance(main, (int, float)):
+        direction = "净流入" if main >= 0 else "净流出"
+        parts.append(f"主力资金当日{direction} {abs(main):.2f}亿元")
+    retail = moneyflow.get("retail_net")
+    if isinstance(retail, (int, float)):
+        direction = "净流入" if retail >= 0 else "净流出"
+        parts.append(f"散户资金当日{direction} {abs(retail):.2f}亿元")
+    lines.append("；".join(parts) if parts else "主力/散户资金数据未获取。")
+    for key, label in (("top_inflow", "资金流入居前"), ("top_outflow", "资金流出居前")):
+        items = moneyflow.get(key)
+        if items:
+            lines.append(f"{label}：{_format_flow_items(items)}")
+    count = moneyflow.get("stock_count")
+    if isinstance(count, (int, float)) and count:
+        lines.append(f"统计样本：{int(count)}只成分股")
+    note = moneyflow.get("note")
+    if note:
+        lines.append(f"备注：{note}")
+    return "\n".join(lines)
+
+
 def _format_multi_day_news(snapshot, sector, date_str) -> str:
     """预格式化多日新闻，LLM无法跳过，直接注入prompt。"""
     from datetime import datetime, timedelta
@@ -431,6 +510,39 @@ class MarketReviewAgent:
 
         return await self._call_llm(system, user_prompt, stream)
 
+    async def _fetch_sector_extras(
+        self, sector: str, trade_date: str
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """
+        并行采集板块估值与资金流向（Tushare）。
+        单点失败（import 缺失 / 抛异常 / 返回非dict）降级为 None，绝不向上抛出。
+        trade_date 格式 %Y%m%d。
+        """
+        try:
+            from .data_fetcher import fetch_sector_valuation, fetch_sector_moneyflow
+        except ImportError as e:
+            logger.warning("板块深挖附加数据函数未就绪（data_fetcher 未提供）: %s", e)
+            return None, None
+
+        loop = asyncio.get_running_loop()
+
+        async def _safe(fn, label: str) -> Optional[dict]:
+            try:
+                result = await loop.run_in_executor(None, fn, sector, trade_date)
+                if not isinstance(result, dict):
+                    logger.warning("%s 返回非dict（%s板块 %s）: %r", label, sector, trade_date, result)
+                    return None
+                return result
+            except Exception as e:
+                logger.warning("%s 获取失败（%s板块 %s）: %s", label, sector, trade_date, e, exc_info=True)
+                return None
+
+        valuation, moneyflow = await asyncio.gather(
+            _safe(fetch_sector_valuation, "板块估值"),
+            _safe(fetch_sector_moneyflow, "板块资金流向"),
+        )
+        return valuation, moneyflow
+
     async def _sector_deep_dive(self, sector: str, stream: bool):
         """单板块深度聚焦。"""
         today = datetime.now()
@@ -448,14 +560,27 @@ class MarketReviewAgent:
             self._cache[cache_key] = snapshot
         market_data = format_market_data_for_prompt(snapshot)
 
+        # 板块估值 + 资金流向（独立采集，单点失败降级为『数据未获取』，不影响主流程）
+        valuation, moneyflow = await self._fetch_sector_extras(sector, date_str)
+        valuation_block = _format_sector_valuation_block(valuation)
+        moneyflow_block = _format_sector_moneyflow_block(moneyflow)
+
         system = get_system_prompt("sector_deep_dive", sector)
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
         user_prompt = f"""交易日：{date_display} {weekday} | 行业：{sector}
 
+【一、行情与趋势数据】
 {market_data}
 
-深度分析{sector}板块。输出标题需包含日期{date_display}。不列出新闻。数据缺失处标注数据暂缺，禁止编造。"""
+{valuation_block}
+
+{moneyflow_block}
+
+【四、新闻与景气背景】
+上方"行情与趋势数据"中的东方财富实时快讯与新浪历史新闻已按{sector}行业过滤，请作为景气度与催化/风险判断的素材引用，不要原样罗列。
+
+深度分析{sector}板块。输出标题需包含日期{date_display}。新闻条目仅作为第五维催化与风险的引用素材，不要单独罗列新闻清单。数据缺失处标注数据暂缺，禁止编造。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
