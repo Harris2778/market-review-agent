@@ -197,6 +197,20 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
+    # 股票代码/名称查询
+    stock_patterns = [r"分析.{0,4}[A-Z]{1,5}$", r"[A-Z]{1,5}.*(股价|行情|分析|怎么样)", r"(茅台|五粮液|宁德|比亚迪|中芯)"]
+    for p in stock_patterns:
+        if re.search(p, msg, re.IGNORECASE):
+            return ("stock_query", msg)
+
+    # 期货查询
+    if any(kw in msg for kw in ["期货", "黄金", "原油", "铜价", "螺纹钢", "铁矿石", "白银", "焦煤"]):
+        return ("futures_query", msg)
+
+    # 基金查询
+    if any(kw in msg for kw in ["基金", "ETF", "净值", "申赎"]):
+        return ("fund_query", msg)
+
     return ("general_chat", None)
 
 
@@ -341,6 +355,12 @@ class MarketReviewAgent:
             return await self._market_review(stream)
         elif intent == "news_only":
             return await self._news_only(sector, stream)
+        elif intent == "stock_query":
+            return await self._stock_query(message, stream)
+        elif intent == "futures_query":
+            return await self._futures_query(message, stream)
+        elif intent == "fund_query":
+            return await self._fund_query(message, stream)
         else:
             return await self._sector_deep_dive(sector, stream)
 
@@ -520,6 +540,58 @@ class MarketReviewAgent:
         if not stream and isinstance(result, dict):
             result["content"] = news_text
         return result
+
+    async def _stock_query(self, message: str, stream: bool):
+        """个股查询。"""
+        from agent.data_fetcher import fetch_stock_quote, fetch_stock_kline, fetch_stock_news, search_stock
+        # 先搜索股票
+        results = search_stock(message[:20])
+        if not results:
+            return {"role": "assistant", "content": "未找到该股票，请尝试输入完整代码如 600519.SH 或公司名如 贵州茅台"}
+        s = results[0]
+        market = "cn" if s.get("market","") in ["11","cn"] else "us"
+        quote = fetch_stock_quote(market, s["code"])
+        kline = fetch_stock_kline(market, s["code"], 5)
+        news = fetch_stock_news(s["code"], market, 5)
+        info = f"""{s['name']}({s['code']})
+实时行情: 价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}% 成交量{quote.get('vol','?')}
+开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}
+近5日K线: {', '.join(f"{k['date'][-5:]}:{k['close']}({k['pct']}%)" for k in kline)}
+相关新闻({len(news)}条): {'; '.join(f"{n['title'][:40]} {n['time']}" for n in news[:3])}
+"""
+        system = "你是股票分析师。根据数据简要分析该股票。禁止markdown格式。"
+        result = await self._call_llm(system, f"股票数据:\n{info}\n\n请简要分析这只股票。", stream)
+        if not stream and isinstance(result, dict):
+            result["content"] = info + "\n" + result["content"]
+        return result
+
+    async def _futures_query(self, message: str, stream: bool):
+        """期货查询。"""
+        from agent.data_fetcher import fetch_futures_quote
+        # 简单关键词映射
+        kw_map = {"黄金": ("shfe", "AU0"), "原油": ("dce", "SC0"), "铜": ("shfe", "CU0"),
+                  "螺纹钢": ("shfe", "RB0"), "铁矿石": ("dce", "I0"), "白银": ("shfe", "AG0"), "焦煤": ("dce", "JM0")}
+        matched = None
+        for kw, (mkt, sym) in kw_map.items():
+            if kw in message:
+                matched = (kw, mkt, sym)
+                break
+        if not matched:
+            return {"role": "assistant", "content": "请指定期货品种：黄金/原油/铜/螺纹钢/铁矿石/白银/焦煤"}
+        kw, mkt, sym = matched
+        q = fetch_futures_quote(mkt, sym)
+        info = f"{kw}期货: 价格{q.get('price','?')} 涨跌{q.get('pct','?')}% 成交量{q.get('volume','?')}"
+        return {"role": "assistant", "content": info}
+
+    async def _fund_query(self, message: str, stream: bool):
+        """基金查询。"""
+        from agent.data_fetcher import fetch_fund_info
+        # 简单代码提取
+        code = re.search(r"\d{6}", message)
+        if code:
+            info = fetch_fund_info(code.group(0))
+            return {"role": "assistant", "content": str(info)}
+        return {"role": "assistant", "content": "请提供基金代码（如 510050）"}
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False
