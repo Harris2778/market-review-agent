@@ -1176,6 +1176,8 @@ async def collect_market_snapshot(
         "sina2": loop.run_in_executor(None, fetch_sina_news, 30, d2),
         "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
         "calendar": loop.run_in_executor(None, fetch_economic_calendar),
+        "breadth": loop.run_in_executor(None, fetch_market_breadth),
+        "hot": loop.run_in_executor(None, fetch_hot_stocks),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1199,8 +1201,8 @@ async def collect_market_snapshot(
     snapshot._north_hold = safe(results_raw.get("north"), [])
     snapshot._north_sector = aggregate_northbound_by_sector(snapshot._north_hold)
     snapshot._sector_volumes = await loop.run_in_executor(None, fetch_sector_volume_all, date)
-    snapshot._breadth = await loop.run_in_executor(None, fetch_market_breadth)
-    snapshot._hot = await loop.run_in_executor(None, fetch_hot_stocks)
+    snapshot._breadth = safe(results_raw.get("breadth"), {})
+    snapshot._hot = safe(results_raw.get("hot"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
