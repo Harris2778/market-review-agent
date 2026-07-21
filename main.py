@@ -322,6 +322,14 @@ async def debug_macro():
     return {"macro_test": results}
 
 
+@app.get("/debug/mcp-news")
+async def debug_mcp_news():
+    """测试MCP新闻搜索。"""
+    from agent.data_fetcher import fetch_mcp_news
+    items = fetch_mcp_news("银行", 10)
+    return {"count": len(items), "sample": [i["title"][:60] for i in items[:3]]}
+
+
 @app.get("/debug/news-count")
 async def debug_news_count():
     """检查新闻数据是否进入了snapshot。"""
