@@ -428,20 +428,16 @@ class MarketReviewAgent:
         d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
 
-        # MCP + Sina + EM 全部并行拉取
+        # 新闻数据并行拉取
         from agent.data_fetcher import fetch_mcp_news as _mcp, fetch_sina_news as _s, fetch_eastmoney_news as _e
         search_kw = sector if sector else "A股"
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-            futures = [pool.submit(_mcp, search_kw, 60), pool.submit(_e, 50)]
-            for date_str in [d0, d1, d2]:
-                for page in [1, 2, 3]:
-                    futures.append(pool.submit(_s, 50, date_str))
-            mcp_items = futures[0].result() or []
-            em1 = futures[1].result() or []
-            all_sina = []
-            for f in futures[2:]:
-                items = f.result()
+        # 直接同步调用，不用线程池
+        mcp_items = _mcp(search_kw, 60)
+        em1 = _e(50)
+        all_sina = []
+        for date_str in [d0, d1, d2]:
+            for page in [1, 2]:
+                items = _s(50, date_str)
                 if items:
                     all_sina.extend(items)
 
