@@ -583,13 +583,20 @@ def fetch_us_breadth() -> dict:
 
 
 def fetch_strong_sectors() -> list:
-    """A股强势板块。数据格式: result.data[].name/jjzt"""
-    d = _mcp_call("cnMarketStrongSectors", {"bk": "行业", "type": "行业", "isNotSt": "1"})
+    """A股强势板块。type=all/ck/other, bk=gn概念/hy行业/dy地域"""
+    d = _mcp_call("cnMarketStrongSectors", {"type": "all", "isNotSt": "1", "bk": "gn"})
     items = []
     data = d.get("result",{}).get("data",[]) or []
     for it in data[:10]:
-        items.append({"name": it.get("name",""), "pct": it.get("jjzt","")})
+        items.append({"name": it.get("name",""), "pct": it.get("percent","")})
     return items
+
+
+def fetch_valuation(symbol: str, rank: str = "y1", val_type: str = "syl") -> dict:
+    """个股估值明细。rank: y1/y3/y5/y10/all, type: syl市盈率/sjl市净率/sxl市现率/gxl股息率/zsz总市值"""
+    d = _mcp_call("cnStockValuationDetail", {"symbol": symbol, "rank": rank, "type": val_type})
+    data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
+    return {"个股": data.get("gg",[]), "行业": data.get("hy",[]), "大盘": data.get("dp",[])}
 
 
 def fetch_us_sectors() -> list:
@@ -1318,7 +1325,28 @@ def fetch_china_macro() -> dict:
 # 商品期货 + 汇率（yfinance）
 # ═══════════════════════════════════════════
 
-def fetch_commodities_and_fx() -> dict:
+def fetch_forex() -> dict:
+    """最新汇率。symbol: USDCNY, EURUSD等"""
+    d = _mcp_call("forexQuoteLatest", {"symbol": "USDCNY"})
+    data = d.get("status",{}).get("data",{}) or d.get("data",{}) or {}
+    return {"在岸人民币": f"{data.get('price','?')}", "涨跌": f"{data.get('pctChg','?')}%"}
+
+
+def fetch_forex_batch() -> list:
+    """批量汇率。"""
+    d = _mcp_call("forexQuotesBatch", {"from": "USD", "to": "CNY,JPY,EUR"})
+    items = []
+    data = d.get("status",{}).get("data",[]) or d.get("data",[]) or []
+    for it in data:
+        items.append(f"{it.get('symbol','?')}:{it.get('price','?')}")
+    return items[:5]
+
+
+def fetch_futures(market: str = "gn", symbol: str = "AU0") -> dict:
+    """期货行情。market: gn内盘/global外盘/cff股指, symbol: CHA50CFD/AU0等"""
+    d = _mcp_call("future_quotes", {"market": market, "symbol": symbol})
+    data = d.get("data",{}) or {}
+    return {"名称": data.get("name",""), "价格": data.get("price",""), "涨跌": data.get("percent",""), "成交量": data.get("volume","")}
     """商品期货 + 人民币汇率（yfinance 免费）。"""
     result = {}
     tickers = {
@@ -1458,7 +1486,7 @@ async def collect_market_snapshot(
         "flows": loop.run_in_executor(None, fetch_fund_flows, date),
         "gidx": loop.run_in_executor(None, fetch_global_indices),
         "broker": loop.run_in_executor(None, fetch_broker_recommendations),
-        "comm": loop.run_in_executor(None, fetch_commodities_and_fx),
+        "forex": loop.run_in_executor(None, fetch_forex),
         "shibor": loop.run_in_executor(None, fetch_shibor),
         "north": loop.run_in_executor(None, fetch_north_holdings),
         "toplist": loop.run_in_executor(None, fetch_top_list, date),
@@ -1501,7 +1529,7 @@ async def collect_market_snapshot(
     snapshot.fund_flows = safe(results_raw.get("flows"), {})
     snapshot.global_indices = safe(results_raw.get("gidx"), {})
     snapshot._broker_recs = safe(results_raw.get("broker"), [])
-    snapshot._commodities = safe(results_raw.get("comm"), {})
+    snapshot._forex = safe(results_raw.get("forex"), {})
     snapshot._shibor = safe(results_raw.get("shibor"), {})
     snapshot._north_hold = safe(results_raw.get("north"), [])
     snapshot._north_sector = aggregate_northbound_by_sector(snapshot._north_hold)
@@ -1694,12 +1722,9 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("")
 
     # ── 商品 + 汇率 ──
-    comm = getattr(snapshot, "_commodities", {})
-    if comm:
-        lines.append("### 商品期货与汇率")
-        for name, d in comm.items():
-            lines.append(f"- {name}: {d['close']} {d['pct_chg']:+.2f}%")
-        lines.append("")
+    fx = getattr(snapshot, "_forex", {})
+    if fx:
+        lines.append(f"### 汇率 在岸人民币 {fx.get('在岸人民币','?')} {fx.get('涨跌','?')}")
 
     # ── 龙虎榜 ──
     top_list = getattr(snapshot, "_top_list", [])
