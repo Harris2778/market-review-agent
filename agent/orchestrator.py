@@ -682,17 +682,11 @@ class MarketReviewAgent:
                 model=self.model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=8192,
+                max_tokens=32768,
             )
             raw = completion.choices[0].message.content
             disclaimer = "\n\n风险提示：以上内容仅为行情数据复盘，不构成任何投资建议。本智能体由AI驱动，市场数据来源于公开信息，分析结论仅供参考。智能体开发同学与以上内容无任何责任关系。市场有风险，投资需谨慎。"
             clean = _clean_markdown(raw)
-            # 检测是否被截断（内容>5000字且末尾无句号）
-            finish = completion.choices[0].finish_reason
-            if finish == "length" or (len(clean) > 5000 and not clean.rstrip().endswith(("。","）",")","\"","\n"))):
-                hint = '\n\n受模型token限制，以上为部分内容。回复"继续"查看剩余部分'
-                self._pending[str(len(self._pending))] = {"system": system_prompt, "data": user_message[:2000], "prev": clean[-1000:]}
-                return {"role": "assistant", "content": clean + disclaimer + hint}
             return {"role": "assistant", "content": clean + disclaimer}
 
     async def _stream_response(self, messages: list) -> AsyncGenerator:
@@ -701,7 +695,7 @@ class MarketReviewAgent:
             model=self.model,
             messages=messages,
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=32768,
             stream=True,
         )
         async for chunk in stream:
