@@ -324,14 +324,35 @@ async def debug_macro():
 
 @app.get("/debug/mcp-news")
 async def debug_mcp_news():
-    """测试MCP新闻搜索。"""
-    import traceback
+    """测试MCP连通性+新闻搜索。"""
+    import requests as req, traceback, os
+    token = os.getenv("SINA_MCP_TOKEN", "")
+    result = {"token_exists": bool(token), "steps": []}
     try:
-        from agent.data_fetcher import fetch_mcp_news
-        items = fetch_mcp_news("银行", 10)
-        return {"count": len(items), "sample": [i["title"][:60] for i in items[:3]]}
+        base = "https://mcp.finance.sina.com.cn/mcp-http"
+        r = req.post(f"{base}?token={token}", json={
+            "jsonrpc":"2.0","method":"initialize","id":1,
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+        }, timeout=15)
+        result["init_status"] = r.status_code
+        sid = r.headers.get("Mcp-Session-Id","")
+        result["session"] = bool(sid)
+        if sid:
+            r2 = req.post(f"{base}?token={token}", json={
+                "jsonrpc":"2.0","method":"tools/call","id":2,
+                "params":{"name":"qNewsSearch","arguments":{"keyword":"银行","num":5,"page":1}}
+            }, headers={"Mcp-Session-Id":sid}, timeout=30)
+            d = r2.json()
+            content = d.get("result",{}).get("content",[])
+            if content:
+                text = content[0].get("text","")
+                data = json.loads(text)
+                items = data.get("result",{}).get("data",{}).get("data",[])
+                result["count"] = len(items)
+                result["sample"] = [(i.get("title","") or i.get("content",""))[:60] for i in items[:3]]
+        return result
     except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()[-500:]}
+        return {"error": str(e)[:200], "trace": traceback.format_exc()[-300:]}
 
 
 @app.get("/debug/news-count")
