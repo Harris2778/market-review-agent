@@ -695,14 +695,17 @@ def fetch_sw_classify(symbol: str) -> dict:
 
 
 def search_stock(keyword: str) -> list:
-    """股票代码搜索。返回格式: CSV 名称,市场,代码,完整代码,名称2"""
+    """股票代码搜索。返回CSV格式：结果：名称,市场,代码,完整代码,..."""
     d = _mcp_call("globalStockSearchSymbols", {"type": "11", "key": keyword, "format": "text", "num": "5"})
     items = []
     raw = d.get("raw","") or ""
-    for line in raw.split("\n"):
-        parts = line.split(",")
-        if len(parts) >= 4:
-            items.append({"name": parts[0], "market": parts[1], "code": parts[2], "full_code": parts[3]})
+    # 格式: "结果：贵州茅台,11,600519,sh600519,...  结果组成定义：{...}"
+    if "结果：" in raw:
+        data_part = raw.split("结果：")[1].split("结果组成定义")[0].strip()
+        for block in data_part.split("\n"):
+            parts = [p.strip() for p in block.split(",")]
+            if len(parts) >= 4 and parts[0]:
+                items.append({"name": parts[0], "market": parts[1], "code": parts[2], "full_code": parts[3]})
     return items[:5]
 
 
