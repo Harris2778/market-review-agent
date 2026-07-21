@@ -428,25 +428,23 @@ class MarketReviewAgent:
         d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
 
-        # MCP新闻搜索（按行业关键字）
+        # MCP + Sina并行拉取
         from agent.data_fetcher import fetch_mcp_news as _mcp
-        mcp_items = []
-        if sector:
-            search_kw = sector  # 直接用申万一级行业名搜索
-            mcp_items = await loop.run_in_executor(None, _mcp, search_kw, 60)
-        else:
-            mcp_items = await loop.run_in_executor(None, _mcp, "A股", 60)
-
-        # Sina公网历史
-        all_sina = []
+        search_kw = sector if sector else "A股"
+        mcp_task = loop.run_in_executor(None, _mcp, search_kw, 60)
+        em_task = loop.run_in_executor(None, _em, 50)
+        sina_tasks = []
         for date_str in [d0, d1, d2]:
             for page in [1, 2, 3]:
-                for attempt in range(2):
-                    items = await loop.run_in_executor(None, _sina, 50, date_str)
-                    if items:
-                        all_sina.extend(items)
-                        break
-        em1 = await loop.run_in_executor(None, _em, 50)
+                sina_tasks.append(loop.run_in_executor(None, _sina, 50, date_str))
+
+        mcp_items = await mcp_task or []
+        em1 = await em_task or []
+        all_sina = []
+        for t in sina_tasks:
+            items = await t
+            if items:
+                all_sina.extend(items)
 
         # 申万31行业关键词（每个行业名+简称，用于新闻自动归类）
         SW_ALL_KEYWORDS = {
