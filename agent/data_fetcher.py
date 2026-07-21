@@ -488,7 +488,7 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
             return items
         r2 = requests.post(f"{base}?token={token}", json={
             "jsonrpc":"2.0","method":"tools/call","id":2,
-            "params":{"name":"newsSearch","arguments":{"keyword":keyword,"num":limit,"page":1}}
+            "params":{"name":"qNewsSearch","arguments":{"keyword":keyword,"num":min(20,limit),"page":1}}
         }, headers={"Mcp-Session-Id":sid}, timeout=30)
         d = r2.json()
         content = d.get("result",{}).get("content",[])
