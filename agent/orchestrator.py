@@ -426,8 +426,14 @@ class MarketReviewAgent:
         d1 = trade_date.strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        sina1 = await loop.run_in_executor(None, _sina, 50, d1)
-        sina2 = await loop.run_in_executor(None, _sina, 50, d2)
+        # 新浪重试3次确保稳定
+        sina1 = []; sina2 = []
+        for attempt in range(3):
+            sina1 = await loop.run_in_executor(None, _sina, 50, d1)
+            if sina1: break
+        for attempt in range(3):
+            sina2 = await loop.run_in_executor(None, _sina, 50, d2)
+            if sina2: break
         em1 = await loop.run_in_executor(None, _em, 50)
 
         # 申万31行业关键词（每个行业名+简称，用于新闻自动归类）
