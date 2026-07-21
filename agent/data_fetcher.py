@@ -495,9 +495,14 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
         if content and isinstance(content,list):
             text = content[0].get("text","")
             if text:
-                data = json.loads(text).get("result",{}).get("data",{}).get("data",[])
-                for nd in data:
-                    items.append({"source":"智研","time":str(nd.get("ctime",""))[:16],"title":nd.get("title","")})
+                parsed = json.loads(text)
+                news_list = parsed.get("result",{}).get("data",{}).get("data",[])
+                if not news_list:
+                    news_list = parsed.get("data",{}).get("data",[])
+                for nd in news_list:
+                    title = nd.get("title","") or nd.get("content","")[:80]
+                    if title:
+                        items.append({"source":"智研","time":str(nd.get("ctime",""))[:16],"title":title})
     except Exception:
         pass
     return items
