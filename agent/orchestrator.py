@@ -363,8 +363,7 @@ class MarketReviewAgent:
     async def process_message(
         self, message: str, stream: bool = False
     ) -> dict | AsyncGenerator:
-        """处理用户消息。"""
-        # "继续"：续写上次截断内容
+        """处理用户消息。流式模式下自动将dict包装为生成器。"""
         if message.strip() in ["继续", "继续输出", "接着来", "继续分析", "go on", "continue"]:
             if self._pending:
                 key = list(self._pending.keys())[-1]
@@ -381,13 +380,23 @@ class MarketReviewAgent:
         elif intent == "news_only":
             return await self._news_only(sector, stream)
         elif intent == "stock_query":
-            return await self._stock_query(message, stream)
+            result = await self._stock_query(message, False)
         elif intent == "futures_query":
-            return await self._futures_query(message, stream)
+            result = await self._futures_query(message, False)
         elif intent == "fund_query" or intent == "mcp_query":
-            return await self._fund_query(message, stream)
+            result = await self._fund_query(message, False)
         else:
             return await self._sector_deep_dive(sector, stream)
+
+        # 简单查询返回dict → 流式模式包装为生成器
+        if stream and isinstance(result, dict):
+            async def _wrap():
+                text = result.get("content", "")
+                for i in range(0, len(text), 80):
+                    yield text[i:i+80]
+                    await asyncio.sleep(0.01)
+            return _wrap()
+        return result
 
     async def _chat(self, message: str, stream: bool):
         """通用对话。"""
