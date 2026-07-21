@@ -567,11 +567,19 @@ class MarketReviewAgent:
         return result
 
     async def _stock_query(self, message: str, stream: bool):
-        """个股查询——链式调用：搜索→行情→K线→新闻。"""
-        return await self._generic_mcp(
-            f"查询股票'{message}'的实时行情、近5日K线和相关新闻。请先搜索股票代码，再依次获取行情、K线和新闻。",
-            stream
-        )
+        """个股查询——直接调用预封装函数，不绕function calling。"""
+        from agent.data_fetcher import search_stock, fetch_stock_quote, fetch_stock_kline, fetch_stock_news
+        results = search_stock(message[:30])
+        if not results:
+            return {"role": "assistant", "content": "未找到该股票，请输入完整代码如600519.SH或公司名如贵州茅台"}
+        s = results[0]
+        market = "cn" if s.get("market","") == "11" else "us"
+        code = s.get("full_code", s.get("code",""))
+        quote = fetch_stock_quote(market, code)
+        kline = fetch_stock_kline(market, code, 5)
+        news = fetch_stock_news(code, market, 5)
+        info = f"{s['name']}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}% 成交量{quote.get('volume','?')}\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{', '.join(f'{k[\"date\"][-5:]}:{k[\"close\"]}({k[\"open\"]}→{k[\"close\"]})' for k in kline)}\n相关新闻：{' | '.join(f'{n[\"title\"][:40]}' for n in news[:3])}\n数据来源：新浪智研"
+        return {"role": "assistant", "content": info}
 
     async def _futures_query(self, message: str, stream: bool):
         """期货查询。"""
