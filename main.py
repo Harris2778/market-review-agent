@@ -229,16 +229,26 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
-@app.get("/debug/mcp-broadth")
-async def debug_mcp_broadth():
-    """测试MCP涨跌分布+热搜。"""
-    import traceback
-    from agent.data_fetcher import _mcp_call
-    try:
-        b = _mcp_call("cnMarketUpdownDistribution", {})
-        return {"raw_keys": list(b.keys())[:5], "raw_data": str(b)[:500]}
-    except Exception as e:
-        return {"error": str(e), "trace": traceback.format_exc()[-300:]}
+@app.get("/debug/mcp-raw")
+async def debug_mcp_raw():
+    """原始MCP响应测试。"""
+    import requests, os
+    token = os.getenv("SINA_MCP_TOKEN","")
+    base = "https://mcp.finance.sina.com.cn/mcp-http"
+    r = requests.post(f"{base}?token={token}", json={
+        "jsonrpc":"2.0","method":"initialize","id":1,
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+    }, timeout=15)
+    sid = r.headers.get("Mcp-Session-Id","")
+    r2 = requests.post(f"{base}?token={token}", json={
+        "jsonrpc":"2.0","method":"tools/call","id":2,
+        "params":{"name":"cnMarketUpdownDistribution","arguments":{}}
+    }, headers={"Mcp-Session-Id":sid}, timeout=30)
+    content = r2.json().get("result",{}).get("content",[])
+    if content:
+        text = content[0].get("text","")
+        return {"text_len": len(text), "text_preview": text[:500]}
+    return {"error": "no content", "status": r2.status_code, "raw": str(r2.json())[:300]}
 
 
 @app.get("/debug/sina-news")
