@@ -206,6 +206,9 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
         r".+行业.+新闻",  # "银行行业新闻"
         r"全市场.*新闻", r"新闻.*全市场",
         r"^(新闻|快讯|资讯)$",
+        # 解读类新闻请求（如「解读一下今天的新闻」「这些新闻怎么看」）
+        r"(解读|分析|影响|怎么看|意味着什么|说明什么).{0,10}(新闻|快讯|资讯)",
+        r"(新闻|快讯|资讯).{0,10}(解读|怎么看|意味着什么|说明什么)",
     ]
     for pattern in news_patterns:
         if re.search(pattern, msg):
@@ -669,6 +672,43 @@ def _format_multi_day_news(snapshot, sector, date_str) -> str:
     return "\n".join(lines)
 
 
+# ── 新闻模式：重要性评分词表、触发词与展示辅助 ──
+
+# 消息含这些词时，新闻模式走 LLM 解读而非原文透传
+_NEWS_ANALYSIS_TRIGGERS = ("解读", "分析", "影响", "怎么看", "意味着什么", "说明什么")
+
+# 新闻源内部名 → 展示名
+_NEWS_SOURCE_NAMES = {
+    "sina": "新浪", "eastmoney": "东方财富", "mcp": "新浪智研",
+    "cls": "财联社", "tushare": "Tushare",
+}
+
+# 重要性评分词表（词组, 分值）：超展示上限时按评分截断
+_NEWS_SCORE_WORDS = (
+    (("预增", "扭亏", "净利", "营收", "中标", "签约"), 3),            # 业绩词
+    (("政策", "国务院", "央行", "证监会", "工信部", "规划", "补贴"), 3),  # 政策词
+    (("涨停", "跌停", "大涨", "大跌", "创新高", "创新低"), 2),          # 异动词
+    (("增持", "回购", "减持", "并购", "重组", "上市"), 2),              # 公司行动词
+)
+
+
+def _news_importance(title: str) -> int:
+    """新闻重要性评分：命中一组词加对应分值，用于超限时截断排序。"""
+    score = 0
+    for words, pts in _NEWS_SCORE_WORDS:
+        if any(w in title for w in words):
+            score += pts
+    return score
+
+
+def _fmt_news_time(t: str) -> str:
+    """新闻时间统一显示为 MM-DD HH:mm；格式异常时原样截断返回。"""
+    t = (t or "").strip()
+    if len(t) >= 16 and t[4] == "-" and t[7] == "-":
+        return f"{t[5:10]} {t[11:16]}"
+    return t[:16]
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -716,7 +756,7 @@ class MarketReviewAgent:
         elif intent == "market_review":
             return await self._market_review(stream, context_note=context_note)
         elif intent == "news_only":
-            return await self._news_only(sector, stream)
+            return await self._news_only(sector, stream, message=user_message)
         elif intent == "stock_query":
             result = await self._stock_query(user_message, False)
         elif intent == "futures_query":
@@ -871,43 +911,22 @@ class MarketReviewAgent:
             result["content"] = _clean_markdown(await self._critique_and_revise(draft, user_prompt))
         return result
 
-    async def _news_only(self, sector: str, stream: bool):
-        """新闻专属模式：代码层按行业关键字精准过滤，48小时全覆盖。"""
+    async def _news_only(self, sector: str, stream: bool, message: str = ""):
+        """新闻专属模式：五源新闻池 + 行业关键词过滤，48小时尽量多展示。
+
+        - 数据层优先用 fetch_news_pool（五源聚合、跨源去重、时间已修复），
+          未就绪或调用失败时降级到旧三源直采逻辑。
+        - 行业过滤除标题外，同时匹配 time/content/summary 字段（有的话）。
+        - 展示策略：按天分组、按时间倒序；全市场查询每天上限30条（超限按重要性
+          评分截断），行业查询每天全量展示。
+        - message 含解读类触发词（解读/分析/影响/怎么看/意味着什么/说明什么）时
+          走 LLM 分析模式（NEWS_ANALYSIS_PROMPT）；否则非流式直接透传原文，
+          不经过 LLM 改写。
+        """
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
-        date_str = trade_date.strftime("%Y%m%d")
         date_display = trade_date.strftime("%Y年%m月%d日")
         weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
-
-        # 新闻模式：Sina每天50条，3天覆盖 + EM补最新
-        from agent.data_fetcher import fetch_sina_news as _sina, fetch_eastmoney_news as _em
-
-        # 每日期50条、重试2次 ≈ 50条/天 × 3天 = 150条
-        d0 = trade_date.strftime("%Y-%m-%d")
-        d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
-        d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
-
-        # 新闻数据并行拉取
-        from agent.data_fetcher import fetch_mcp_news as _mcp, fetch_sina_news as _s, fetch_eastmoney_news as _e
-        search_kw = sector if sector else "A股"
-        # 直接同步调用，不用线程池
-        mcp_items = _mcp(search_kw, 60)
-        em1 = _e(50)
-        all_sina = []
-        for news_date in [d0, d1, d2]:
-            # fetch_sina_news 的 page 参数内部硬编码为 1，每个日期只需调用一次
-            items = _s(50, news_date)
-            if items:
-                all_sina.extend(items)
-        # 按标题去重，避免同一新闻重复出现
-        seen_titles = set()
-        deduped_sina = []
-        for it in all_sina:
-            title_key = (it.get("title", "") or "").strip()
-            if title_key and title_key not in seen_titles:
-                seen_titles.add(title_key)
-                deduped_sina.append(it)
-        all_sina = deduped_sina
 
         # 申万31行业关键词（每个行业名+简称，用于新闻自动归类）
         SW_ALL_KEYWORDS = {
@@ -947,40 +966,103 @@ class MarketReviewAgent:
         by_date = defaultdict(list)
         label = f"{sector}板块" if sector else "全市场"
 
-        all_items = mcp_items + all_sina + (em1 or [])
-        for item in all_items:
-            t = (item.get("time", "") or "")[:10]
-            title = (item.get("title", "") or "").strip()
-            if not t or not title or len(title) < 4:
-                continue
-            if sector:
-                keywords = SW_ALL_KEYWORDS.get(sector, [sector])
-                if not any(kw in title for kw in keywords):
+        # ── 1. 数据采集：五源新闻池优先，未就绪/失败时降级到旧三源直采 ──
+        sources = self._collect_news_sources(sector, trade_date, SW_ALL_KEYWORDS)
+
+        # ── 2. 跨源去重 + 行业过滤 + 按天分组 ──
+        sector_kws = SW_ALL_KEYWORDS.get(sector, [sector]) if sector else None
+        seen_titles = set()
+        source_counts = {}  # 源 → 有效条数（过滤后）
+        for src in ("sina", "eastmoney", "mcp", "cls", "tushare"):
+            for item in sources.get(src) or []:
+                title = (item.get("title", "") or "").strip()
+                t = (item.get("time", "") or "")[:10]
+                if not t or not title or len(title) < 4:
                     continue
-            by_date[t].append(title)
+                if title in seen_titles:
+                    continue
+                if sector_kws:
+                    # 标题之外，content/summary/time 字段（有的话）也参与关键词匹配
+                    match_text = title + (item.get("content", "") or "") \
+                        + (item.get("summary", "") or "") + (item.get("time", "") or "")
+                    if not any(kw in match_text for kw in sector_kws):
+                        continue
+                seen_titles.add(title)
+                by_date[t].append({
+                    "title": title,
+                    "time": (item.get("time", "") or ""),
+                    "source": src,
+                })
+                source_counts[src] = source_counts.get(src, 0) + 1
 
-        total = sum(len(v) for v in by_date.values())
-        if total == 0:
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到与该行业相关的新闻。请尝试更宽泛的关键词，或查询\"全市场新闻\"。"
-        # MCP独家新闻块
-        mcp_block = ""
-        if mcp_items:
-            mcp_block = f"\n\n新浪智研快讯（关键字精准匹配，共{len(mcp_items)}条）:\n"
-            for it in mcp_items[:30]:
-                t = (it.get("time","") or "")[:16]
-                mcp_block += f"[{t}] {it.get('title','')}\n"
+        total_raw = sum(len(v) for v in by_date.values())
 
-        if total == 0 and not mcp_items:
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到相关新闻。"
+        # ── 3. 组装展示文本：按天分组、时间倒序、全市场每天上限30条 ──
+        if total_raw == 0:
+            if sector:
+                news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到与该行业相关的新闻。请尝试更宽泛的关键词，或查询\"全市场新闻\"。"
+            else:
+                news_text = f"{label}新闻汇总 — {date_display} {weekday}\n未找到相关新闻。"
         else:
-            news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{total}+{len(mcp_items)}条）\n"
-        for d in sorted(by_date.keys(), reverse=True):
-            items = sorted(by_date[d])
-            news_text += f"\n--- {d}（{len(items)}条）---\n"
-            for title in items:
-                news_text += f"[{d}] {title}\n"
-        news_text += mcp_block
+            day_cap = None if sector else 30  # 全市场每天上限30条，行业查询全量展示
+            truncated = False
+            display_total = 0
+            blocks = []
+            for d in sorted(by_date.keys(), reverse=True):
+                items = by_date[d]
+                raw_cnt = len(items)
+                if day_cap and raw_cnt > day_cap:
+                    # 超限：按重要性评分排序截断（同分按时间倒序）
+                    items = sorted(
+                        items,
+                        key=lambda x: (_news_importance(x["title"]), x["time"]),
+                        reverse=True,
+                    )[:day_cap]
+                    truncated = True
+                else:
+                    items = sorted(items, key=lambda x: x["time"], reverse=True)
+                display_total += len(items)
+                block = f"\n--- {d}（{len(items)}条"
+                if raw_cnt > len(items):
+                    block += f"，原始{raw_cnt}条按重要性截断"
+                block += "）---\n"
+                for it in items:
+                    src_name = _NEWS_SOURCE_NAMES.get(it["source"], it["source"])
+                    block += f"[{_fmt_news_time(it['time'])}] 【{src_name}】{it['title']}\n"
+                blocks.append(block)
 
+            # 头部：总条数、覆盖时间段、各源条数
+            all_times = [it["time"] for v in by_date.values() for it in v if it["time"]]
+            span = ""
+            if all_times:
+                span = f"覆盖{_fmt_news_time(min(all_times))}~{_fmt_news_time(max(all_times))}"
+            src_stat = " / ".join(
+                f"{_NEWS_SOURCE_NAMES.get(s, s)}{source_counts[s]}条"
+                for s in ("sina", "eastmoney", "mcp", "cls", "tushare")
+                if source_counts.get(s)
+            )
+            news_text = f"{label}新闻汇总 — {date_display} {weekday}（48小时覆盖，共{display_total}条）\n"
+            meta_parts = [p for p in (span, f"来源：{src_stat}" if src_stat else "") if p]
+            if truncated:
+                meta_parts.append("单日超30条已按重要性截断")
+            if meta_parts:
+                news_text += " | ".join(meta_parts) + "\n"
+            news_text += "".join(blocks)
+
+        # ── 4. 分析模式：消息含解读类触发词且有新闻时，走 LLM 解读而非透传 ──
+        analysis_mode = (
+            bool(message) and total_raw > 0
+            and any(w in message for w in _NEWS_ANALYSIS_TRIGGERS)
+        )
+        if analysis_mode:
+            system = get_system_prompt("news_analysis")
+            user_prompt = (
+                f"{news_text}\n\n以上是{label}近48小时新闻清单。请按系统提示的框架输出解读，"
+                "只分析清单内的新闻条目，清单未覆盖的写「本期新闻未覆盖」。"
+            )
+            return await self._call_llm(system, user_prompt, stream)
+
+        # 透传模式：非流式直接返回原文，不经过 LLM 改写
         system = "你是财经新闻编辑。将以下新闻汇总原样输出。不删减、不分析、不改格式。"
         user_prompt = f"{news_text}\n\n以上{label}48小时新闻汇总。原样输出。"
 
@@ -988,6 +1070,54 @@ class MarketReviewAgent:
         if not stream and isinstance(result, dict):
             result["content"] = news_text
         return result
+
+    def _collect_news_sources(self, sector: str, trade_date: datetime, sw_keywords: dict) -> dict:
+        """新闻采集：优先 fetch_news_pool 五源聚合，未就绪/失败时降级到旧三源直采。
+
+        返回统一结构 {'sina','eastmoney','mcp','cls','tushare'} → 条目列表，
+        每条至少含 {'title','time'}，部分源可能带 content/summary 字段。
+        """
+        sector_kws = sw_keywords.get(sector, [sector]) if sector else None
+        try:
+            from agent.data_fetcher import fetch_news_pool as _pool
+        except ImportError as e:
+            logger.warning("fetch_news_pool 未就绪，新闻模式降级到旧三源逻辑: %s", e)
+            _pool = None
+        if _pool is not None:
+            try:
+                pool = _pool(sector_keywords=sector_kws, days=3)
+                if isinstance(pool, dict):
+                    return {k: (pool.get(k) or []) for k in ("sina", "eastmoney", "mcp", "cls", "tushare")}
+                logger.warning("fetch_news_pool 返回非dict，降级到旧三源逻辑: %r", pool)
+            except Exception as e:
+                logger.warning("fetch_news_pool 调用失败，降级到旧三源逻辑: %s", e, exc_info=True)
+
+        # 旧三源直采：Sina 每天50条×3天覆盖 + EM补最新 + 智研快讯
+        from agent.data_fetcher import (
+            fetch_sina_news as _s,
+            fetch_eastmoney_news as _e,
+            fetch_mcp_news as _m,
+        )
+        search_kw = sector if sector else "A股"
+        mcp_items = _m(search_kw, 60)
+        em_items = _e(50)
+        d0 = trade_date.strftime("%Y-%m-%d")
+        d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
+        all_sina = []
+        for news_date in [d0, d1, d2]:
+            # fetch_sina_news 的 page 参数内部硬编码为 1，每个日期只需调用一次
+            items = _s(50, news_date)
+            if items:
+                all_sina.extend(items)
+        return {
+            "sina": all_sina,
+            "eastmoney": em_items or [],
+            "mcp": mcp_items or [],
+            "cls": [],
+            "tushare": [],
+        }
+
 
     async def _stock_query(self, message: str, stream: bool):
         """个股查询——中文名本地映射，不走搜索API。"""

@@ -289,8 +289,9 @@ def fetch_tushare_news(date: str, limit: int = 25) -> list:
                     "title": str(row.get("title", "")),
                     "content": str(row.get("content", ""))[:300],
                 })
-    except Exception:
-        pass
+    except Exception as e:
+        # 常见原因：token 无 news 接口权限，降级尝试 sina 源
+        logger.warning("Tushare 新闻(cls源)获取失败: %s", str(e)[:120])
 
     # 如果 CLS 源为空，尝试其他源
     if not items:
@@ -304,8 +305,8 @@ def fetch_tushare_news(date: str, limit: int = 25) -> list:
                         "title": str(row.get("title", "")),
                         "content": str(row.get("content", ""))[:300],
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Tushare 新闻(sina源)获取失败: %s", str(e)[:120])
 
     return items
 
@@ -877,89 +878,250 @@ def fetch_northbound_flow() -> list:
     return items
 
 
+def _fmt_news_time(raw, fallback: str = "") -> str:
+    """新闻时间归一化：epoch 秒/毫秒 → 'YYYY-MM-DD HH:MM:SS'，其余原样截断。
+
+    raw 为空时返回 fallback（通常为当天日期），保证前端不出现空时间括号。
+    """
+    if raw is None or raw == "":
+        return fallback
+    s = str(raw).strip()
+    if not s:
+        return fallback
+    # 纯数字按 epoch 处理（新浪/财联社接口返回 unix 时间戳）
+    if s.isdigit():
+        try:
+            ts = int(s)
+            if ts > 1e12:  # 毫秒时间戳
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OverflowError, OSError) as e:
+            logger.warning("新闻时间戳解析失败: %s (%s)", s, e)
+            return fallback
+    return s[:19]
+
+
 def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
-    """新浪智研MCP新闻搜索。"""
+    """新浪智研MCP新闻搜索。复用通用 _mcp_call 通道。"""
     items = []
-    token = _env("SINA_MCP_TOKEN", "")
-    if not token:
+    if not _env("SINA_MCP_TOKEN", ""):
         return items
     try:
-        base = "https://mcp.finance.sina.com.cn/mcp-http"
-        r = requests.post(f"{base}?token={token}", json={
-            "jsonrpc":"2.0","method":"initialize","id":1,
-            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
-        }, timeout=15)
-        sid = r.headers.get("Mcp-Session-Id","")
-        if not sid:
+        parsed = _mcp_call("qNewsSearch", {"keyword": keyword, "num": min(20, limit), "page": 1})
+        if not parsed:
             return items
-        r2 = requests.post(f"{base}?token={token}", json={
-            "jsonrpc":"2.0","method":"tools/call","id":2,
-            "params":{"name":"qNewsSearch","arguments":{"keyword":keyword,"num":min(20,limit),"page":1}}
-        }, headers={"Mcp-Session-Id":sid}, timeout=30)
-        d = r2.json()
-        content = d.get("result",{}).get("content",[])
-        if content and isinstance(content,list):
-            text = content[0].get("text","")
-            if text:
-                parsed = json.loads(text)
-                news_list = parsed.get("result",{}).get("data",{}).get("data",[])
-                if not news_list:
-                    news_list = parsed.get("data",{}).get("data",[])
-                for nd in news_list:
-                    title = nd.get("title","") or nd.get("content","")[:80]
-                    if title:
-                        items.append({"source":"智研","time":str(nd.get("ctime",""))[:16],"title":title})
-    except Exception:
-        pass
+        news_list = parsed.get("result",{}).get("data",{}).get("data",[])
+        if not news_list:
+            news_list = parsed.get("data",{}).get("data",[])
+        # 该接口实测只返回 title/content，不带时间字段；
+        # 先尽力解析常见时间字段，全部缺失时降级为当天日期，避免前端显示空括号 []
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for nd in news_list:
+            title = nd.get("title","") or nd.get("content","")[:80]
+            if not title:
+                continue
+            raw_time = ""
+            for tf in ("ctime", "mtime", "pubtime", "time", "create_time", "pub_date", "date"):
+                if nd.get(tf):
+                    raw_time = nd.get(tf)
+                    break
+            items.append({"source":"智研","time":_fmt_news_time(raw_time, today_str),"title":title})
+    except Exception as e:
+        logger.warning("智研MCP新闻解析失败: %s", e)
     return items
 
 
 def fetch_sina_news(limit: int = 20, date_str: str = "") -> list:
-    """新浪财经历史新闻（支持按日期查询）。"""
-    items = []
-    try:
-        import re
-        url = "https://feed.mix.sina.com.cn/api/roll/get"
-        params = {"pageid": 153, "lid": 2509, "k": "", "num": limit, "page": 1}
-        if date_str:
-            params["date"] = date_str
-        resp = requests.get(url, params=params, timeout=15,
-                          headers={"User-Agent": "Mozilla/5.0"})
-        data = resp.json()
-        for item in data.get("result", {}).get("data", [])[:limit]:
-            title = re.sub(r'<[^>]+>', '', item.get("title", ""))
-            items.append({
-                "source": "新浪财经",
-                "time": date_str if date_str else item.get("ctime", ""),
-                "title": title[:150],
-            })
-    except Exception:
-        pass
-    return items
+    """新浪财经历史新闻（支持按日期查询）。
+
+    接口单页上限 50 条；limit > 50 时自动翻第 2 页（页间 sleep 防限流），
+    单日最多可取 100 条。第 2 页失败时降级保留第 1 页结果。
+    """
+    import re
+
+    def _fetch_page(page: int, num: int) -> list:
+        """拉取单页新闻，失败返回空列表。"""
+        page_items = []
+        try:
+            url = "https://feed.mix.sina.com.cn/api/roll/get"
+            params = {"pageid": 153, "lid": 2509, "k": "", "num": num, "page": page}
+            if date_str:
+                params["date"] = date_str
+            resp = requests.get(url, params=params, timeout=15,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            data = resp.json()
+            for item in data.get("result", {}).get("data", [])[:num]:
+                title = re.sub(r'<[^>]+>', '', item.get("title", ""))
+                page_items.append({
+                    "source": "新浪财经",
+                    # 按日期查询时直接用日期；否则把 epoch ctime 格式化为可读时间
+                    "time": date_str if date_str else _fmt_news_time(item.get("ctime", "")),
+                    "title": title[:150],
+                })
+        except Exception as e:
+            logger.warning("新浪新闻第%d页获取失败: %s", page, e)
+        return page_items
+
+    # 第 1 页（接口 num 上限 50，超出无效）
+    items = _fetch_page(1, min(limit, 50))
+
+    # limit > 50 时翻第 2 页补齐（最多再取 50 条）
+    if limit > 50 and items:
+        time.sleep(0.3)  # 轻微限速，避免触发新浪接口限流
+        page2 = _fetch_page(2, min(limit - 50, 50))
+        items.extend(page2)
+
+    return items[:limit]
+
+
+def _cls_sign(params: dict) -> str:
+    """财联社接口签名：参数按 key 排序 → key=value& 拼接 → SHA-1 → MD5。"""
+    import hashlib
+    raw = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    return hashlib.md5(hashlib.sha1(raw.encode()).hexdigest().encode()).hexdigest()
 
 
 def fetch_cls_telegraph(limit: int = 20) -> list:
-    """财联社电报（备用）。"""
+    """财联社电报（7x24 快讯）。
+
+    旧接口 /api/sw 已下线（404），现行接口为 /api/cache?name=telegraphList
+    （签名算法对照 RSSHub lib/routes/cls，财联社再改版时照它更新）。
+    单页固定返回约 20 条，通过 last_time 翻页直到凑满 limit（最多 5 页）。
+    """
     items = []
     try:
-        resp = requests.post(
-            "https://www.cls.cn/api/sw",
-            json={"type": "telegram", "page": 1, "limit": limit,
-                  "last_time": int(datetime.now().timestamp())},
-            headers={"Content-Type": "application/json", "Referer": "https://www.cls.cn/telegraph"},
-            timeout=15,
-        )
-        data = resp.json()
-        for item in data.get("data", {}).get("roll_data", [])[:limit]:
-            items.append({
-                "source": "财联社电报",
-                "time": item.get("ctime", ""),
-                "title": item.get("title", ""),
-                "brief": str(item.get("brief", ""))[:200],
+        last_time = int(datetime.now().timestamp())
+        max_pages = min(5, (limit + 19) // 20)  # 每页约 20 条
+        for _ in range(max_pages):
+            params = {
+                "app": "CailianpressWeb", "name": "telegraphList",
+                "last_time": str(last_time), "os": "web", "rn": "20", "sv": "8.7.9",
+            }
+            params["sign"] = _cls_sign(params)
+            resp = requests.get(
+                "https://www.cls.cn/api/cache", params=params,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.cls.cn/"},
+                timeout=15,
+            )
+            data = resp.json()
+            if data.get("errno") != 0:
+                logger.warning("财联社电报接口返回错误: errno=%s msg=%s",
+                               data.get("errno"), str(data.get("msg"))[:100])
+                break
+            roll = data.get("data", {}).get("roll_data", [])
+            if not roll:
+                break
+            for item in roll:
+                # 快讯类电报 title 常为空，降级用 brief 摘要前 80 字
+                title = item.get("title", "") or str(item.get("brief", ""))[:80]
+                if not title:
+                    continue
+                items.append({
+                    "source": "财联社电报",
+                    # ctime 为 epoch 秒，统一格式化为可读时间
+                    "time": _fmt_news_time(item.get("ctime", "")),
+                    "title": title,
+                    "brief": str(item.get("brief", ""))[:200],
+                })
+            if len(items) >= limit:
+                break
+            # 用本页最旧一条的 ctime 作为下一页翻页锚点，轻微限速防限流
+            last_time = min(int(it.get("ctime", last_time)) for it in roll)
+            time.sleep(0.3)
+    except Exception as e:
+        logger.warning("财联社电报获取失败: %s", e)
+    return items[:limit]
+
+
+def fetch_news_pool(sector_keywords: list = None, days: int = 3) -> dict:
+    """统一新闻聚合池：并行拉取 5 个新闻源，跨源按标题去重。
+
+    参数：
+        sector_keywords: 行业关键词列表，首个关键词用作智研 MCP 搜索词（缺省 "A股"）
+        days: 新浪/Tushare 回溯天数（每天各拉取一次，覆盖 48 小时以上）
+
+    返回：
+        {'sina': [...], 'eastmoney': [...], 'mcp': [...], 'cls': [...], 'tushare': [...]}
+        每条统一为 {'title': str, 'time': str, 'source': str}；
+        单源失败只降级为该源空列表，不影响其他源。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    search_kw = sector_keywords[0] if sector_keywords else "A股"
+
+    # 回溯日期列表：今天起往前 days 天（新浪用 YYYY-MM-DD，Tushare 用 YYYYMMDD）
+    today = datetime.now()
+    date_list = [(today - timedelta(days=i)) for i in range(days)]
+
+    def _job_sina():
+        """新浪：每天最多 100 条（内部自动翻页），逐日串行避免触发限流。"""
+        pool = []
+        for d in date_list:
+            pool.extend(fetch_sina_news(100, d.strftime("%Y-%m-%d")))
+        return pool
+
+    def _job_eastmoney():
+        """东方财富：7x24 实时快讯第 1 页。"""
+        return fetch_eastmoney_news(50)
+
+    def _job_mcp():
+        """智研 MCP：按关键词搜索快讯。"""
+        return fetch_mcp_news(search_kw, 60)
+
+    def _job_cls():
+        """财联社电报：实时滚动。"""
+        return fetch_cls_telegraph(50)
+
+    def _job_tushare():
+        """Tushare 新闻：逐日拉取。"""
+        pool = []
+        for d in date_list:
+            pool.extend(fetch_tushare_news(d.strftime("%Y%m%d"), 40))
+        return pool
+
+    jobs = {
+        "sina": _job_sina,
+        "eastmoney": _job_eastmoney,
+        "mcp": _job_mcp,
+        "cls": _job_cls,
+        "tushare": _job_tushare,
+    }
+
+    # 并行拉取；单源异常只记日志并降级为空列表
+    raw = {name: [] for name in jobs}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {executor.submit(fn): name for name, fn in jobs.items()}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                raw[name] = future.result() or []
+            except Exception as e:
+                logger.warning("新闻池源 %s 拉取失败，已降级为空: %s", name, e)
+                raw[name] = []
+
+    # 统一为 {'title','time','source'} 并跨源按标题去重
+    # 优先级：实时源（东财/财联社）在前，保证重复新闻保留时间更准的一条
+    today_str = today.strftime("%Y-%m-%d")
+    seen_titles = set()
+    pool = {}
+    for name in ("eastmoney", "cls", "mcp", "sina", "tushare"):
+        unified = []
+        for it in raw[name]:
+            title = (it.get("title", "") or "").strip()
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
+            unified.append({
+                "title": title,
+                "time": _fmt_news_time(it.get("time", ""), today_str),
+                "source": it.get("source", "") or name,
             })
-    except Exception:
-        pass
-    return items
+        pool[name] = unified
+
+    total = sum(len(v) for v in pool.values())
+    logger.info("新闻池聚合完成: %s，共 %d 条（去重后）",
+                {k: len(v) for k, v in pool.items()}, total)
+    return pool
 
 
 # ═══════════════════════════════════════════
