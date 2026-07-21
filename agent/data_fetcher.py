@@ -625,6 +625,30 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
 # 缓存 MCP 工具列表
 _mcp_tools_cache = None
 
+def _mcp_tool_schema_entry(tool: dict) -> dict:
+    """从 MCP 工具的 inputSchema 提取精简 schema。
+
+    properties 保留 type/description（单参数描述截断 300 字）/enum，
+    外加 required 列表（只保留真实存在于 properties 中的参数名）。
+    供 DeepSeek function calling 构建 parameters 使用——根因修复：
+    旧链路丢弃了参数描述与枚举，模型不知道 source 只能填 lrb/gjzb 等。
+    """
+    schema = tool.get("inputSchema") or {}
+    raw_props = schema.get("properties") or {}
+    props = {}
+    for pname, spec in raw_props.items():
+        if not isinstance(spec, dict):
+            spec = {}
+        entry = {"type": spec.get("type") or "string"}
+        desc = str(spec.get("description") or "")[:300]
+        if desc:
+            entry["description"] = desc
+        if isinstance(spec.get("enum"), list):
+            entry["enum"] = spec["enum"]
+        props[pname] = entry
+    required = [p for p in (schema.get("required") or []) if p in props]
+    return {"properties": props, "required": required}
+
 def get_mcp_tools() -> list:
     """获取所有可用MCP工具列表。"""
     global _mcp_tools_cache
@@ -646,7 +670,8 @@ def get_mcp_tools() -> list:
             }, headers={"Mcp-Session-Id":sid}, timeout=15)
             tools = r2.json().get("result",{}).get("tools",[])
             _mcp_tools_cache = [{"name":t["name"],"desc":t.get("description","")[:200],
-                                "params":list(t.get("inputSchema",{}).get("properties",{}).keys())}
+                                "params":list(t.get("inputSchema",{}).get("properties",{}).keys()),
+                                "schema":_mcp_tool_schema_entry(t)}
                               for t in tools]
             return _mcp_tools_cache
     except Exception as e:

@@ -177,6 +177,32 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
   tests/test_mcp_result_tools.py 41 用例、tests/test_output_hygiene.py
   61 用例；全部 mock 零网络）。
 
+### 2026-07-22 追加：_generic_mcp 财报参数枚举丢失根因修复
+
+- 根因（实测确认）：function calling 链路丢弃 MCP 工具 inputSchema 的
+  参数文档。data_fetcher.get_mcp_tools 只留 name/desc(截200)/params(纯参数名)，
+  orchestrator._generic_mcp 构建 ds_tools 时参数描述=参数名本身；模型调
+  cnFinanceReportsFull 不知道 source 只能填 lrb/fzb/llb/gjzb/zxzb，瞎填
+  "1"/"sina" → code=11 Input error → 用户看到「财务指标暂未获取」全占位符。
+  同因曾致 hkFinanceReportsByIndex 报错。工具本身无恙（正确参数实测返回
+  21KB 完整财报）。
+- 方案：
+  - get_mcp_tools 缓存条目新增 schema 键（properties 保留 type/
+    description≤300字/enum + required 列表，剔除不在 properties 中的
+    required 项）；name/desc/params 旧键不变兼容其他调用方。
+  - _generic_mcp ds_tools 改用真实 schema 构建 parameters（含 required）；
+    无 schema 键或 properties 为空的旧缓存条目防御式降级回原 params 逻辑。
+  - _GENERIC_MCP_SYSTEM_PROMPT 补一句：财报类工具严格按枚举填参，
+    A股财务指标推荐链路 cnFinanceReportDateList 拿报告期 →
+    cnFinanceReportsFull(source=gjzb 等枚举) 取数。
+- 实测：真实链路跑「查询西麦食品近期的财务指标」——模型调用序列
+  globalStockSearchSymbols → cnFinanceReportDateList →
+  cnFinanceReportsFull(source="gjzb")×多报告期（+利润表 lrb），返回含
+  营业总收入 18.96亿(+20.16%)、归母净利 1.33亿(+15.36%) 等真实数据。
+- 测试：902 passed 全绿（新增 tests/test_mcp_tool_schema.py 7 用例：
+  schema 保留/300字截断/无 inputSchema 兜底/真实 schema 构建/
+  旧格式降级×2/端到端枚举填参；mock tools/list 零网络）。
+
 ## 已知问题
 
 - Tushare news 接口无权限（积分不足），新闻池 tushare 源恒为空，已安全降级

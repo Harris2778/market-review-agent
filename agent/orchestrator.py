@@ -906,6 +906,9 @@ _GENERIC_MCP_SYSTEM_PROMPT = (
     "禁止使用#和*号。数据用缩进对齐或列表呈现。\n"
     "搜索类工具返回多个候选代码时，必须选用与用户公司名完全匹配的那一条，"
     "不要用名称近似的其他公司凑合。\n"
+    "调用财报类工具时严格按参数枚举值填参，不要编造枚举外的取值。"
+    "查询A股财务指标的推荐链路：先用 cnFinanceReportDateList 拿报告期，"
+    "再用 cnFinanceReportsFull（source 填 gjzb/lrb/fzb/llb/zxzb 等枚举值）取数。\n"
     "工具返回错误或空数据时，不要反复重试同一个工具；最多换参数重试一次，"
     "仍拿不到就基于已经拿到的数据回答，或如实说明该项数据暂缺。"
 )
@@ -1710,15 +1713,24 @@ class MarketReviewAgent:
         # 转成OpenAI function calling格式
         ds_tools = []
         for t in tools[:80]:
-            props = {}
-            for p in t.get("params", [])[:5]:
-                props[p] = {"type": "string", "description": p}
+            schema = t.get("schema")
+            if isinstance(schema, dict) and schema.get("properties"):
+                # 新缓存格式：真实 inputSchema（含参数描述/枚举/required）
+                parameters = {"type": "object", "properties": schema["properties"]}
+                if schema.get("required"):
+                    parameters["required"] = schema["required"]
+            else:
+                # 旧缓存格式降级：只有参数名列表，描述退回参数名本身
+                props = {}
+                for p in t.get("params", [])[:5]:
+                    props[p] = {"type": "string", "description": p}
+                parameters = {"type": "object", "properties": props}
             ds_tools.append({
                 "type": "function",
                 "function": {
                     "name": t["name"],
                     "description": t.get("desc", "")[:200],
-                    "parameters": {"type": "object", "properties": props}
+                    "parameters": parameters
                 }
             })
 
