@@ -154,8 +154,18 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
                 return ("sector_deep_dive", sector)
 
     # 全市场复盘
+    # 简单数据查询 → MCP而非完整复盘
+    simple_data_patterns = [
+        r"(多少|几家|哪些|排名|前\d|列表|列出|查询|查一下|帮我查)",
+        r"^(今天|今日|昨天|当前).{0,10}(涨跌|上涨|下跌|涨停|跌停|热搜|北向)",
+    ]
+    is_simple = any(re.search(p, msg) for p in simple_data_patterns)
+    is_not_review = not any(kw in msg for kw in ["复盘","分析","总结","回顾","报告","日报","怎么样","如何","走势","行情"])
+
     for kw in MARKET_REVIEW_KEYWORDS:
         if kw in msg:
+            if is_simple and is_not_review:
+                return ("mcp_query", msg)  # 简单查询走MCP
             return ("market_review", None)
 
     for pattern in MARKET_REVIEW_PATTERNS:
@@ -369,7 +379,7 @@ class MarketReviewAgent:
             return await self._stock_query(message, stream)
         elif intent == "futures_query":
             return await self._futures_query(message, stream)
-        elif intent == "fund_query":
+        elif intent == "fund_query" or intent == "mcp_query":
             return await self._fund_query(message, stream)
         else:
             return await self._sector_deep_dive(sector, stream)
@@ -601,7 +611,7 @@ class MarketReviewAgent:
 2. 可以多轮调用，每轮一个工具。拿到数据后如果需要更多数据，继续调用。
 3. 所有数据收集完毕后输出done。
 4. 如果用户问的问题超出数据范围，直接输出done说明能力边界。
-5. 不要编造数据。无数据就说无数据。"""
+5. 绝对禁止编造数据！如果工具返回空或无结果，必须如实说"暂无数据"。禁止用训练数据中的历史信息冒充实时数据。"""
 
         context = f"用户问题: {message}"
         all_results = []
