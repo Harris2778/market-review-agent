@@ -532,10 +532,16 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
                 return json.loads(text)
             except:
                 pass
-            # 格式2: var xxx="csv,data" → 提取数据部分
+            # 格式2: var xxx="csv,data" 或 HTML/纯文本
             if "var " in text and "=\"" in text:
                 csv = text.split('="')[1].split('"')[0] if '="' in text else text
                 return {"raw": csv, "type": "csv"}
+            # 格式3: 纯文本 → 尝试当JSON，失败则包起来
+            if text.strip().startswith("{") or text.strip().startswith("["):
+                try:
+                    return json.loads(text)
+                except:
+                    return {"raw": text, "type": "text"}
             return {"raw": text, "type": "text"}
     except Exception:
         pass
