@@ -332,7 +332,7 @@ class MarketReviewAgent:
 
 {market_data}
 
-生成A股市场复盘。所有新闻全部列出。31行业全部列出。数据缺失标[UNSOURCED]。"""
+生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失标[UNSOURCED]。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
@@ -360,7 +360,7 @@ class MarketReviewAgent:
 
 {market_data}
 
-深度分析{sector}板块。相关新闻节只列5条最重要的标题即可。需要完整新闻列表请用户说\"{sector}板块新闻\"。"""
+深度分析{sector}板块。不列出新闻。如需新闻请用户说\"{sector}板块新闻\"。"""
 
         return await self._call_llm(system, user_prompt, stream)
 
