@@ -671,6 +671,127 @@ def fetch_futures_quote(market: str, symbol: str) -> dict:
     return {"price": data.get("price",""), "pct": data.get("change_pct",""), "volume": data.get("volume","")}
 
 
+def fetch_financials(code: str) -> dict:
+    """个股三大报表。"""
+    pro = _get_pro()
+    if not pro:
+        return {}
+    result = {}
+    for name, fn in [("利润表", pro.income), ("资产负债表", pro.balancesheet), ("现金流量表", pro.cashflow)]:
+        try:
+            df = fn(ts_code=code, start_date="20260101", end_date="20260630")
+            if df is not None and not df.empty:
+                result[name] = df.iloc[0].to_dict()
+        except Exception:
+            pass
+    return result
+
+
+def fetch_forecast(date: str = "") -> list:
+    """业绩预告。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    d = date or datetime.now().strftime("%Y%m%d")
+    try:
+        df = pro.forecast(ann_date=d)
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "type": r.get("type",""), "p_min": r.get("p_change_min",""), "p_max": r.get("p_change_max","")} for _, r in df.head(20).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_express(date: str = "") -> list:
+    """业绩快报。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    d = date or datetime.now().strftime("%Y%m%d")
+    try:
+        df = pro.express(ann_date=d)
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "revenue": r.get("revenue",""), "profit": r.get("operate_profit","")} for _, r in df.head(20).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_block_trades(code: str = "", date: str = "") -> list:
+    """大宗交易。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    d = date or datetime.now().strftime("%Y%m%d")[:6] + "01"
+    try:
+        df = pro.block_trade(ts_code=code, start_date=d, end_date=date or datetime.now().strftime("%Y%m%d")) if code else pro.block_trade(start_date=d, end_date=date or datetime.now().strftime("%Y%m%d"))
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "date": r.get("trade_date",""), "price": r.get("price",""), "amount": r.get("amount","")} for _, r in df.head(20).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_fund_list(market: str = "E") -> list:
+    """基金列表。market: E(ETF)/O(开放式)/F(封闭式)"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    try:
+        df = pro.fund_basic(market=market)
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "name": r["name"], "type": r.get("fund_type",""), "company": r.get("management","")} for _, r in df.head(50).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_ggt_daily() -> list:
+    """港股通每日资金流向。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    try:
+        today = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        df = pro.ggt_daily(start_date=start, end_date=today)
+        if df is not None and not df.empty:
+            return [{"date": r["trade_date"], "buy": r.get("buy_amount",""), "sell": r.get("sell_amount","")} for _, r in df.iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_repurchase(date: str = "") -> list:
+    """股票回购。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    d = date or datetime.now().strftime("%Y%m%d")
+    try:
+        df = pro.repurchase(ann_date=d)
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "vol": r.get("vol",""), "proc": r.get("proc","")} for _, r in df.head(20).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
+def fetch_share_float(date: str = "") -> list:
+    """限售解禁。"""
+    pro = _get_pro()
+    if not pro:
+        return []
+    d = date or datetime.now().strftime("%Y%m%d")
+    try:
+        df = pro.share_float(ann_date=d)
+        if df is not None and not df.empty:
+            return [{"code": r["ts_code"], "date": r.get("float_date",""), "share": r.get("float_share",""), "ratio": r.get("float_ratio","")} for _, r in df.head(20).iterrows()]
+    except Exception:
+        pass
+    return []
+
+
 def fetch_fund_info(symbol: str) -> dict:
     """基金档案。"""
     d = _mcp_call("fund_info", {"symbol": symbol})
@@ -1349,7 +1470,9 @@ async def collect_market_snapshot(
         "us_breadth": loop.run_in_executor(None, fetch_us_breadth),
         "limit_up": loop.run_in_executor(None, fetch_limit_up_pool),
         "lian_ban": loop.run_in_executor(None, fetch_lian_ban),
-        "us_fund": loop.run_in_executor(None, fetch_us_fund_flow),
+        "ggt": loop.run_in_executor(None, fetch_ggt_daily),
+        "repurchase": loop.run_in_executor(None, fetch_repurchase, date),
+        "share_float": loop.run_in_executor(None, fetch_share_float, date),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1382,7 +1505,9 @@ async def collect_market_snapshot(
     snapshot._hk_sec = safe(results_raw.get("hk_sec"), [])
     snapshot._limit_up = safe(results_raw.get("limit_up"), [])
     snapshot._lian_ban = safe(results_raw.get("lian_ban"), [])
-    snapshot._us_fund = safe(results_raw.get("us_fund"), [])
+    snapshot._ggt = safe(results_raw.get("ggt"), [])
+    snapshot._repurchase = safe(results_raw.get("repurchase"), [])
+    snapshot._share_float = safe(results_raw.get("share_float"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1619,6 +1744,20 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("### 连板个股")
         for s in lian_ban[:8]:
             lines.append(f"- {s['name']}({s['code']}) {s.get('count','')}连板")
+    ggt = getattr(snapshot, "_ggt", [])
+    if ggt:
+        latest = ggt[-1]
+        lines.append(f"### 港股通资金流向 买入{latest.get('buy','?')} 卖出{latest.get('sell','?')}")
+    rep = getattr(snapshot, "_repurchase", [])
+    if rep:
+        lines.append(f"### 今日回购（{len(rep)}只）")
+        for r in rep[:8]:
+            lines.append(f"- {r['code']} 回购{r.get('vol','?')}万股")
+    sf = getattr(snapshot, "_share_float", [])
+    if sf:
+        lines.append(f"### 近期限售解禁（{len(sf)}只）")
+        for r in sf[:8]:
+            lines.append(f"- {r['code']} {r.get('date','?')} 解禁{r.get('share','?')}万股")
 
     # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
