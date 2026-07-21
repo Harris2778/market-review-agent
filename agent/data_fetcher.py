@@ -1470,9 +1470,13 @@ async def collect_market_snapshot(
         "us_breadth": loop.run_in_executor(None, fetch_us_breadth),
         "limit_up": loop.run_in_executor(None, fetch_limit_up_pool),
         "lian_ban": loop.run_in_executor(None, fetch_lian_ban),
+        "forecast": loop.run_in_executor(None, fetch_forecast, date),
+        "express": loop.run_in_executor(None, fetch_express, date),
+        "block": loop.run_in_executor(None, fetch_block_trades, "", date),
         "ggt": loop.run_in_executor(None, fetch_ggt_daily),
         "repurchase": loop.run_in_executor(None, fetch_repurchase, date),
         "share_float": loop.run_in_executor(None, fetch_share_float, date),
+        "funds": loop.run_in_executor(None, fetch_fund_list, "E"),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1505,9 +1509,13 @@ async def collect_market_snapshot(
     snapshot._hk_sec = safe(results_raw.get("hk_sec"), [])
     snapshot._limit_up = safe(results_raw.get("limit_up"), [])
     snapshot._lian_ban = safe(results_raw.get("lian_ban"), [])
+    snapshot._forecast = safe(results_raw.get("forecast"), [])
+    snapshot._express = safe(results_raw.get("express"), [])
+    snapshot._block = safe(results_raw.get("block"), [])
     snapshot._ggt = safe(results_raw.get("ggt"), [])
     snapshot._repurchase = safe(results_raw.get("repurchase"), [])
     snapshot._share_float = safe(results_raw.get("share_float"), [])
+    snapshot._funds = safe(results_raw.get("funds"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1758,6 +1766,21 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append(f"### 近期限售解禁（{len(sf)}只）")
         for r in sf[:8]:
             lines.append(f"- {r['code']} {r.get('date','?')} 解禁{r.get('share','?')}万股")
+    fc = getattr(snapshot, "_forecast", [])
+    if fc:
+        lines.append(f"### 今日业绩预告（{len(fc)}只）")
+        for r in fc[:8]:
+            lines.append(f"- {r['code']} {r.get('type','?')} 变动{r.get('p_min','?')}%~{r.get('p_max','?')}%")
+    ex = getattr(snapshot, "_express", [])
+    if ex:
+        lines.append(f"### 今日业绩快报（{len(ex)}只）")
+        for r in ex[:8]:
+            lines.append(f"- {r['code']} 营收{r.get('revenue','?')} 利润{r.get('profit','?')}")
+    bt = getattr(snapshot, "_block", [])
+    if bt:
+        lines.append(f"### 今日大宗交易（{len(bt)}笔）")
+        for r in bt[:8]:
+            lines.append(f"- {r['code']} {r.get('date','?')} 成交{r.get('amount','?')}万元")
 
     # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
