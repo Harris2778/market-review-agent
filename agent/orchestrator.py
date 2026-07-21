@@ -615,7 +615,10 @@ class MarketReviewAgent:
                 }
             })
 
-        messages = [{"role": "user", "content": message}]
+        messages = [
+            {"role": "system", "content": "你是数据查询助手。用纯文本回答，禁止Markdown表格（禁止|和-组成的表格线）。数据用缩进对齐或列表呈现。"},
+            {"role": "user", "content": message}
+        ]
         all_results = []
 
         for _ in range(max_rounds):
