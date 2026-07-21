@@ -248,6 +248,43 @@ def _clean_markdown(text: str) -> str:
     return text
 
 
+def _format_all_news(snapshot, date_display: str) -> str:
+    """新闻专属模式：全量48h，不过滤。"""
+    lines = [f"48小时新闻全覆盖 — {date_display}及前一天"]
+    lines.append("")
+
+    # 新浪历史（交易日+前日，各30条，共60条）
+    sina = snapshot.news_items.get("sina", [])
+    if sina:
+        # 按日期分组
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for item in sina:
+            t = item.get("time", "")[:10]
+            by_date[t].append(item.get("title", ""))
+        for d in sorted(by_date.keys(), reverse=True):
+            lines.append(f"--- {d} ---")
+            for title in by_date[d]:
+                lines.append(f"[{d}] {title}")
+        lines.append("")
+
+    # 东方财富实时（最新补全）
+    em = snapshot.news_items.get("eastmoney", [])
+    if em:
+        em_dedup = []
+        seen = set()
+        for item in sorted(em, key=lambda x: x.get("time", "")):
+            key = item.get("title", "")[:60]
+            if key not in seen:
+                seen.add(key)
+                em_dedup.append(item)
+        lines.append(f"--- 实时快讯 ---")
+        for item in em_dedup[:40]:
+            lines.append(f"[{item['time']}] {item['title']}")
+
+    return "\n".join(lines)
+
+
 def _format_multi_day_news(snapshot, sector, date_str) -> str:
     """预格式化多日新闻，LLM无法跳过，直接注入prompt。"""
     from datetime import datetime, timedelta
@@ -374,25 +411,24 @@ class MarketReviewAgent:
         return await self._call_llm(system, user_prompt, stream)
 
     async def _news_only(self, sector: str, stream: bool):
-        """新闻专属模式：只生成新闻汇总，不生成分析报告。"""
+        """新闻专属模式：全量48h新闻，不过滤不限量。"""
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
         date_str = trade_date.strftime("%Y%m%d")
         date_display = trade_date.strftime("%Y年%m月%d日")
 
-        snapshot = await collect_market_snapshot(date=date_str, sector_focus=sector)
-        news_block = _format_multi_day_news(snapshot, sector or "全市场", date_str)
+        # 不过滤，全量采集
+        snapshot = await collect_market_snapshot(date=date_str, sector_focus=None)
+        news_block = _format_all_news(snapshot, date_display)
 
         label = f"{sector}板块" if sector else "全市场"
-        system = f"""你是财经新闻编辑。根据提供的新闻数据，生成{label}新闻汇总。
+        system = f"""你是财经新闻编辑。以下是{label}新闻汇总，覆盖{date_display}及前一天（48小时）。请将以下所有新闻按日期分组列出。每条格式：[时间] 标题。不要添加分析。纯文本。"""
 
-格式要求：按日期分组（先列{date_display}，再列前一天），每条新闻列出时间和标题。不要添加分析评论。纯文本，禁止markdown。"""
-
-        user_prompt = f"""{label}新闻汇总 — 覆盖{date_display}及前一天
+        user_prompt = f"""{label}新闻汇总 — {date_display}及前一天（48小时全覆盖）
 
 {news_block}
 
-请将以上所有新闻按日期分组列出。每条格式：[时间] 标题。全部列出，不许跳过。"""
+以上所有新闻全部列出，不许跳过任何一条。按日期分组，先列{date_display}，再列前一天。"""
 
         result = await self._call_llm(system, user_prompt, stream)
         if not stream and isinstance(result, dict):
