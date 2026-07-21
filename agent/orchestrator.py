@@ -227,7 +227,7 @@ def _extract_sector(msg: str) -> Optional[str]:
 # ── Markdown 清理 ──
 
 def _clean_markdown(text: str) -> str:
-    """后处理：强制清除 LLM 输出的所有 markdown 格式标记。"""
+    """后处理：强制清除所有markdown格式。"""
     import re
 
     # 1. 管道表格 → 缩进纯文本
@@ -236,8 +236,9 @@ def _clean_markdown(text: str) -> str:
     in_table = False
     for line in lines:
         stripped = line.strip()
+        # 检测管道表格行
         if stripped.startswith("|") and stripped.endswith("|"):
-            if "---" in stripped:
+            if "---" in stripped or ":--" in stripped:
                 in_table = True
                 continue
             if in_table:
@@ -246,18 +247,20 @@ def _clean_markdown(text: str) -> str:
             continue
         in_table = False
         cleaned.append(line)
-
     text = "\n".join(cleaned)
 
     # 2. **加粗** → 去掉星号
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
 
-    # 3. # → 空行替代
-    text = re.sub(r"^###?\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\n###?\s+", "\n", text)
+    # 3. # 标题 → 空行分隔
+    text = re.sub(r"^#{1,4}\s*", "", text, flags=re.MULTILINE)
 
     # 4. * 列表 → - 列表
-    text = re.sub(r"^\* ", "- ", text, flags=re.MULTILINE)
+    text = re.sub(r"^[\*\+]\s+", "- ", text, flags=re.MULTILINE)
+
+    # 5. 残留的单个 | 替换为空格
+    text = text.replace(" | ", "  ")
 
     return text
 
