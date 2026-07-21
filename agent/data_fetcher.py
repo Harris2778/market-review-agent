@@ -471,6 +471,66 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
     return items
 
 
+def _mcp_call(tool_name: str, args: dict) -> dict:
+    """通用MCP工具调用。"""
+    token = _env("SINA_MCP_TOKEN", "")
+    if not token:
+        return {}
+    try:
+        base = "https://mcp.finance.sina.com.cn/mcp-http"
+        r = requests.post(f"{base}?token={token}", json={
+            "jsonrpc":"2.0","method":"initialize","id":1,
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+        }, timeout=15)
+        sid = r.headers.get("Mcp-Session-Id","")
+        if not sid:
+            return {}
+        r2 = requests.post(f"{base}?token={token}", json={
+            "jsonrpc":"2.0","method":"tools/call","id":2,
+            "params":{"name": tool_name, "arguments": args}
+        }, headers={"Mcp-Session-Id":sid}, timeout=30)
+        d = r2.json()
+        content = d.get("result",{}).get("content",[])
+        if content and isinstance(content,list):
+            text = content[0].get("text","")
+            if text:
+                return json.loads(text)
+    except Exception:
+        pass
+    return {}
+
+
+def fetch_market_breadth() -> dict:
+    """A股全市场涨跌分布。"""
+    d = _mcp_call("cnMarketUpdownDistribution", {})
+    data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    if data:
+        return {"total": len(data), "data": data[:20]}
+    return {}
+
+
+def fetch_northbound_sector() -> list:
+    """沪深港通持股——北向资金流向。"""
+    items = []
+    for mkt in ["sh", "sz"]:
+        d = _mcp_call("cnStockConnectHoldings", {"type": mkt, "sort": "hold_market", "asc": 0, "num": 10, "page": 1})
+        data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
+        for it in data:
+            items.append({"market": mkt, "name": it.get("name",""), "code": it.get("symbol",""),
+                         "hold": it.get("hold_market",""), "pct": it.get("hold_ratio","")})
+    return items[:20]
+
+
+def fetch_hot_stocks() -> list:
+    """股票热搜榜。"""
+    items = []
+    d = _mcp_call("globalStockHotBoard", {"type": "hot", "market": "cn", "num": 10, "page": 1})
+    data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    for it in data:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "heat": it.get("heat",0)})
+    return items[:15]
+
+
 def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
     """新浪智研MCP新闻搜索。"""
     items = []
@@ -1139,6 +1199,8 @@ async def collect_market_snapshot(
     snapshot._north_hold = safe(results_raw.get("north"), [])
     snapshot._north_sector = aggregate_northbound_by_sector(snapshot._north_hold)
     snapshot._sector_volumes = await loop.run_in_executor(None, fetch_sector_volume_all, date)
+    snapshot._breadth = await loop.run_in_executor(None, fetch_market_breadth)
+    snapshot._hot = await loop.run_in_executor(None, fetch_hot_stocks)
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1331,6 +1393,16 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             names = ", ".join(f"{t['name']}(净卖出{abs(t['net_amount']):.1f}亿)" for t in retail[:10])
             lines.append(f"机构净卖出: {names}")
         lines.append("")
+
+    # ── 涨跌分布 + 热搜 ──
+    breadth = getattr(snapshot, "_breadth", {})
+    if breadth and breadth.get("data"):
+        lines.append(f"### A股全市场涨跌分布（共{len(breadth['data'])}档）")
+    hot = getattr(snapshot, "_hot", [])
+    if hot:
+        lines.append("### 股票热搜榜TOP15")
+        for h in hot[:10]:
+            lines.append(f"- {h['name']}({h['code']}) 热度{h.get('heat','?')}")
 
     # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
