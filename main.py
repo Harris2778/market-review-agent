@@ -229,9 +229,9 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
-@app.get("/debug/mcp-raw")
-async def debug_mcp_raw():
-    """原始MCP响应测试。"""
+@app.get("/debug/hot")
+async def debug_hot():
+    """热搜原始响应。"""
     import requests, os
     token = os.getenv("SINA_MCP_TOKEN","")
     base = "https://mcp.finance.sina.com.cn/mcp-http"
@@ -242,13 +242,9 @@ async def debug_mcp_raw():
     sid = r.headers.get("Mcp-Session-Id","")
     r2 = requests.post(f"{base}?token={token}", json={
         "jsonrpc":"2.0","method":"tools/call","id":2,
-        "params":{"name":"cnMarketUpdownDistribution","arguments":{}}
+        "params":{"name":"globalStockHotBoard","arguments":{"type":"hot","market":"cn","num":5,"page":1}}
     }, headers={"Mcp-Session-Id":sid}, timeout=30)
-    content = r2.json().get("result",{}).get("content",[])
-    if content:
-        text = content[0].get("text","")
-        return {"text_len": len(text), "text_preview": text[:500]}
-    return {"error": "no content", "status": r2.status_code, "raw": str(r2.json())[:300]}
+    return {"text": str(r2.json())[:1000]}
 
 
 @app.get("/debug/sina-news")
