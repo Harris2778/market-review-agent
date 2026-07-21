@@ -394,11 +394,15 @@ async def debug_mcp_news():
 @app.get("/debug/stock-all")
 async def debug_stock_all():
     """测试个股全流程。"""
-    from agent.data_fetcher import fetch_stock_quote, fetch_stock_kline, fetch_stock_news
-    q = fetch_stock_quote("cn","sh600519")
-    k = fetch_stock_kline("cn","sh600519",5)
-    n = fetch_stock_news("sh600519","cn",5)
-    return {"quote": bool(q), "kline": len(k), "news": len(n), "k_sample": k[:2] if k else [], "n_sample": n[:2] if n else []}
+    import traceback
+    try:
+        from agent.data_fetcher import fetch_stock_quote, fetch_stock_kline, fetch_stock_news
+        q = fetch_stock_quote("cn","sh600519")
+        k = fetch_stock_kline("cn","sh600519",5)
+        n = fetch_stock_news("sh600519","cn",5)
+        return {"quote": bool(q), "kline": len(k), "news": len(n)}
+    except Exception as e:
+        return {"error": str(e), "trace": traceback.format_exc()[-500:]}
 
 
 @app.get("/debug/futures")
