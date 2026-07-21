@@ -428,23 +428,22 @@ class MarketReviewAgent:
         d1 = (trade_date - timedelta(days=1)).strftime("%Y-%m-%d")
         d2 = (trade_date - timedelta(days=2)).strftime("%Y-%m-%d")
 
-        # MCP + Sina并行拉取
-        from agent.data_fetcher import fetch_mcp_news as _mcp
+        # MCP + Sina + EM 全部并行拉取
+        from agent.data_fetcher import fetch_mcp_news as _mcp, fetch_sina_news as _s, fetch_eastmoney_news as _e
         search_kw = sector if sector else "A股"
-        mcp_task = loop.run_in_executor(None, _mcp, search_kw, 60)
-        em_task = loop.run_in_executor(None, _em, 50)
-        sina_tasks = []
-        for date_str in [d0, d1, d2]:
-            for page in [1, 2, 3]:
-                sina_tasks.append(loop.run_in_executor(None, _sina, 50, date_str))
-
-        mcp_items = await mcp_task or []
-        em1 = await em_task or []
-        all_sina = []
-        for t in sina_tasks:
-            items = await t
-            if items:
-                all_sina.extend(items)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            futures = [pool.submit(_mcp, search_kw, 60), pool.submit(_e, 50)]
+            for date_str in [d0, d1, d2]:
+                for page in [1, 2, 3]:
+                    futures.append(pool.submit(_s, 50, date_str))
+            mcp_items = futures[0].result() or []
+            em1 = futures[1].result() or []
+            all_sina = []
+            for f in futures[2:]:
+                items = f.result()
+                if items:
+                    all_sina.extend(items)
 
         # 申万31行业关键词（每个行业名+简称，用于新闻自动归类）
         SW_ALL_KEYWORDS = {
