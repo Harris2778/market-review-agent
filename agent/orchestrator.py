@@ -643,8 +643,8 @@ class MarketReviewAgent:
                         args = {}
                     data = _mcp_call(fn.name, args)
                     data_str = json.dumps(data, ensure_ascii=False)[:3000]
-                    if not data_str or data_str == "{}" or '"data":[]' in data_str:
-                        data_str = "该工具返回空数据。请如实告知用户：当前暂无数据。不要编造，不要使用训练数据。"
+                    if not data_str or data_str == "{}" or ('"data":[]' in data_str and '"s_list":[]' not in data_str):
+                        return {"role": "assistant", "content": "抱歉，该数据暂不支持查询。新浪智研API返回为空，可能原因：非交易时段数据未更新、该接口暂不可用、或查询参数不支持。请尝试其他问题。"}
                     all_results.append({"tool": fn.name, "result": data_str[:300]})
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": data_str})
