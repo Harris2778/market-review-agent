@@ -525,43 +525,43 @@ def fetch_market_breadth() -> dict:
 
 
 def fetch_hot_stocks() -> list:
-    """股票热搜榜。"""
+    """股票热搜榜。数据格式: result.data[].name/symbol/gzd(graph)"""
     d = _mcp_call("globalStockHotBoard", {"type": "hot", "market": "cn", "num": 10, "page": 1})
     items = []
-    # 格式1: JSON {result: {data: [...]}}
-    data = d.get("result",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    data = d.get("result",{}).get("data",[]) or []
     for it in data:
         items.append({"name": it.get("name",""), "code": it.get("symbol",""), "heat": it.get("heat",0)})
-    # 格式2: CSV
-    if not items:
-        raw = d.get("raw","")
-        if raw and "var " in raw:
-            for block in raw.split("\n"):
-                if "=" in block and "," in block:
-                    csv = block.split('="')[1].split('"')[0]
-                    parts = csv.split(",")
-                    if len(parts) >= 3:
-                        items.append({"name": parts[1], "code": parts[0], "heat": parts[2]})
     return items[:15]
 
 
 def fetch_us_breadth() -> dict:
-    """美股涨跌分布。"""
+    """美股涨跌分布。数据格式: result.data.{rise,fall,ping,up_0_2,...}"""
     d = _mcp_call("usMarketStatisticsUpdown", {})
-    raw = d.get("raw","")
-    if raw and "," in raw:
-        parts = raw.split(",")
-        return {"up": parts[1] if len(parts)>1 else "?", "down": parts[2] if len(parts)>2 else "?"}
+    data = d.get("result",{}).get("data",{}) or d.get("data",{})
+    if data:
+        return {"涨": data.get("rise","?"), "跌": data.get("fall","?"), "平": data.get("ping","?"),
+                "涨停": data.get("up_10","?"), "跌停": data.get("down_10","?")}
     return {}
 
 
 def fetch_strong_sectors() -> list:
-    """A股强势板块。"""
+    """A股强势板块。数据格式: result.data[].name/jjzt"""
     d = _mcp_call("cnMarketStrongSectors", {"bk": "行业", "type": "行业", "isNotSt": "1"})
     items = []
-    data = d.get("result",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    data = d.get("result",{}).get("data",[]) or []
     for it in data[:10]:
-        items.append({"name": it.get("name",""), "pct": it.get("change_pct","")})
+        items.append({"name": it.get("name",""), "pct": it.get("jjzt","")})
+    return items
+
+
+def fetch_northbound_flow() -> list:
+    """沪深港通实时资金流向。"""
+    items = []
+    d = _mcp_call("cnStockConnectHoldings", {"type": "sh", "sort": "hold_market", "asc": 0, "num": 10, "page": 1})
+    slist = d.get("result",{}).get("data",{}).get("s_list",[])
+    for it in slist[:10]:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""),
+                      "hold": it.get("cur_capital",""), "chg": it.get("day1_capital_chg","")})
     return items
 
 
@@ -1213,7 +1213,7 @@ async def collect_market_snapshot(
         "breadth": loop.run_in_executor(None, fetch_market_breadth),
         "hot": loop.run_in_executor(None, fetch_hot_stocks),
         "us_breadth": loop.run_in_executor(None, fetch_us_breadth),
-        "strong_sec": loop.run_in_executor(None, fetch_strong_sectors),
+        "north_flow": loop.run_in_executor(None, fetch_northbound_flow),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1241,6 +1241,7 @@ async def collect_market_snapshot(
     snapshot._hot = safe(results_raw.get("hot"), [])
     snapshot._us_breadth = safe(results_raw.get("us_breadth"), {})
     snapshot._strong_sec = safe(results_raw.get("strong_sec"), [])
+    snapshot._north_flow = safe(results_raw.get("north_flow"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1441,7 +1442,12 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append(f"涨停{breadth.get('涨停','?')}家 跌停{breadth.get('跌停','?')}家 上涨{breadth.get('total_up','?')}家 下跌{breadth.get('total_down','?')}家 平盘{breadth.get('平','?')}家")
     us_b = getattr(snapshot, "_us_breadth", {})
     if us_b:
-        lines.append(f"### 美股涨跌分布 涨{us_b.get('up','?')}家 跌{us_b.get('down','?')}家")
+        lines.append(f"### 美股涨跌分布 涨{us_b.get('涨','?')}家 跌{us_b.get('跌','?')}家 平{us_b.get('平','?')}家")
+    north_f = getattr(snapshot, "_north_flow", [])
+    if north_f:
+        lines.append("### 北向资金持仓TOP10（MCP实时）")
+        for h in north_f[:10]:
+            lines.append(f"- {h['name']}({h['code']}) 持仓{h.get('hold','?')} 日变动{h.get('chg','?')}")
     hot = getattr(snapshot, "_hot", [])
     if hot:
         lines.append("### 股票热搜榜TOP10")
