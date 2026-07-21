@@ -229,13 +229,16 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
-@app.get("/debug/mcp-breadth")
-async def debug_mcp_breadth():
+@app.get("/debug/mcp-broadth")
+async def debug_mcp_broadth():
     """测试MCP涨跌分布+热搜。"""
-    from agent.data_fetcher import fetch_market_breadth, fetch_hot_stocks
-    b = fetch_market_breadth()
-    h = fetch_hot_stocks()
-    return {"breadth_keys": list(b.keys()) if b else [], "hot_count": len(h)}
+    import traceback
+    from agent.data_fetcher import _mcp_call
+    try:
+        b = _mcp_call("cnMarketUpdownDistribution", {})
+        return {"raw_keys": list(b.keys())[:5], "raw_data": str(b)[:500]}
+    except Exception as e:
+        return {"error": str(e), "trace": traceback.format_exc()[-300:]}
 
 
 @app.get("/debug/sina-news")
