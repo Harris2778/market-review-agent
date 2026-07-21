@@ -1,0 +1,45 @@
+# Render Blueprint — market-review-agent
+# 用法：Render Dashboard → New → Blueprint → 选择本仓库 → Apply。
+# 密钥类环境变量（sync: false）在 Apply 时由 Dashboard 提示手动填写。
+services:
+  - type: web
+    name: market-review-agent
+    runtime: python
+    region: singapore            # 离清小搭调用方最近的可选区域
+    plan: starter                # $7/月，常驻不睡（免费档 15 分钟无请求会睡死，定时推送会挂）
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py # main.py 读 $PORT（Render 自动注入）
+    healthCheckPath: /           # 根端点无需鉴权，返回服务状态 JSON
+    autoDeploy: true             # main 分支 push 即部署
+    disk:                        # 持久卷：问责存档/自选股/SVG 图表都落这里
+      name: agent-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.4
+      - key: DATA_DIR
+        value: /data             # archive/charts/watchlist 的统一推导根
+      # ── 以下在 Apply 时手动填写（不同步进仓库）──
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: AGENT_API_KEY
+        sync: false
+      - key: TUSHARE_TOKEN
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: FRED_API_KEY
+        sync: false
+      - key: SINA_MCP_TOKEN
+        sync: false
+      # 可选：推送与配额（有默认值，不配也能跑）
+      # - key: PUSH_WEBHOOK_URL
+      #   sync: false
+      # - key: PUSH_TIME
+      #   value: "15:40"
+      # - key: RATE_LIMIT_PER_MIN
+      #   value: "30"
+      # - key: QUOTA_DAILY
+      #   value: "500"

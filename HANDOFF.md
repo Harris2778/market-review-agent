@@ -6,7 +6,8 @@
 
 A 股金融分析智能体。FastAPI 提供 OpenAI 兼容接口（`/v1/chat/completions`），
 DeepSeek（deepseek-chat）生成分析，数据源：Tushare Pro（200元/年）+ 新浪智研 MCP（75 工具）
-+ yfinance + FRED + Finnhub。部署：Railway（从 GitHub main 分支自动部署）。
++ yfinance + FRED + Finnhub。部署：Railway（从 GitHub main 分支自动部署；
+2026-07-22 起其 Hobby 计划构建队列频繁卡死，仓库已内置 render.yaml/Dockerfile 可迁 Render/Fly，见 DEPLOY.md）。
 
 - 仓库：https://github.com/Harris2778/market-review-agent
 - 生产：https://market-review-agent-production.up.railway.app
