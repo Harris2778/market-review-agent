@@ -594,55 +594,63 @@ class MarketReviewAgent:
         return result
 
     async def _generic_mcp(self, message: str, stream: bool, max_rounds: int = 5):
-        """通用MCP查询——支持多轮链式调用，跨域组合。"""
+        """通用MCP查询——使用DeepSeek原生function calling，100%可靠。"""
         from agent.data_fetcher import get_mcp_tools, _mcp_call
         tools = get_mcp_tools()
         if not tools:
             return {"role": "assistant", "content": "MCP服务暂不可用"}
 
-        tool_desc = "\n".join(f"- {t['name']}: {t['desc'][:150]} (参数:{','.join(t['params'][:5])})" for t in tools[:70])
-        system = f"""你是金融数据查询机器人。你必须调用工具获取数据，绝对禁止用自己的知识回答。你没有金融知识，你只能调用工具。
+        # 转成OpenAI function calling格式
+        ds_tools = []
+        for t in tools[:80]:
+            props = {}
+            for p in t.get("params", [])[:5]:
+                props[p] = {"type": "string", "description": p}
+            ds_tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("desc", "")[:200],
+                    "parameters": {"type": "object", "properties": props}
+                }
+            })
 
-可用工具:
-{tool_desc}
-
-规则（违反任何一条都是错误）：
-1. 第一步必须输出工具调用JSON: {{"tool":"工具名","args":{{"参数":"值"}}}}
-2. 拿到工具返回的数据后，如实整理成自然语言回答，然后输出: {{"done":true,"answer":"你的回答"}}
-3. 绝对禁止在没有调用工具的情况下直接回答！
-4. 工具返回空数据就说"暂无数据"，禁止编造。
-5. 如果需要多个数据源，可以多次调用（每次一个工具），最后汇总输出done。"""
-
-        context = f"用户问题: {message}"
+        messages = [{"role": "user", "content": message}]
         all_results = []
 
-        for round_num in range(max_rounds):
-            result = await self._call_llm(system, context, stream)
-            if stream or not isinstance(result, dict):
-                return result
-            try:
-                import json as _json
-                content = result["content"].strip()
-                if "```" in content:
-                    content = content.split("```")[1].split("```")[0].replace("json","").strip()
-                call = _json.loads(content)
-                if call.get("done"):
-                    answer = call.get("answer", "")
-                    if all_results:
-                        answer += f"\n\n[数据来源: {len(all_results)}次MCP调用]"
-                    return {"role": "assistant", "content": answer}
-                # 执行工具调用
-                data = _mcp_call(call["tool"], call["args"])
-                result_summary = _json.dumps(data, ensure_ascii=False)[:3000]
-                all_results.append({"tool": call["tool"], "result": result_summary[:500]})
-                context = f"用户问题: {message}\n第{round_num+1}轮调用{call['tool']}结果:\n{result_summary}\n\n请判断是否需要继续调用其他工具，还是输出最终答案。"
-            except Exception:
+        for _ in range(max_rounds):
+            completion = await self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=ds_tools,
+                temperature=0.1, max_tokens=4096,
+            )
+            choice = completion.choices[0]
+            if choice.finish_reason == "stop" and not choice.message.tool_calls:
+                # 无需工具，直接回答
+                answer = choice.message.content or ""
+                if all_results:
+                    answer += f"\n[数据来源: {len(all_results)}次MCP调用]"
+                return {"role": "assistant", "content": answer}
+
+            if choice.message.tool_calls:
+                for tc in choice.message.tool_calls:
+                    fn = tc.function
+                    try:
+                        args = json.loads(fn.arguments) if fn.arguments else {}
+                    except:
+                        args = {}
+                    data = _mcp_call(fn.name, args)
+                    data_str = json.dumps(data, ensure_ascii=False)[:3000]
+                    all_results.append({"tool": fn.name, "result": data_str[:300]})
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": data_str})
+            else:
                 break
 
-        # 超过最大轮数，综合所有结果输出
-        summary = "\n".join(f"- {r['tool']}: {r['result'][:200]}" for r in all_results)
-        return {"role": "assistant", "content": f"多轮查询结果:\n{summary}\n\n[共{len(all_results)}次工具调用，如需深入分析请提出具体问题]"}
-        return {"role": "assistant", "content": f"无法解析工具调用: {result['content'][:300]}"}
+        # 汇总
+        if all_results:
+            summary = "\n".join(f"- {r['tool']}: {r['result']}" for r in all_results)
+            return {"role": "assistant", "content": f"查询结果:\n{summary}\n[共{len(all_results)}次工具调用]"}
+        return {"role": "assistant", "content": "未获取到数据，请尝试更具体的查询。"}
 
     async def _fund_query(self, message: str, stream: bool):
         """基金/期货/股票/汇率等通用MCP查询。"""
