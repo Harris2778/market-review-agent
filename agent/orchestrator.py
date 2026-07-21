@@ -643,6 +643,8 @@ class MarketReviewAgent:
                         args = {}
                     data = _mcp_call(fn.name, args)
                     data_str = json.dumps(data, ensure_ascii=False)[:3000]
+                    if not data_str or data_str == "{}" or '"data":[]' in data_str:
+                        data_str = "该工具返回空数据。请如实告知用户：当前暂无数据。不要编造，不要使用训练数据。"
                     all_results.append({"tool": fn.name, "result": data_str[:300]})
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": data_str})
