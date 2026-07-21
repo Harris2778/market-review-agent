@@ -1326,9 +1326,9 @@ def fetch_china_macro() -> dict:
 # ═══════════════════════════════════════════
 
 def fetch_forex() -> dict:
-    """最新汇率。symbol: USDCNY, EURUSD等"""
+    """最新汇率。symbol: USDCNY"""
     d = _mcp_call("forexQuoteLatest", {"symbol": "USDCNY"})
-    data = d.get("status",{}).get("data",{}) or d.get("data",{}) or {}
+    data = d.get("data",{}) or {}
     return {"在岸人民币": f"{data.get('price','?')}", "涨跌": f"{data.get('pctChg','?')}%"}
 
 
