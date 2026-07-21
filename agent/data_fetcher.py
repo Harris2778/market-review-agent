@@ -563,12 +563,12 @@ def fetch_market_breadth() -> dict:
 
 
 def fetch_hot_stocks() -> list:
-    """股票热搜榜。数据格式: result.data[].name/symbol/gzd(graph)"""
-    d = _mcp_call("globalStockHotBoard", {"type": "hot", "market": "cn", "num": 10, "page": 1})
+    """A股股票热搜榜。type: d, num: 数量, page: 页码"""
+    d = _mcp_call("globalStockHotBoard", {"type": "d", "num": 10, "page": 1})
     items = []
     data = d.get("result",{}).get("data",[]) or []
     for it in data:
-        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "heat": it.get("heat",0)})
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "heat": it.get("pv","")})
     return items[:15]
 
 
