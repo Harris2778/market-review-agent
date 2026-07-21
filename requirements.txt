@@ -1,11 +1,13 @@
 # Web Framework
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
-sse-starlette>=2.0.0
+
+# HTTP Client
+requests>=2.32.0
+httpx>=0.28.0
 
 # LLM
 openai>=1.60.0
-httpx>=0.28.0
 
 # Market Data
 tushare>=1.4.0
@@ -13,16 +15,6 @@ finnhub-python>=2.4.0
 fredapi>=0.5.0
 yfinance>=0.2.50
 
-# News & Search
-levistock>=0.1.0
-beautifulsoup4>=4.12.0
-lxml>=5.3.0
-
 # Data Processing
 pandas>=2.2.0
-numpy>=1.26.0
-pydantic>=2.0.0
 python-dotenv>=1.0.0
-
-# Utilities
-python-dateutil>=2.9.0

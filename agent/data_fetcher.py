@@ -9,10 +9,13 @@
 
 import os
 import json
+import logging
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -132,14 +135,15 @@ def fetch_a_share_indices(date: str) -> dict:
                 "close": round(close, 2),
                 "pct_chg": round(pct_chg, 2),
                 "vol": round(vol, 2),
+                "amount": round(float(latest.get("amount", 0) or 0) / 1e7, 2),  # 千元→亿
                 "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma60": ma60,
                 "chg_5d": chg_5d, "chg_20d": chg_20d,
                 "trend_5d": trend_5d, "trend_20d": trend_20d,
                 "vol_ratio": vol_ratio,
                 "mas_above": f"{above_mas}/{total_mas}" if total_mas else "—",
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("获取指数行情失败 code=%s", code, exc_info=True)
     return result
 
 
@@ -210,11 +214,11 @@ def fetch_shenwan_sectors(date: str) -> list:
                 "high": round(float(row.get("high", 0)), 2),
                 "low": round(float(row.get("low", 0)), 2),
                 "vol": round(float(row.get("vol", 0)) / 10000, 2),
-                "amount": round(float(row.get("amount", 0)) / 1e8, 2),
+                "amount": round(float(row.get("amount", 0)) / 1e7, 2),
                 "streak": streak_str,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("获取申万行业行情失败 code=%s", code, exc_info=True)
 
     sectors.sort(key=lambda x: x["pct_chg"], reverse=True)
     return sectors
@@ -552,14 +556,21 @@ def fetch_market_breadth() -> dict:
     """A股全市场涨跌分布。"""
     d = _mcp_call("cnMarketUpdownDistribution", {})
     raw = d.get("raw","")
-    if raw and "," in raw:
-        parts = raw.split(",")
-        return {"date": parts[1] if len(parts)>1 else "", "跌停": parts[2], "跌7-10": parts[3],
+    if not raw or "," not in raw:
+        return {}
+    parts = raw.split(",")
+    if len(parts) < 13:
+        logger.warning("涨跌分布CSV字段数异常（%d < 13），原始数据: %s", len(parts), raw[:200])
+        return {}
+    try:
+        return {"date": parts[1], "跌停": parts[2], "跌7-10": parts[3],
                 "跌5-7": parts[4], "跌2-5": parts[5], "跌0-2": parts[6], "平": parts[7],
                 "涨0-2": parts[8], "涨2-5": parts[9], "涨5-7": parts[10], "涨7-10": parts[11], "涨停": parts[12],
                 "total_up": str(int(parts[8])+int(parts[9])+int(parts[10])+int(parts[11])+int(parts[12])),
                 "total_down": str(int(parts[2])+int(parts[3])+int(parts[4])+int(parts[5])+int(parts[6]))}
-    return {}
+    except (ValueError, IndexError) as e:
+        logger.warning("解析涨跌分布CSV失败: %s", raw[:200], exc_info=True)
+        return {}
 
 
 def fetch_hot_stocks() -> list:
@@ -597,16 +608,6 @@ def fetch_valuation(symbol: str, rank: str = "y1", val_type: str = "syl") -> dic
     d = _mcp_call("cnStockValuationDetail", {"symbol": symbol, "rank": rank, "type": val_type})
     data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
     return {"个股": data.get("gg",[]), "行业": data.get("hy",[]), "大盘": data.get("dp",[])}
-
-
-def fetch_us_sectors() -> list:
-    """美股板块表现。"""
-    d = _mcp_call("usSectorRanking", {"asc": 0, "sort": "change_pct", "num": 10, "page": 1})
-    items = []
-    data = d.get("result",{}).get("data",[]) or []
-    for it in data[:10]:
-        items.append({"name": it.get("name",""), "pct": it.get("change_pct","")})
-    return items
 
 
 def fetch_limit_up_pool() -> list:
@@ -1012,7 +1013,7 @@ def fetch_north_holdings() -> list:
 
 
 def aggregate_northbound_by_sector(holdings: list) -> dict:
-    """将北向持仓按行业聚合，返回各行业持仓市值(亿)排名。"""
+    """将北向持仓按行业聚合，返回各行业持股数量(亿股)排名。"""
     _load_stock_names()
     sector_holdings = {}
     for h in holdings:
@@ -1020,7 +1021,7 @@ def aggregate_northbound_by_sector(holdings: list) -> dict:
         if not sector:
             continue
         sector_holdings[sector] = sector_holdings.get(sector, 0) + h["vol"]
-    # 按持仓市值排序
+    # 按持股数量排序
     sorted_sectors = sorted(sector_holdings.items(), key=lambda x: x[1], reverse=True)
     return dict(sorted_sectors[:15])
 
@@ -1385,13 +1386,17 @@ def fetch_forex_batch() -> list:
 
 
 def fetch_futures(market: str = "gn", symbol: str = "AU0") -> dict:
-    """期货行情。market: gn内盘/global外盘/cff股指"""
+    """期货行情。market: gn内盘/global外盘/cff股指。
+    主路径：新浪智研 MCP；主路径失败时回退 yfinance 商品期货 + 人民币汇率。"""
     d = _mcp_call("future_quotes", {"market": market, "symbol": symbol})
     data = d.get("data",{}) or {}
-    return {"name": data.get("name",""), "price": data.get("price",""),
-            "pct": data.get("percent",""), "vol": data.get("volume",""),
-            "open": data.get("openPrice",""), "high": data.get("high",""), "low": data.get("low","")}
-    """商品期货 + 人民币汇率（yfinance 免费）。"""
+    if data.get("price"):
+        return {"name": data.get("name",""), "price": data.get("price",""),
+                "pct": data.get("percent",""), "vol": data.get("volume",""),
+                "open": data.get("openPrice",""), "high": data.get("high",""), "low": data.get("low","")}
+
+    # fallback：商品期货 + 人民币汇率（yfinance 免费）
+    logger.warning("MCP future_quotes 无数据（market=%s symbol=%s），回退 yfinance", market, symbol)
     result = {}
     tickers = {
         "CL=F": "WTI原油", "GC=F": "黄金", "HG=F": "铜",
@@ -1408,10 +1413,10 @@ def fetch_futures(market: str = "gn", symbol: str = "AU0") -> dict:
                     prev = round(float(hist["Close"].iloc[-2]), 2)
                     pct = round((close - prev) / prev * 100, 2) if prev else 0.0
                     result[name] = {"close": close, "pct_chg": pct}
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.warning("yfinance 获取 %s 失败", sym, exc_info=True)
+    except Exception as e:
+        logger.warning("yfinance 兜底整体失败", exc_info=True)
     return result
 
 
@@ -1555,6 +1560,12 @@ async def collect_market_snapshot(
         "repurchase": loop.run_in_executor(None, fetch_repurchase, date),
         "share_float": loop.run_in_executor(None, fetch_share_float, date),
         "funds": loop.run_in_executor(None, fetch_fund_list, "E"),
+        "strong_sec": loop.run_in_executor(None, fetch_strong_sectors),
+        "north_flow": loop.run_in_executor(None, fetch_northbound_flow),
+        "us_sec": loop.run_in_executor(None, fetch_us_sectors),
+        "hk_sec": loop.run_in_executor(None, fetch_hk_sectors),
+        "ts_news": loop.run_in_executor(None, fetch_tushare_news, date),
+        "cls_telegraph": loop.run_in_executor(None, fetch_cls_telegraph, 30),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1618,6 +1629,8 @@ async def collect_market_snapshot(
     snapshot.news_items = {
         "eastmoney": all_em,
         "sina": all_sina,
+        "ts_news": safe(results_raw.get("ts_news"), []),
+        "cls_telegraph": safe(results_raw.get("cls_telegraph"), []),
         "global": safe(results_raw.get("fh_news"), []),
     }
     snapshot.calendar = safe(results_raw.get("calendar"), [])
@@ -1647,9 +1660,11 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             if d.get("mas_above") and d["mas_above"] != "—":
                 extras.append(f"站上{d['mas_above']}条均线")
             extra_str = f" | {' | '.join(extras)}" if extras else ""
+            amt = d.get("amount")
+            vol_str = f"成交额{amt}亿" if amt else f"成交量{d['vol']}万手"
             lines.append(
                 f"- {name}: {d['close']} | {d['pct_chg']:+.2f}%"
-                f" | 成交额{d['vol']}亿{extra_str}"
+                f" | {vol_str}{extra_str}"
             )
     else:
         lines.append("### A股主要指数\n[Tushare未配置]")
@@ -1862,13 +1877,13 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     if north_h:
         lines.append("### 北向资金持仓TOP20")
         for h in north_h[:15]:
-            lines.append(f"- {h['name']}({h['code']}) 持仓{h['vol']}亿 占比{h['ratio']}%")
+            lines.append(f"- {h['name']}({h['code']}) 持仓{h['vol']}亿股 占比{h['ratio']}%")
         # 北向行业分布
         north_sec = getattr(snapshot, "_north_sector", {})
         if north_sec:
-            lines.append("北向持仓行业分布（市值排名）:")
+            lines.append("北向持仓行业分布（持股数量排名）:")
             for sec, val in list(north_sec.items())[:10]:
-                lines.append(f"  {sec}: {val:.0f}亿")
+                lines.append(f"  {sec}: {val:.0f}亿股")
         lines.append("")
 
     # ── 美国宏观 ──

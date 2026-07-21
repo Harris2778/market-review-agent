@@ -29,11 +29,15 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import traceback
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 try:
     from agent.orchestrator import get_agent, detect_intent
@@ -47,7 +51,12 @@ except Exception as e:
 
 # ── 配置 ──
 
-AGENT_API_KEY = os.getenv("AGENT_API_KEY", "market-review-agent-key")
+AGENT_API_KEY = os.getenv("AGENT_API_KEY")
+if not AGENT_API_KEY:
+    raise RuntimeError(
+        "缺少必填环境变量 AGENT_API_KEY（智能体调用密钥），服务拒绝启动。"
+        "请在环境变量或 .env 文件中设置 AGENT_API_KEY 后重启。"
+    )
 AGENT_NAME = "市场复盘智能体"
 AGENT_DESCRIPTION = (
     "A股市场每日复盘智能体，提供全市场31行业覆盖、"
@@ -67,7 +76,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -99,7 +108,8 @@ async def root():
         "time": datetime.now().isoformat(),
     }
     if not _agent_loaded:
-        result["error"] = _agent_error[-500:] if _agent_error else "unknown"
+        logger.error("智能体加载失败:\n%s", _agent_error)
+        result["error"] = "智能体加载失败，详情见服务端日志"
     return result
 
 
@@ -161,7 +171,20 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        result = await agent.process_message(user_message, stream=False)
+        try:
+            result = await agent.process_message(user_message, stream=False)
+        except Exception as e:
+            logger.error("非流式对话处理失败: %s", e, exc_info=True)
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "message": "上游模型调用失败，请稍后重试",
+                        "type": "upstream_error",
+                        "code": "agent_process_error",
+                    }
+                },
+            )
 
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         return JSONResponse({
@@ -229,7 +252,7 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
-@app.get("/debug/mcp-test")
+@app.get("/debug/mcp-test", dependencies=[Depends(verify_api_key)])
 async def debug_mcp_test(tool: str = "cnMarketUpdownDistribution"):
     """测试任意MCP工具——返回原始响应。"""
     import requests, os
@@ -247,7 +270,7 @@ async def debug_mcp_test(tool: str = "cnMarketUpdownDistribution"):
     return {"tool": tool, "response": str(r2.json())[:1500]}
 
 
-@app.get("/debug/hot")
+@app.get("/debug/hot", dependencies=[Depends(verify_api_key)])
 async def debug_hot():
     """热搜原始响应。"""
     import requests, os
@@ -265,7 +288,7 @@ async def debug_hot():
     return {"text": str(r2.json())[:1000]}
 
 
-@app.get("/debug/sina-news")
+@app.get("/debug/sina-news", dependencies=[Depends(verify_api_key)])
 async def debug_sina_news():
     """测试新浪历史新闻是否能拉取。"""
     from agent.data_fetcher import fetch_sina_news
@@ -281,7 +304,7 @@ async def debug_sina_news():
     }
 
 
-@app.get("/debug/sector-stocks")
+@app.get("/debug/sector-stocks", dependencies=[Depends(verify_api_key)])
 async def debug_sector_stocks(sector: str = "食品饮料"):
     """测试板块成分股数据获取。"""
     from agent.data_fetcher import fetch_sector_stock_detail
@@ -290,7 +313,7 @@ async def debug_sector_stocks(sector: str = "食品饮料"):
     return {"sector": sector, "detail": detail}
 
 
-@app.get("/debug/derivatives")
+@app.get("/debug/derivatives", dependencies=[Depends(verify_api_key)])
 async def debug_derivatives():
     """测试衍生品数据权限。"""
     token = os.getenv("TUSHARE_TOKEN", "")
@@ -322,7 +345,7 @@ async def debug_derivatives():
     return {"derivatives": results}
 
 
-@app.get("/debug/macro")
+@app.get("/debug/macro", dependencies=[Depends(verify_api_key)])
 async def debug_macro():
     """测试 Tushare 宏观数据 + 个股基本面接口权限。"""
     token = os.getenv("TUSHARE_TOKEN", "")
@@ -358,7 +381,7 @@ async def debug_macro():
     return {"macro_test": results}
 
 
-@app.get("/debug/mcp-news")
+@app.get("/debug/mcp-news", dependencies=[Depends(verify_api_key)])
 async def debug_mcp_news():
     """测试MCP连通性+新闻搜索。"""
     import requests as req, traceback, os
@@ -391,7 +414,7 @@ async def debug_mcp_news():
         return {"error": str(e)[:200], "trace": traceback.format_exc()[-300:]}
 
 
-@app.get("/debug/stock-all")
+@app.get("/debug/stock-all", dependencies=[Depends(verify_api_key)])
 async def debug_stock_all():
     """测试个股全流程。"""
     import traceback
@@ -405,18 +428,16 @@ async def debug_stock_all():
         return {"error": str(e), "trace": traceback.format_exc()[-500:]}
 
 
-@app.get("/debug/futures")
+@app.get("/debug/futures", dependencies=[Depends(verify_api_key)])
 async def debug_futures():
     """测试期货+个股API。"""
-    import os as _os
-    token = _os.getenv("SINA_MCP_TOKEN","")[:10]
     from agent.data_fetcher import fetch_futures, fetch_stock_quote
     f = fetch_futures("gn","AU0")
     s = fetch_stock_quote("cn","sh600519")
-    return {"token_prefix": token, "futures": f, "stock": s}
+    return {"futures": f, "stock": s}
 
 
-@app.get("/debug/news-count")
+@app.get("/debug/news-count", dependencies=[Depends(verify_api_key)])
 async def debug_news_count():
     """检查新闻数据是否进入了snapshot。"""
     import asyncio
@@ -440,7 +461,7 @@ async def debug_news_count():
     }
 
 
-@app.get("/debug/pipeline")
+@app.get("/debug/pipeline", dependencies=[Depends(verify_api_key)])
 async def debug_pipeline():
     """测试完整数据采集管线。"""
     from agent.orchestrator import _get_latest_trade_date
@@ -502,7 +523,7 @@ async def debug_pipeline():
     }
 
 
-@app.get("/debug/tushare")
+@app.get("/debug/tushare", dependencies=[Depends(verify_api_key)])
 async def debug_tushare():
     """测试 Tushare API 连通性，返回详细错误信息。"""
     token = os.getenv("TUSHARE_TOKEN", "")
@@ -558,9 +579,7 @@ async def debug_tushare():
     except Exception as e:
         results["init"] = {"status": "fail", "error": str(e)[:200]}
 
-    return {"tushare": results, "proxy_env": {
-        k: os.environ.get(k) for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"]
-    }}
+    return {"tushare": results}
 
 @app.get("/health")
 async def health_check():

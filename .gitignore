@@ -22,6 +22,3 @@ Thumbs.db
 
 # Logs
 *.log
-
-# Docker
-.dockerignore
