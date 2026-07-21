@@ -712,8 +712,9 @@ class MarketReviewAgent:
             return {"role": "assistant", "content": "热搜数据暂不可用，新浪智研API返回为空。请稍后再试。"}
         if any(kw in msg for kw in ["汇率","人民币","美元"]):
             f = fetch_forex()
-            if f.get("在岸人民币") != "?":
+            if f.get("在岸人民币","?") != "?":
                 return {"role": "assistant", "content": f"最新汇率：在岸人民币 {f['在岸人民币']} 涨跌{f.get('涨跌','?')} 数据来源：新浪智研"}
+            return {"role": "assistant", "content": "汇率数据暂不可用，新浪智研API返回为空。请稍后再试。"}
         if any(kw in msg for kw in ["期货","黄金","原油","铜"]):
             kw_map = {"黄金":("gn","AU0"),"原油":("gn","SC0"),"铜":("gn","CU0")}
             for kw, (mkt, sym) in kw_map.items():
@@ -721,6 +722,13 @@ class MarketReviewAgent:
                     d = fetch_futures(mkt, sym)
                     if d.get("价格"):
                         return {"role": "assistant", "content": f"{kw}期货：价格{d.get('价格','?')} 涨跌{d.get('涨跌','?')}% 成交量{d.get('成交量','?')} 数据来源：新浪智研"}
+                    return {"role": "assistant", "content": f"{kw}期货数据暂不可用，请稍后再试。"}
+        if any(kw in msg for kw in ["热搜","热榜"]):
+            h = fetch_hot_stocks()
+            if h:
+                items = "\n".join(f"{i+1}. {s['name']}({s['code']}) 热度{s.get('heat','?')}" for i, s in enumerate(h[:10]))
+                return {"role": "assistant", "content": f"A股热搜榜Top10：\n{items}\n数据来源：新浪智研"}
+            return {"role": "assistant", "content": "热搜数据暂不可用，新浪智研API返回为空。请稍后再试。"}
         return await self._generic_mcp(message, stream)
 
     async def _call_llm(
