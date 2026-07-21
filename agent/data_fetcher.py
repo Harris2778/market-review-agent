@@ -630,19 +630,20 @@ def fetch_lian_ban() -> list:
     return items
 
 
-def fetch_us_fund_flow(symbol: str = "AAPL") -> list:
-    """美股今日资金趋势。"""
-    d = _mcp_call("usTradingFundFlow1Day", {"symbol": symbol})
-    data = d.get("result",{}).get("data",{}) or d.get("data",{})
-    return [data] if data else []
+def fetch_us_fund_flow(symbol: str = "aapl") -> dict:
+    """美股今日资金流向。symbol小写如aapl"""
+    d = _mcp_call("usTradingFundFlow1Day", {"symbol": symbol.lower()})
+    data = d.get("data",{}) or {}
+    return {"超大单": data.get("r0","?"), "大单": data.get("r1","?"), "中单": data.get("r2","?"), "小单": data.get("r3","?"), "成交额": data.get("amount","?")}
 
 
 def fetch_stock_quote(market: str, symbol: str) -> dict:
-    """实时股票行情（沪深/港股/美股）。market: cn/hk/us"""
+    """实时股票行情。market: cn/hk/us, symbol需带前缀如sh688001、sz000002"""
     d = _mcp_call("globalStockQuoteRealtime", {"market": market, "symbol": symbol})
-    data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
-    return {"price": data.get("price",""), "pct": data.get("change_pct",""), "vol": data.get("volume",""),
-            "high": data.get("high",""), "low": data.get("low",""), "open": data.get("open","")}
+    data = d.get("data",{}) or {}
+    return {"name": data.get("name",""), "price": data.get("price",""), "pct": data.get("percent",""),
+            "high": data.get("high",""), "low": data.get("low",""), "open": data.get("openPrice",""),
+            "volume": data.get("volume",""), "preClose": data.get("preClose","")}
 
 
 def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
@@ -656,14 +657,20 @@ def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
 
 
 def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
-    """个股新闻搜索。"""
-    d = _mcp_call("stockNewsSearch", {"market": market, "symbol": symbol, "num": limit, "page": 1})
+    """个股新闻搜索。symbol需带sh/sz前缀"""
+    d = _mcp_call("stockNewsSearch", {"market": market, "symbol": symbol, "num": str(min(20,limit)), "page": "1"})
     items = []
-    data = d.get("result",{}).get("data",{}) or {}
-    news_list = data.get("data",[]) or data.get("list",[]) or []
-    for it in news_list[:limit]:
-        items.append({"title": it.get("title",""), "time": it.get("ctime","")[:16], "source": "MCP"})
+    data = d.get("result",{}).get("data",[]) or []
+    for it in data[:limit]:
+        items.append({"title": it.get("title",""), "url": it.get("url","")})
     return items
+
+
+def fetch_sw_classify(symbol: str) -> dict:
+    """申万行业分类。symbol不带前缀如600519"""
+    d = _mcp_call("swSymbolList", {"symbol": symbol})
+    data = d.get("data",{}) or {}
+    return {"一级": data.get("sw1",""), "二级": data.get("sw2",""), "三级": data.get("sw3","")}
 
 
 def search_stock(keyword: str) -> list:
