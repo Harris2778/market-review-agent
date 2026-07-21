@@ -54,7 +54,7 @@ AGENT_DESCRIPTION = (
     "宏观新闻S/A/B/C四级权威性分级解读、资金流向分析、"
     "单板块7维度深度聚焦。数据来源：DeepSeek + Tushare + Finnhub + FRED。"
 )
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 # ── FastAPI App ──
 
