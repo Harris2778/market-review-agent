@@ -471,6 +471,38 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
     return items
 
 
+# 缓存 MCP 工具列表
+_mcp_tools_cache = None
+
+def get_mcp_tools() -> list:
+    """获取所有可用MCP工具列表。"""
+    global _mcp_tools_cache
+    if _mcp_tools_cache:
+        return _mcp_tools_cache
+    token = _env("SINA_MCP_TOKEN", "")
+    if not token:
+        return []
+    try:
+        base = "https://mcp.finance.sina.com.cn/mcp-http"
+        r = requests.post(f"{base}?token={token}", json={
+            "jsonrpc":"2.0","method":"initialize","id":1,
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+        }, timeout=15)
+        sid = r.headers.get("Mcp-Session-Id","")
+        if sid:
+            r2 = requests.post(f"{base}?token={token}", json={
+                "jsonrpc":"2.0","method":"tools/list","id":2
+            }, headers={"Mcp-Session-Id":sid}, timeout=15)
+            tools = r2.json().get("result",{}).get("tools",[])
+            _mcp_tools_cache = [{"name":t["name"],"desc":t.get("description","")[:200],
+                                "params":list(t.get("inputSchema",{}).get("properties",{}).keys())}
+                              for t in tools]
+            return _mcp_tools_cache
+    except Exception:
+        pass
+    return []
+
+
 def _mcp_call(tool_name: str, args: dict) -> dict:
     """通用MCP工具调用。自动兼容JSON和分号分隔字符串两种响应格式。"""
     token = _env("SINA_MCP_TOKEN", "")
