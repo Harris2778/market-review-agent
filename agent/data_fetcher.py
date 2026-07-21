@@ -554,6 +554,26 @@ def fetch_strong_sectors() -> list:
     return items
 
 
+def fetch_us_sectors() -> list:
+    """美股板块表现。"""
+    d = _mcp_call("usSectorRanking", {"asc": 0, "sort": "change_pct", "num": 10, "page": 1})
+    items = []
+    data = d.get("result",{}).get("data",[]) or []
+    for it in data[:10]:
+        items.append({"name": it.get("name",""), "pct": it.get("change_pct","")})
+    return items
+
+
+def fetch_hk_sectors() -> list:
+    """港股板块行情。"""
+    d = _mcp_call("hkSectorQuotesList", {"type": "hangye", "num": 10, "page": 1})
+    items = []
+    data = d.get("result",{}).get("data",[]) or []
+    for it in data[:10]:
+        items.append({"name": it.get("name",""), "pct": it.get("change_pct","")})
+    return items
+
+
 def fetch_northbound_flow() -> list:
     """沪深港通实时资金流向。"""
     items = []
@@ -1213,7 +1233,8 @@ async def collect_market_snapshot(
         "breadth": loop.run_in_executor(None, fetch_market_breadth),
         "hot": loop.run_in_executor(None, fetch_hot_stocks),
         "us_breadth": loop.run_in_executor(None, fetch_us_breadth),
-        "north_flow": loop.run_in_executor(None, fetch_northbound_flow),
+        "us_sec": loop.run_in_executor(None, fetch_us_sectors),
+        "hk_sec": loop.run_in_executor(None, fetch_hk_sectors),
     }
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
@@ -1242,6 +1263,8 @@ async def collect_market_snapshot(
     snapshot._us_breadth = safe(results_raw.get("us_breadth"), {})
     snapshot._strong_sec = safe(results_raw.get("strong_sec"), [])
     snapshot._north_flow = safe(results_raw.get("north_flow"), [])
+    snapshot._us_sec = safe(results_raw.get("us_sec"), [])
+    snapshot._hk_sec = safe(results_raw.get("hk_sec"), [])
     snapshot._top_list = safe(results_raw.get("toplist"), [])
     snapshot.macro_data = {
         "china": safe(results_raw.get("cn_macro"), {}),
@@ -1458,6 +1481,16 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
         lines.append("### 强势行业板块（MCP）")
         names = ", ".join(f"{s['name']}({s['pct']})" for s in strong[:8])
         lines.append(names)
+    us_sec = getattr(snapshot, "_us_sec", [])
+    if us_sec:
+        lines.append("### 美股板块表现TOP10")
+        for s in us_sec[:8]:
+            lines.append(f"- {s['name']}: {s['pct']}")
+    hk_sec = getattr(snapshot, "_hk_sec", [])
+    if hk_sec:
+        lines.append("### 港股板块表现TOP10")
+        for s in hk_sec[:8]:
+            lines.append(f"- {s['name']}: {s['pct']}")
 
     # ── 北向持仓TOP + 行业分布 ──
     north_h = getattr(snapshot, "_north_hold", [])
