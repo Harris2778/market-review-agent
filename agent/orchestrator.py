@@ -68,6 +68,20 @@ except ImportError as e:
     logger.warning("agent/history_lens.py 未就绪，以史为鉴注入将降级跳过: %s", e)
     history_lens = None
 
+# 第八波：MCP 结果压缩与错误识别（工程师B 在 data_fetcher.py 提供）。
+# 跨层接口契约：防御式导入，未就绪时退回现状行为（json.dumps 截断 + 原文喂回），
+# 绝不能硬依赖。
+try:
+    from .data_fetcher import compact_mcp_result, is_mcp_error, mcp_error_brief
+except ImportError as e:
+    logger.warning(
+        "data_fetcher 的 compact_mcp_result/is_mcp_error/mcp_error_brief 未就绪，"
+        "MCP 结果压缩与错误简述将降级为现状行为: %s", e,
+    )
+    compact_mcp_result = None
+    is_mcp_error = None
+    mcp_error_brief = None
+
 
 def _log_stream_violations(label: str, violations: list) -> None:
     """流式路径 log-only：记录疑似无出处数字的数量与前几条原文，绝不抛出、不拦截。"""
@@ -549,9 +563,32 @@ def _assistant_tool_message(message) -> dict:
 
 # ── Markdown 清理 ──
 
+# 符号级删除表：流式 chunk 与确定性拼装文本共用（无状态、跨 chunk 安全）
+_MD_SYMBOLS_TRANSLATE = str.maketrans("", "", "*#")
+
+
+def _strip_md_symbols(text: str) -> str:
+    """轻量符号级清洗：删除文本中所有 * 与 # 字符，其余一律不动。
+
+    无状态、逐 chunk 安全：因为目标是「* 与 # 零到达用户」，跨 chunk 的
+    ** 配对无需识别——无论 **加粗** 完整到达还是拆成两个 chunk，每个 *
+    都被删除，拼接结果与整段清洗完全一致。用于流式 chunk 清洗与
+    确定性拼装文本（新闻清单/个股/期货/基金/自选股输出）的兜底清洗。
+    """
+    if not text:
+        return text or ""
+    return text.translate(_MD_SYMBOLS_TRANSLATE)
+
+
 def _clean_markdown(text: str) -> str:
-    """后处理：强制清除所有markdown格式。"""
-    import re
+    """后处理：强制清除所有 markdown 格式。
+
+    结构性清洗（管道表格/加粗/斜体/标题/列表符号/管道符）之后，
+    末尾用 _strip_md_symbols 兜底删除一切残留的 * 与 #（含行内 *斜体*
+    未配对残留、孤立 #），保证任何 markdown 符号都到不了用户。
+    """
+    if not text:
+        return text or ""
 
     # 1. 管道表格 → 缩进纯文本
     lines = text.split("\n")
@@ -572,18 +609,22 @@ def _clean_markdown(text: str) -> str:
         cleaned.append(line)
     text = "\n".join(cleaned)
 
-    # 2. **加粗** → 去掉星号
+    # 2. **加粗** / __加粗__ / *斜体* → 去掉星号保正文
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"\*([^*\n]+)\*", r"\1", text)
 
-    # 3. # 标题 → 空行分隔
-    text = re.sub(r"^#{1,4}\s*", "", text, flags=re.MULTILINE)
+    # 3. # 标题 → 去掉行首标记（1-6 个 #）
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
 
     # 4. * 列表 → - 列表
     text = re.sub(r"^[\*\+]\s+", "- ", text, flags=re.MULTILINE)
 
     # 5. 残留的单个 | 替换为空格
     text = text.replace(" | ", "  ")
+
+    # 6. 兜底：删除一切残留的 * 与 #（未配对星号、孤立井号、行内残余标记）
+    text = _strip_md_symbols(text)
 
     return text
 
@@ -857,6 +898,25 @@ def _truncate_at_sentence(text: str, limit: int = _NEWS_SUMMARY_CAP) -> str:
     return text[:limit].rstrip() + "……"
 
 
+# ── 通用 MCP 查询（_generic_mcp）──
+
+# system 提示词：纯文本无 Markdown；候选代码精确匹配；错误/空数据不反复重试
+_GENERIC_MCP_SYSTEM_PROMPT = (
+    "你是数据查询助手。用纯文本回答，禁止Markdown表格（禁止|和-组成的表格线），"
+    "禁止使用#和*号。数据用缩进对齐或列表呈现。\n"
+    "搜索类工具返回多个候选代码时，必须选用与用户公司名完全匹配的那一条，"
+    "不要用名称近似的其他公司凑合。\n"
+    "工具返回错误或空数据时，不要反复重试同一个工具；最多换参数重试一次，"
+    "仍拿不到就基于已经拿到的数据回答，或如实说明该项数据暂缺。"
+)
+
+# 最终综合也失败时的优雅降级提示（任何情况下都不把原始 JSON 给用户）
+_MCP_DATA_UNAVAILABLE = (
+    "抱歉，相关数据暂未获取成功（数据源返回异常或为空）。"
+    "请稍后重试，或换个更具体的问法（如指明股票代码、市场与具体指标）。"
+)
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -1017,7 +1077,7 @@ class MarketReviewAgent:
         content = text
         if ok:
             content += f"\n请核对上方股票名称与代码；如不正确，回复『删自选 {keyword}』后重新添加。"
-        return {"role": "assistant", "content": content}
+        return {"role": "assistant", "content": _clean_markdown(content)}
 
     def _watchlist_remove(self, msg: str) -> dict:
         """删除自选股：回显删除结果。"""
@@ -1029,7 +1089,7 @@ class MarketReviewAgent:
         except Exception as e:
             logger.warning("自选股删除调用异常（fail-safe）: %s", e, exc_info=True)
             return {"role": "assistant", "content": "自选股删除失败，请稍后再试。"}
-        return {"role": "assistant", "content": text}
+        return {"role": "assistant", "content": _clean_markdown(text)}
 
     def _watchlist_list(self) -> dict:
         """自选股清单：纯文本直接输出，无需 LLM。"""
@@ -1047,7 +1107,7 @@ class MarketReviewAgent:
             lines.append(f"{i}. {name}（{code}）")
         lines.append("")
         lines.append("回复『复盘我的自选股』查看逐只复盘；『加自选 名称』/『删自选 名称』管理清单。")
-        return {"role": "assistant", "content": "\n".join(lines)}
+        return {"role": "assistant", "content": _clean_markdown("\n".join(lines))}
 
     def _watchlist_system_prompt(self) -> str:
         """自选股复盘系统提示词：优先 get_system_prompt("watchlist")，取不到/为空用内联兜底。"""
@@ -1305,9 +1365,11 @@ class MarketReviewAgent:
           未就绪或调用失败时降级到旧三源直采逻辑。
         - 行业过滤除标题外，同时匹配 time/content/summary 字段（有的话）。
         - 展示策略：按天分组、按时间倒序；全市场查询每天上限30条（超限按重要性
-          评分截断），行业查询每天全量展示。标题一律完整输出，绝不拦腰截断；
-          抓取层把正文拦腰截断当标题时（title 是 content/summary/brief 的裸
-          前缀），用摘要字段按句子边界截断（上限 _NEWS_SUMMARY_CAP 字）修复展示。
+          评分截断），行业查询每天全量展示。条目格式为「[时间] 标题」，不再带
+          【来源】标签（省出字符给新闻本身，来源归属由头部「来源：xxxN条」统计行
+          统一承载）。标题一律完整输出，绝不拦腰截断；抓取层把正文拦腰截断当标题
+          时（title 是 content/summary/brief 的裸前缀），用摘要字段按句子边界截断
+          （上限 _NEWS_SUMMARY_CAP 字）修复展示。
         - 头部覆盖描述按实际数据生成：单日写「当日」/实际日期，多日写起止日期，
           不照抄「48小时」模板；来源统计只列实际有贡献的源。
         - 解读段：板块查询（sector 非 None）默认在确定性清单后追加 LLM 解读
@@ -1438,7 +1500,6 @@ class MarketReviewAgent:
                     block += f"，原始{raw_cnt}条按重要性截断"
                 block += "）---\n"
                 for it in items:
-                    src_name = _NEWS_SOURCE_NAMES.get(it["source"], it["source"])
                     text = it["title"]
                     summary = (it.get("summary") or "").strip()
                     # 防御：抓取层把正文拦腰截断当标题（如 cls brief[:80]、智研
@@ -1447,7 +1508,9 @@ class MarketReviewAgent:
                     # 摘要缺失或并非标题前缀时，标题原样完整输出，绝不拦腰截断。
                     if summary and len(summary) > len(text) and summary.startswith(text):
                         text = _truncate_at_sentence(summary)
-                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] 【{src_name}】{text}\n"
+                    # 展示行格式：[时间] 标题。条目不再带【来源】标签（省出字符给
+                    # 新闻本身）；来源归属由头部「来源：xxxN条」统计行统一承载。
+                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] {text}\n"
                 blocks.append(block)
 
             # 头部：总条数、覆盖时间段、各源条数
@@ -1467,6 +1530,11 @@ class MarketReviewAgent:
             if meta_parts:
                 news_text += " | ".join(meta_parts) + "\n"
             news_text += "".join(blocks)
+
+        # 输出卫生兜底：新闻标题为外部文本，可能混入 # 或 * 字符。清单进入
+        # 解读 prompt 与最终展示前统一做符号级清洗（只删 #/*，不动结构、
+        # 不动头部「来源：xxxN条」统计行与其余字符）。
+        news_text = _strip_md_symbols(news_text)
 
         # ── 4. 解读段：板块查询默认附带 LLM 解读；全市场保持触发词逻辑 ──
         triggered = bool(message) and any(w in message for w in _NEWS_ANALYSIS_TRIGGERS)
@@ -1601,7 +1669,7 @@ class MarketReviewAgent:
         except Exception as e:
             logger.warning("个股数据获取失败(%s %s): %s", market, code, e, exc_info=True)
             info = f"{name}({code})\n数据暂不可用，请稍后再试。"
-        return {"role": "assistant", "content": info}
+        return {"role": "assistant", "content": _clean_markdown(info)}
 
     async def _futures_query(self, message: str, stream: bool):
         """期货查询。"""
@@ -1619,10 +1687,21 @@ class MarketReviewAgent:
         kw, mkt, sym = matched
         q = fetch_futures_quote(mkt, sym)
         info = f"{kw}期货: 价格{q.get('price','?')} 涨跌{q.get('pct','?')}% 成交量{q.get('volume','?')}"
-        return {"role": "assistant", "content": info}
+        return {"role": "assistant", "content": _clean_markdown(info)}
 
     async def _generic_mcp(self, message: str, stream: bool, max_rounds: int = 5):
-        """通用MCP查询——使用DeepSeek原生function calling，100%可靠。"""
+        """通用MCP查询——使用DeepSeek原生function calling，100%可靠。
+
+        输出卫生（任何路径都不把工具原始 JSON dump 给用户）：
+        - 模型在轮次内给出纯文本回答：_clean_markdown 清洗后返回；
+        - 循环跑满 max_rounds 仍要调工具：把所有已收集工具结果拼入上下文，
+          再发起一次无 tools 的最终综合调用（_mcp_final_synthesis），让 LLM
+          用人话总结；综合也失败时返回优雅的「数据暂未获取成功」类提示；
+        - 工具结果喂回模型前经 _mcp_result_for_prompt 压缩：错误返回压成
+          简短错误说明（工程师B 的 is_mcp_error/mcp_error_brief，未就绪时
+          退回现状原文），正常返回经 compact_mcp_result 压缩（未就绪时退回
+          json.dumps 截断 3000），防止大段原文挤爆上下文并诱导反复重试。
+        """
         from agent.data_fetcher import get_mcp_tools, _mcp_call
         tools = get_mcp_tools()
         if not tools:
@@ -1644,7 +1723,7 @@ class MarketReviewAgent:
             })
 
         messages = [
-            {"role": "system", "content": "你是数据查询助手。用纯文本回答，禁止Markdown表格（禁止|和-组成的表格线）。数据用缩进对齐或列表呈现。"},
+            {"role": "system", "content": _GENERIC_MCP_SYSTEM_PROMPT},
             {"role": "user", "content": message}
         ]
         all_results = []
@@ -1656,8 +1735,8 @@ class MarketReviewAgent:
             )
             choice = completion.choices[0]
             if choice.finish_reason == "stop" and not choice.message.tool_calls:
-                # 无需工具，直接回答
-                answer = choice.message.content or ""
+                # 无需工具，直接回答（清洗 markdown 符号后返回）
+                answer = _clean_markdown(choice.message.content or "")
                 if all_results:
                     answer += f"\n[数据来源: {len(all_results)}次MCP调用]"
                 return {"role": "assistant", "content": answer}
@@ -1671,20 +1750,90 @@ class MarketReviewAgent:
                         logger.warning("MCP工具参数解析失败(%s): %s", fn.name, e, exc_info=True)
                         args = {}
                     data = _mcp_call(fn.name, args)
-                    data_str = json.dumps(data, ensure_ascii=False)[:3000]
-                    if not data_str or data_str == "{}" or ('"data":[]' in data_str and '"s_list":[]' not in data_str):
+                    data_str = self._mcp_result_for_prompt(fn.name, data)
+                    if data_str is None:
                         return {"role": "assistant", "content": "抱歉，该数据暂不支持查询。新浪智研API返回为空，可能原因：非交易时段数据未更新、该接口暂不可用、或查询参数不支持。请尝试其他问题。"}
-                    all_results.append({"tool": fn.name, "result": data_str[:300]})
+                    all_results.append({"tool": fn.name, "result": data_str[:500]})
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": data_str})
             else:
                 break
 
-        # 汇总
-        if all_results:
-            summary = "\n".join(f"- {r['tool']}: {r['result']}" for r in all_results)
-            return {"role": "assistant", "content": f"查询结果:\n{summary}\n[共{len(all_results)}次工具调用]"}
-        return {"role": "assistant", "content": "未获取到数据，请尝试更具体的查询。"}
+        # 循环跑满：禁止返回原始 JSON dump，改走无 tools 的最终综合
+        return await self._mcp_final_synthesis(message, all_results)
+
+    @staticmethod
+    def _mcp_result_for_prompt(tool_name: str, data) -> Optional[str]:
+        """把一次 MCP 工具返回压缩为喂回模型的文本；返回 None 表示数据为空
+        （走既有的「暂不支持查询」早退路径）。
+
+        - 错误返回（第八波 is_mcp_error 识别）→ 简短错误说明，不喂大段原文；
+        - 正常返回 → compact_mcp_result 压缩（未就绪时退回 json.dumps 截断）；
+        - 空判定口径与历史行为一致（{} / "data":[] 且非 s_list 场景）。
+        """
+        # 第八波：错误识别优先（工程师B 提供；导入未就绪时本段整体跳过，退回现状）
+        if is_mcp_error is not None:
+            try:
+                if is_mcp_error(data):
+                    brief = mcp_error_brief(data) if mcp_error_brief is not None else "工具返回错误"
+                    logger.info("MCP工具返回错误(%s): %s", tool_name, brief)
+                    return f"[工具 {tool_name} 返回错误] {brief}"
+            except Exception as e:
+                logger.warning(
+                    "is_mcp_error/mcp_error_brief 判定异常（%s，按正常数据处理）: %s",
+                    tool_name, e, exc_info=True,
+                )
+        payload = data
+        if compact_mcp_result is not None:
+            try:
+                compacted = compact_mcp_result(data)
+                if compacted is not None:
+                    payload = compacted
+            except Exception as e:
+                logger.warning(
+                    "compact_mcp_result 压缩异常（%s，退回原始数据）: %s",
+                    tool_name, e, exc_info=True,
+                )
+        data_str = json.dumps(payload, ensure_ascii=False)[:3000]
+        if not data_str or data_str == "{}" or ('"data":[]' in data_str and '"s_list":[]' not in data_str):
+            return None
+        return data_str
+
+    async def _mcp_final_synthesis(self, message: str, all_results: list) -> dict:
+        """工具循环跑满 max_rounds 后的收尾：把所有已收集工具结果拼入上下文，
+        发起一次无 tools 的最终综合调用，让 LLM 用人话总结。
+
+        综合调用失败或返回为空时，返回优雅的「数据暂未获取成功」类提示；
+        任何情况下都不把原始 JSON 给用户。
+        """
+        if not all_results:
+            return {"role": "assistant", "content": "未获取到数据，请尝试更具体的查询。"}
+        summary = "\n".join(f"[{r['tool']}] {r['result']}" for r in all_results)
+        synth_messages = [
+            {"role": "system", "content": _GENERIC_MCP_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"用户问题：{message}\n\n"
+                f"以下是通过数据工具查询到的结果（可能包含错误说明或不完整数据）：\n"
+                f"{summary}\n\n"
+                "请基于以上结果，用通顺的中文纯文本直接回答用户问题："
+                "数据可用就正常解读；结果是错误说明、空数据或明显占位（如字段全为--）"
+                "的部分，如实告知用户该项数据暂未获取成功，并给出可行的追问建议。"
+                "禁止输出JSON或字段名罗列，禁止描述工具调用过程，禁止使用#和*号。"
+            )},
+        ]
+        try:
+            completion = await self.client.chat.completions.create(
+                model=self.model, messages=synth_messages,
+                temperature=0.2, max_tokens=4096,
+            )
+            answer = (completion.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning("MCP 最终综合调用失败，返回优雅降级提示: %s", e, exc_info=True)
+            answer = ""
+        answer = _clean_markdown(answer).strip()
+        if answer:
+            return {"role": "assistant", "content": answer}
+        return {"role": "assistant", "content": _MCP_DATA_UNAVAILABLE}
 
     async def _fund_query(self, message: str, stream: bool):
         """通用MCP查询。简单数据用预封装函数直接返回，复杂问题走function calling。"""
@@ -1698,17 +1847,17 @@ class MarketReviewAgent:
                 logger.warning("fetch_market_breadth 失败: %s", e, exc_info=True)
                 return {"role": "assistant", "content": "涨跌分布数据暂不可用，数据源解析失败。请稍后再试。"}
             if b:
-                return {"role": "assistant", "content": f"今日A股涨跌分布：上涨{b.get('total_up','?')}家 下跌{b.get('total_down','?')}家 平盘{b.get('平','?')}家。涨停{b.get('涨停','?')}家 跌停{b.get('跌停','?')}家。"}
+                return {"role": "assistant", "content": _clean_markdown(f"今日A股涨跌分布：上涨{b.get('total_up','?')}家 下跌{b.get('total_down','?')}家 平盘{b.get('平','?')}家。涨停{b.get('涨停','?')}家 跌停{b.get('跌停','?')}家。")}
         if any(kw in msg for kw in ["热搜","热榜"]):
             h = fetch_hot_stocks()
             if h:
                 items = "\n".join(f"{i+1}. {s['name']}({s['code']}) 热度{s.get('heat','?')}" for i, s in enumerate(h[:10]))
-                return {"role": "assistant", "content": f"A股热搜榜Top10：\n{items}\n"}
+                return {"role": "assistant", "content": _clean_markdown(f"A股热搜榜Top10：\n{items}\n")}
             return {"role": "assistant", "content": "热搜数据暂不可用，新浪智研API返回为空。请稍后再试。"}
         if any(kw in msg for kw in ["汇率","人民币","美元"]):
             f = fetch_forex()
             if f.get("在岸人民币","?") != "?":
-                return {"role": "assistant", "content": f"最新汇率：在岸人民币 {f['在岸人民币']} 涨跌{f.get('涨跌','?')} "}
+                return {"role": "assistant", "content": _clean_markdown(f"最新汇率：在岸人民币 {f['在岸人民币']} 涨跌{f.get('涨跌','?')} ")}
             return {"role": "assistant", "content": "汇率数据暂不可用，新浪智研API返回为空。请稍后再试。"}
         if any(kw in msg for kw in ["期货","黄金","原油","铜"]):
             kw_map = {"黄金":("gn","AU0"),"原油":("gn","SC0"),"铜":("gn","CU0")}
@@ -1716,7 +1865,7 @@ class MarketReviewAgent:
                 if kw in msg:
                     d = fetch_futures(mkt, sym)
                     if d.get("price"):
-                        return {"role": "assistant", "content": f"{kw}期货：价格{d['price']} 涨跌{d.get('pct','?')}% 成交量{d.get('vol','?')} "}
+                        return {"role": "assistant", "content": _clean_markdown(f"{kw}期货：价格{d['price']} 涨跌{d.get('pct','?')}% 成交量{d.get('vol','?')} ")}
                     return {"role": "assistant", "content": f"{kw}期货数据暂不可用，请稍后再试。"}
         return await self._generic_mcp(message, stream)
 
@@ -1927,10 +2076,16 @@ class MarketReviewAgent:
             return {"role": "assistant", "content": clean + disclaimer}
 
     async def _stream_response(self, messages: list, archive_callback=None) -> AsyncGenerator:
-        """流式响应生成器。注意：流式不清理markdown，但非流式会清理。
+        """流式响应生成器。
+
+        输出卫生：流式对每个 chunk 做符号级清洗（_strip_md_symbols，删除 *
+        与 #），非流式则做完整 _clean_markdown 结构性清洗。符号级方案无
+        状态、跨 chunk 安全——** 配对无需识别：目标是 * 与 # 零到达用户，
+        无论 ** 完整到达还是拆在两个 chunk，每个 * 都被删除，拼接结果与
+        整段清洗一致；不含符号的 chunk 原样透传，边界不受影响。
 
         archive_callback：可选存档回调（第四波），在流结束（生成器被完整消费、
-        含截断续写完成）后以最终全文调用一次；客户端中途断开时不触发。
+        含截断续写完成）后以最终全文（清洗后）调用一次；客户端中途断开时不触发。
         """
         accumulated = ""
         continued = False
@@ -1949,8 +2104,10 @@ class MarketReviewAgent:
                     continue
                 choice = chunk.choices[0]
                 if choice.delta.content:
-                    accumulated += choice.delta.content
-                    yield choice.delta.content
+                    piece = _strip_md_symbols(choice.delta.content)
+                    accumulated += piece
+                    if piece:  # 整个 chunk 都是 #/* 时清洗后为空，跳过不发送
+                        yield piece
                 # 只有最后一个 chunk 的 finish_reason 有值（中间 chunk 为 None）
                 if getattr(choice, "finish_reason", None):
                     finish_reason = choice.finish_reason

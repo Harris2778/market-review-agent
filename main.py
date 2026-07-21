@@ -435,11 +435,22 @@ async def _stream_chat_completion(agent, user_message: str, model: str, history:
         # 立即发送 role chunk，防止连接超时
         yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
-        # 显示预计等待时间
-        warm = agent.cache_warm
-        seconds = "15-30" if warm else "30-40"
-        hint = f"正在采集市场数据并生成分析报告，请稍候..（{'首次' if not warm else ''}约需{seconds}秒）\n\n"
-        yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': hint}, 'finish_reason': None}]})}\n\n"
+        # 加载提示语分级：只有 detect_intent 判定为重数据采集意图
+        # （market_review / sector_deep_dive，采集+成文耗时长）才发等待提示；
+        # 其他意图（闲聊/新闻/个股/简单查询等）直接出答案，不发提示。
+        intent = None
+        if detect_intent is not None:
+            try:
+                intent, _ = detect_intent(user_message)
+            except Exception:
+                logger.warning("流式提示语分级的意图判定异常（按不发提示处理）", exc_info=True)
+                intent = None
+        if intent in ("market_review", "sector_deep_dive"):
+            # 显示预计等待时间
+            warm = agent.cache_warm
+            seconds = "15-30" if warm else "30-40"
+            hint = f"正在采集市场数据并生成分析报告，请稍候..（{'首次' if not warm else ''}约需{seconds}秒）\n\n"
+            yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': hint}, 'finish_reason': None}]})}\n\n"
 
         # 流式输出内容
         async for content_chunk in await agent.process_message(user_message, stream=True, history=history):

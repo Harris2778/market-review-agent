@@ -654,8 +654,30 @@ def get_mcp_tools() -> list:
     return []
 
 
+def _http_error_struct(code: int) -> dict:
+    """HTTP 层失败的归一化返回结构（供 is_mcp_error/mcp_error_brief 识别）。"""
+    return {"error": f"HTTP_{code}"}
+
+
+def _real_status_code(resp) -> Optional[int]:
+    """取真实 HTTP 状态码；mock 响应未显式设置 status_code 时返回 None。
+
+    现有测试大量用裸 MagicMock 模拟响应（status_code 是自动 Mock 对象而非
+    int），必须用 isinstance 严格收窄，只对真实整数状态码做非 200 判定，
+    避免把 mock 误判成 HTTP 错误。
+    """
+    code = getattr(resp, "status_code", None)
+    return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+
 def _mcp_call(tool_name: str, args: dict) -> dict:
-    """通用MCP工具调用。自动兼容JSON和分号分隔字符串两种响应格式。"""
+    """通用MCP工具调用。自动兼容JSON和分号分隔字符串两种响应格式。
+
+    HTTP 非 200 时返回 {"error": "HTTP_<code>"} 简洁结构（不抛异常、不回传
+    大段原始错误页），供 is_mcp_error / mcp_error_brief 统一识别；其余返回
+    结构与历史行为完全一致（JSON 解析结果 / {"raw": ...} / 失败时 {}），
+    返回体中 status.code 非成功的数据原样保留，由 is_mcp_error 负责识别。
+    """
     token = _env("SINA_MCP_TOKEN", "")
     if not token:
         return {}
@@ -665,6 +687,10 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
             "jsonrpc":"2.0","method":"initialize","id":1,
             "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
         }, timeout=15)
+        init_code = _real_status_code(r)
+        if init_code is not None and init_code != 200:
+            logger.warning("_mcp_call initialize HTTP错误 tool=%s code=%s", tool_name, init_code)
+            return _http_error_struct(init_code)
         sid = r.headers.get("Mcp-Session-Id","")
         if not sid:
             return {}
@@ -672,6 +698,10 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
             "jsonrpc":"2.0","method":"tools/call","id":2,
             "params":{"name": tool_name, "arguments": args}
         }, headers={"Mcp-Session-Id":sid}, timeout=30)
+        call_code = _real_status_code(r2)
+        if call_code is not None and call_code != 200:
+            logger.warning("_mcp_call tools/call HTTP错误 tool=%s code=%s", tool_name, call_code)
+            return _http_error_struct(call_code)
         d = r2.json()
         content = d.get("result",{}).get("content",[])
         if content and isinstance(content,list):
@@ -698,6 +728,182 @@ def _mcp_call(tool_name: str, args: dict) -> dict:
     except Exception as e:
         logger.warning("_mcp_call MCP工具调用失败 tool=%s: %s", tool_name, e)
     return {}
+
+
+# ── MCP 结果归一化公共助手（编排层防御式使用，签名固定勿改）──
+#
+# 背景：function calling 循环里模型拿到 {"result":{"data":[],"status":
+# {"code":11,"msg":"Input error"}}} 或全 "--" 占位数据时识别不出失败，
+# 反复重试后把原始 JSON 直接甩给用户。以下三个助手供编排层统一判定/
+# 压缩/摘要 MCP 返回：is_mcp_error 判错，mcp_error_brief 出单行摘要，
+# compact_mcp_result 输出剔除占位字段后的紧凑结构。
+
+_MCP_PLACEHOLDER_STRINGS = frozenset({"", "--", "-", "—", "null", "none", "n/a", "nan"})
+_MCP_SUCCESS_CODES = frozenset({0, "0", 200, "200"})
+# 归一化判定时不计入“有效内容”的元数据键
+_MCP_META_KEYS = frozenset({"status", "error", "type"})
+# compact_mcp_result 单字符串长度上限（超限在标点边界截断）
+_MCP_MAX_STR_LEN = 300
+# 常见英文错误消息 → 中文（供 mcp_error_brief 输出人类可读摘要）
+_MCP_MSG_CN = {
+    "input error": "参数错误",
+    "success": "成功",
+    "ok": "成功",
+    "no data": "无数据",
+    "not found": "未找到",
+    "timeout": "超时",
+}
+
+
+def _is_mcp_placeholder(value) -> bool:
+    """判定单个值是否为占位（无信息）：None/空串/"--"/空dict/空list。
+
+    0 / False 等数值是有效数据，绝不视为占位。
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _MCP_PLACEHOLDER_STRINGS
+    if isinstance(value, (dict, list)):
+        return len(value) == 0
+    return False
+
+
+def _compact_mcp_value(value):
+    """递归压缩：剔除占位字段，超长字符串按句子边界截断。"""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            cv = _compact_mcp_value(v)
+            if not _is_mcp_placeholder(cv):
+                out[k] = cv
+        return out
+    if isinstance(value, list):
+        return [cv for cv in (_compact_mcp_value(v) for v in value)
+                if not _is_mcp_placeholder(cv)]
+    if isinstance(value, str):
+        if value.strip().lower() in _MCP_PLACEHOLDER_STRINGS:
+            return ""
+        return _truncate_at_boundary(value, _MCP_MAX_STR_LEN)
+    return value
+
+
+def compact_mcp_result(data) -> dict:
+    """压缩 MCP 原始返回为紧凑结构（供编排层/模型消费，签名固定）。
+
+    - 递归剔除 None / 空串 / "--" 等占位串 / 空 dict / 空 list 字段
+    - 0 / False 等有效数值保留
+    - 超长字符串在标点边界截断（复用 _truncate_at_boundary，上限 300 字）
+    - 输入非 dict 时包装成 dict：list → {"items": [...]}，
+      有效标量 → {"value": ...}，纯占位输入 → {}
+    """
+    if isinstance(data, dict):
+        return _compact_mcp_value(data)
+    if isinstance(data, list):
+        compacted = _compact_mcp_value(data)
+        return {"items": compacted} if compacted else {}
+    if _is_mcp_placeholder(data):
+        return {}
+    cv = _compact_mcp_value(data) if isinstance(data, str) else data
+    return {"value": cv}
+
+
+def _iter_status_dicts(value):
+    """递归产出结构中所有名为 status 的 dict（MCP 错误码的常见载体）。"""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "status" and isinstance(v, dict):
+                yield v
+            else:
+                yield from _iter_status_dicts(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _iter_status_dicts(v)
+
+
+def _strip_mcp_meta(value):
+    """递归剔除 status/error/type 元数据键，剩下的是“有效内容”。"""
+    if isinstance(value, dict):
+        return {k: _strip_mcp_meta(v) for k, v in value.items()
+                if k not in _MCP_META_KEYS}
+    if isinstance(value, list):
+        return [_strip_mcp_meta(v) for v in value]
+    return value
+
+
+def is_mcp_error(data) -> bool:
+    """判定 MCP 返回是否为错误/空数据（模型不应重试、不应原样转述）。
+
+    以下形态一律判为错误：
+    - None / 空容器 / 占位标量
+    - {"error": ...}（_mcp_call 的 HTTP 归一化结构）
+    - 任意 status.code 非成功值（成功值：0/200），如 code=11 Input error
+    - 剔除 status/error/type 元数据与占位字段后无有效内容：
+      data 为 []、s_list 为空、有效字段全为 "--" 占位等
+    """
+    if data is None:
+        return True
+    if isinstance(data, str):
+        return data.strip().lower() in _MCP_PLACEHOLDER_STRINGS
+    if not isinstance(data, (dict, list)):
+        return False  # 数字/布尔等标量视为有效数据
+    if not data:
+        return True
+    if isinstance(data, dict) and data.get("error"):
+        return True
+    for st in _iter_status_dicts(data):
+        code = st.get("code")
+        if code is not None and code not in _MCP_SUCCESS_CODES:
+            return True
+    # 剥掉元数据后再压缩：不剩任何有效字段即为空数据
+    return not compact_mcp_result(_strip_mcp_meta(data))
+
+
+def _has_placeholder_scalar(value) -> bool:
+    """结构中是否存在被占位（None/"--" 等）的标量字段（区别于整段为空）。"""
+    if isinstance(value, dict):
+        return any(_has_placeholder_scalar(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_placeholder_scalar(v) for v in value)
+    return value is None or (
+        isinstance(value, str) and value.strip().lower() in _MCP_PLACEHOLDER_STRINGS
+    )
+
+
+def mcp_error_brief(data) -> str:
+    """MCP 错误的单行摘要，给人和模型看（签名固定）。
+
+    例：'hkFinanceReportsByIndex 参数错误(code=11)'、'HTTP错误(502)'、
+    '无有效数据'、'返回字段均为占位符(--)'。data 中带 tool/tool_name 键时
+    自动加工具名前缀；非错误数据返回 ''。
+    """
+    if not is_mcp_error(data):
+        return ""
+    name = ""
+    if isinstance(data, dict):
+        name = str(data.get("tool") or data.get("tool_name") or "").strip()
+    prefix = f"{name} " if name else ""
+    # 1) _mcp_call 的 HTTP 归一化结构
+    err = data.get("error") if isinstance(data, dict) else None
+    if err:
+        err_s = str(err)
+        if err_s.startswith("HTTP_"):
+            return f"{prefix}HTTP错误({err_s[5:]})"
+        return f"{prefix}调用失败({_truncate_at_boundary(err_s, 40)})"
+    # 2) status.code 非成功
+    for st in _iter_status_dicts(data):
+        code = st.get("code")
+        if code is None or code in _MCP_SUCCESS_CODES:
+            continue
+        msg = str(st.get("msg") or "").strip()
+        msg_cn = _MCP_MSG_CN.get(msg.lower(), msg)
+        if msg_cn:
+            return f"{prefix}{_truncate_at_boundary(msg_cn, 40)}(code={code})"
+        return f"{prefix}调用失败(code={code})"
+    # 3) 空数据：区分「整段为空」与「字段全占位」
+    if _has_placeholder_scalar(_strip_mcp_meta(data)):
+        return f"{prefix}返回字段均为占位符(--)，无有效数据"
+    return f"{prefix}无有效数据"
 
 
 def fetch_market_breadth() -> dict:

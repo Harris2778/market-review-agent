@@ -4,7 +4,8 @@
 1. data_fetcher.fetch_news_pool：五源（sina/eastmoney/mcp/cls/tushare）聚合结构、
    统一字段（title/time/source）、跨源标题去重、单源失败安全降级。
 2. fetch_mcp_news：解析 _mcp_call 返回的原始数据后，每条 time 字段非空（回归修复）。
-3. orchestrator._news_only 透传模式：按天分组、头部含总条数与各源统计、条目带来源标注。
+3. orchestrator._news_only 透传模式：按天分组、头部含总条数与各源统计；
+   条目格式为「[时间] 标题」，不再带【来源】标签（来源统计由头部承载）。
 4. 行业过滤：查『半导体新闻』时输出不含无关行业标题。
 5. 重要性截断：全市场每天上限 30 条，高分新闻（业绩/政策/异动/公司行动）优先保留，
    即使它们在新闻池列表的末尾。
@@ -232,7 +233,7 @@ class TestMcpNewsTime:
 
 
 # ════════════════════════════════════════════════════════════════
-# 3. _news_only 透传模式：按天分组 + 总条数 + 来源标注
+# 3. _news_only 透传模式：按天分组 + 总条数 + 头部来源统计（条目无标签）
 # ════════════════════════════════════════════════════════════════
 
 
@@ -270,9 +271,15 @@ class TestNewsOnlyPassthrough:
         assert "共" in content and "3" in content and "条" in content, (
             f"输出头部缺少总条数统计:\n{content[:200]}"
         )
-        # 来源标注 / 各源统计（展示名见 orchestrator._NEWS_SOURCE_NAMES）
-        assert "新浪" in content, f"输出缺少新浪来源标注:\n{content[:300]}"
-        assert "东方财富" in content, f"输出缺少东方财富来源标注:\n{content[:300]}"
+        # 头部来源统计 / 各源条数（展示名见 orchestrator._NEWS_SOURCE_NAMES；
+        # 条目行本身不再带【来源】标签，来源信息由头部统计行承载）
+        assert "新浪" in content, f"输出缺少新浪来源统计:\n{content[:300]}"
+        assert "东方财富" in content, f"输出缺少东方财富来源统计:\n{content[:300]}"
+        # 条目行格式为「[时间] 标题」，无【来源】标签
+        item_lines = [l for l in content.splitlines()
+                      if "沪深两市成交额突破一万五千亿元" in l]
+        assert item_lines and item_lines[0].startswith("[")
+        assert "【" not in item_lines[0], f"条目行不应带【来源】标签: {item_lines[0]}"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -550,10 +557,11 @@ class TestNewsOnlyNoTimeItems:
             f"无时间条目未归入交易日分组:\n{content}"
         )
         assert f"--- {DAY1}（1条）---" in content
-        # 渲染时间位置为交易日兜底，且带来源标注
+        # 渲染时间位置为交易日兜底；条目格式为「[时间] 标题」，不再带【来源】标签
         line = next(l for l in content.splitlines() if self.NO_TIME_TITLE in l)
-        assert f"[{DAY0}]" in line, f"无时间条目未用交易日兜底渲染: {line}"
-        assert "【新浪】" in line
+        assert line == f"[{DAY0}] {self.NO_TIME_TITLE}", (
+            f"无时间条目渲染格式异常（应为 [时间] 标题、无来源标签）: {line}"
+        )
         # 头部总条数含无时间条目
         assert "共2条" in content
 
@@ -894,7 +902,8 @@ class TestNewsOnlyDefensiveDisplay:
                 "source": "智研", "content": self.FULL * 20}
         content = self._run(item)
         line = next(l for l in content.splitlines() if self.FRAG in l)
-        text_part = line.split("】", 1)[1]
+        # 展示行格式为「[时间] 标题」（无【来源】标签），取 ] 后的标题部分量长度
+        text_part = line.split("] ", 1)[1]
         assert len(text_part) <= 200 + len("……"), (
             f"摘要展示不应超过 200 字上限（含省略号）: {len(text_part)} 字"
         )

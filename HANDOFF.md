@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -58,7 +58,7 @@ agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     793 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -99,6 +99,7 @@ tests/                     793 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
 ✅ 第六波: 工程化（新闻注入防护/配额/日志覆盖）
 ✅ 第七波: 个性化(自选股) + 行业知识库 + 以史为鉴
 🔧 新闻模式三问题修复（计划外插入，已完成）
+🔧 输出卫生 + MCP 兜底修复（计划外插入，已完成）
 ```
 
 路线图七波全部完成。后续方向：研报库工作线（另线进行）/ 生产挂卷后问责数据积累 / LLM judge 实现。
@@ -131,6 +132,50 @@ tests/                     793 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
     截断（≤200 字）展示完整句。
 - 测试：793 passed 全绿（tests/test_news.py +18 用例；新增 tests/test_news_fetch_layer.py
   34 用例；全部 mock 零网络）。
+
+**输出卫生 + MCP 兜底修复（2026-07-22，后续记录）**
+
+- 现象：① 新闻条目【来源】标签冗余——头部已有「来源：xxxN条」统计行，
+  每条目再标【新浪】【东方财富】浪费字符且视觉嘈杂；② Markdown 符号泄漏——
+  解读/报告中偶发 # 标题与 * 加粗符号直接到达用户（流式路径此前完全未清洗）；
+  ③ 「查询鲟龙科技近期的财务指标」类 MCP 查询跑满工具轮次后，把原始 JSON
+  dump 直接甩给用户。
+- 根因：
+  - _clean_markdown 只挂在 3 个用户可见出口（流式路径、个股/期货/基金/
+    自选股等确定性拼装出口均未清洗），且旧实现不清行内 *斜体* 与残留孤立符号；
+  - _generic_mcp 循环跑满 max_rounds 后直接拼接 all_results 原始 JSON 返回，
+    无任何综合；模型对 {"data":[],"status":{"code":11,"msg":"Input error"}}
+    或全 "--" 占位数据识别不出失败，反复重试同一工具直至跑满轮次；
+  - MCP 错误与空占位无识别：_mcp_call HTTP 非 200 时大段原始错误页直接进
+    上下文，无 {"error":...} 归一化；status.code 非成功、全 "--" 占位均无判定；
+  - main.py 流式加载提示语「正在采集…约需N秒」无差别发送，普通快查询
+    （闲聊/新闻/个股）也弹，误导等待预期。
+- 修复方案要点：
+  - 抓取层（data_fetcher，工程师B）：新增 compact_mcp_result / is_mcp_error /
+    mcp_error_brief 三助手（签名固定）——递归剔除占位字段（0/False 不误判）、
+    句子边界截断、HTTP 错误与 status.code 非成功统一识别、单行中文错误摘要；
+    _mcp_call 的 initialize 与 tools/call 两跳 HTTP 非 200 归一化为
+    {"error":"HTTP_<code>"}（不抛异常、不回传原始错误页；mock 兼容——
+    status_code 非真实 int 时不做非 200 判定，不误伤既有测试）。
+  - 编排层（orchestrator，工程师A）：_clean_markdown 强化（行内 *斜体*、
+    1-6 个 # 标题、末尾 _strip_md_symbols 符号级兜底，保证 * 与 # 零到达用户），
+    挂到所有用户可见出口——含流式逐 chunk 符号级清洗（无状态、跨 chunk 安全，
+    干净 chunk 原样透传）与个股/期货/基金/自选股等确定性拼装出口；新闻条目
+    去【来源】标签改「[时间] 标题」，来源归属由头部统计行统一承载；_generic_mcp
+    跑满轮次后改走 _mcp_final_synthesis——把所有已收集工具结果拼入上下文做
+    一次无 tools 最终综合调用，让 LLM 用人话总结，综合失败/为空返回优雅降级
+    提示，任何路径绝不 dump 原始 JSON；工具结果喂回模型前经
+    _mcp_result_for_prompt 压缩（错误返回压成单行摘要，正常返回经
+    compact_mcp_result 压缩防上下文挤爆）；三助手防御式导入，未就绪退回
+    现状行为，绝不硬依赖。
+  - 提示词（system_prompts）：六个提示词统一追加「输出必须是纯文本：禁止
+    使用任何Markdown语法——不用 # 和 * 号，用【】标记小节标题」。
+  - 接入层（main.py）：加载提示语分级——仅 detect_intent 判定为
+    market_review / sector_deep_dive（重数据采集意图）才发「正在采集…约需N秒」，
+    其他意图直接出答案；意图判定异常按不发提示处理（fail-safe）。
+- 测试：895 passed 全绿（tests/test_news.py 断言同步；新增
+  tests/test_mcp_result_tools.py 41 用例、tests/test_output_hygiene.py
+  61 用例；全部 mock 零网络）。
 
 ## 已知问题
 
