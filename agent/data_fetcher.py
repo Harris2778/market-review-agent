@@ -695,14 +695,15 @@ def fetch_sw_classify(symbol: str) -> dict:
 
 
 def search_stock(keyword: str) -> list:
-    """股票代码搜索。"""
-    d = _mcp_call("globalStockSearchSymbols", {"type": "11,31,41", "key": keyword, "format": "text", "num": 5})
+    """股票代码搜索。返回格式: CSV 名称,市场,代码,完整代码,名称2"""
+    d = _mcp_call("globalStockSearchSymbols", {"type": "11", "key": keyword, "format": "text", "num": "5"})
     items = []
-    data = d.get("result",{}).get("data",{}) or {}
-    slist = data.get("s_list",[]) or data.get("data",[]) or []
-    for it in slist[:5]:
-        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "market": it.get("market","")})
-    return items
+    raw = d.get("raw","") or ""
+    for line in raw.split("\n"):
+        parts = line.split(",")
+        if len(parts) >= 4:
+            items.append({"name": parts[0], "market": parts[1], "code": parts[2], "full_code": parts[3]})
+    return items[:5]
 
 
 def fetch_futures_quote(market: str, symbol: str) -> dict:
