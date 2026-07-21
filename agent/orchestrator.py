@@ -169,16 +169,25 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
-    # 新闻专属模式：用户明确要新闻
-    news_patterns = [r"(今天|今日|昨天|昨日|最近).*(新闻|快讯|资讯|消息)", r".*(新闻|快讯|资讯).*(汇总|总结|盘点|梳理)", r"有什么.*新闻", r"新闻.*怎么样"]
+    # 新闻专属模式：用户明确要新闻（含板块名+新闻、全市场新闻）
+    news_patterns = [
+        r".*(新闻|快讯|资讯).*(汇总|总结|盘点|梳理|报告)",
+        r"有什么.*新闻", r"新闻.*怎么样",
+        r".+板块.+新闻",  # "银行板块新闻"
+        r".+行业.+新闻",  # "银行行业新闻"
+        r"全市场.*新闻", r"新闻.*全市场",
+        r"^(新闻|快讯|资讯)$",
+    ]
     for pattern in news_patterns:
         if re.search(pattern, msg):
             sector = _extract_sector(msg)
             return ("news_only", sector)  # sector may be None for full market news
 
-    # 直接提行业名 → 板块聚焦
+    # 直接提行业名——但如果含"新闻"则走新闻模式
     for kw, sw_name in SECTOR_NAME_MAP.items():
         if kw in msg:
+            if "新闻" in msg:
+                return ("news_only", sw_name)
             return ("sector_deep_dive", sw_name)
 
     # 提板块/行业 + 任何疑问词 → 板块聚焦
