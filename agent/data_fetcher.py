@@ -585,11 +585,65 @@ def fetch_lian_ban() -> list:
     return items
 
 
-def fetch_us_fund_flow() -> list:
+def fetch_us_fund_flow(symbol: str = "AAPL") -> list:
     """美股今日资金趋势。"""
-    d = _mcp_call("usTradingFundFlow1Day", {"symbol": "AAPL"})
+    d = _mcp_call("usTradingFundFlow1Day", {"symbol": symbol})
     data = d.get("result",{}).get("data",{}) or d.get("data",{})
     return [data] if data else []
+
+
+def fetch_stock_quote(market: str, symbol: str) -> dict:
+    """实时股票行情（沪深/港股/美股）。market: cn/hk/us"""
+    d = _mcp_call("globalStockQuoteRealtime", {"market": market, "symbol": symbol})
+    data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
+    return {"price": data.get("price",""), "pct": data.get("change_pct",""), "vol": data.get("volume",""),
+            "high": data.get("high",""), "low": data.get("low",""), "open": data.get("open","")}
+
+
+def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
+    """股票日K线。market: cn/hk/us"""
+    d = _mcp_call("globalStockKlineDaily", {"market": market, "symbol": symbol, "num": days})
+    data = d.get("result",{}).get("data",[]) or d.get("data",{}).get("data",[])
+    items = []
+    for it in (data or [])[-days:]:
+        items.append({"date": it.get("date",""), "close": it.get("close",""), "pct": it.get("change_pct","")})
+    return items
+
+
+def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
+    """个股新闻搜索。"""
+    d = _mcp_call("stockNewsSearch", {"market": market, "symbol": symbol, "num": limit, "page": 1})
+    items = []
+    data = d.get("result",{}).get("data",{}) or {}
+    news_list = data.get("data",[]) or data.get("list",[]) or []
+    for it in news_list[:limit]:
+        items.append({"title": it.get("title",""), "time": it.get("ctime","")[:16], "source": "MCP"})
+    return items
+
+
+def search_stock(keyword: str) -> list:
+    """股票代码搜索。"""
+    d = _mcp_call("globalStockSearchSymbols", {"type": "11,31,41", "key": keyword, "format": "text", "num": 5})
+    items = []
+    data = d.get("result",{}).get("data",{}) or {}
+    slist = data.get("s_list",[]) or data.get("data",[]) or []
+    for it in slist[:5]:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "market": it.get("market","")})
+    return items
+
+
+def fetch_futures_quote(market: str, symbol: str) -> dict:
+    """期货行情。market: dce/shfe/czce/gfex"""
+    d = _mcp_call("future_quotes", {"market": market, "symbol": symbol})
+    data = d.get("result",{}).get("data",{}) or {}
+    return {"price": data.get("price",""), "pct": data.get("change_pct",""), "volume": data.get("volume","")}
+
+
+def fetch_fund_info(symbol: str) -> dict:
+    """基金档案。"""
+    d = _mcp_call("fund_info", {"symbol": symbol})
+    data = d.get("result",{}).get("data",{}) or {}
+    return {"name": data.get("name",""), "type": data.get("type",""), "nav": data.get("nav","")}
 
 
 def fetch_hk_sectors() -> list:
