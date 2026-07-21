@@ -842,12 +842,22 @@ def fetch_fund_info(symbol: str) -> dict:
 
 
 def fetch_hk_sectors() -> list:
-    """港股板块行情。"""
-    d = _mcp_call("hkSectorQuotesList", {"type": "hangye", "num": 10, "page": 1})
+    """港股板块行情。type: hk_plate_rise领涨/hk_plate_drop领跌/ahg/ggt"""
+    d = _mcp_call("hkSectorQuotesList", {"type": "hk_plate_rise", "num": 10, "page": 1})
     items = []
-    data = d.get("result",{}).get("data",[]) or []
+    data = d.get("result",{}).get("data",{}).get("data",[]) or d.get("result",{}).get("data",[]) or []
     for it in data[:10]:
-        items.append({"name": it.get("name",""), "pct": it.get("change_pct","")})
+        items.append({"name": it.get("name",""), "pct": it.get("change",""), "lead": it.get("symbol_name","")})
+    return items
+
+
+def fetch_us_sectors() -> list:
+    """美股板块排行。page/num/sort/asc全部必填"""
+    d = _mcp_call("usSectorRanking", {"page": "1", "num": "10", "sort": "percent", "asc": "0"})
+    items = []
+    data = d.get("data",[]) or d.get("result",{}).get("data",{}).get("data",[]) or []
+    for it in data[:10]:
+        items.append({"name": it.get("category_cn",""), "pct": it.get("percent",""), "lead": it.get("lead_cname","")})
     return items
 
 
