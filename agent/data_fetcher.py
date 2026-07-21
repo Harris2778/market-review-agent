@@ -1262,9 +1262,9 @@ def fetch_sector_stock_detail(sector_name: str, date: str) -> dict:
                 buy_sm = float(df_flow["buy_sm_amount"].sum()) if "buy_sm_amount" in df_flow.columns else 0
                 sell_sm = float(df_flow["sell_sm_amount"].sum()) if "sell_sm_amount" in df_flow.columns else 0
                 result["fund_flow"] = {
-                    "lg_net": round((buy_lg - sell_lg) / 1e8, 2),
-                    "md_net": round((buy_md - sell_md) / 1e8, 2),
-                    "sm_net": round((buy_sm - sell_sm) / 1e8, 2),
+                    "lg_net": round((buy_lg - sell_lg) / 10000, 2),  # 万元→亿
+                    "md_net": round((buy_md - sell_md) / 10000, 2),
+                    "sm_net": round((buy_sm - sell_sm) / 10000, 2),
                 }
         except Exception:
             pass
