@@ -127,7 +127,7 @@ PE(TTM) X倍  PB X倍  ROE X%  净利润同比增速X%
 ```"""
 
 
-SECTOR_ATTRIBUTION_PROMPT = """触发：用户问板块涨跌原因。核心约束：禁止因果性表述，全部用相关性表述，禁止判定"XX导致涨跌"。
+SECTOR_ATTRIBUTION_PROMPT = """触发：用户要求分析具体行业板块。
 
 固定调用：
 1. 新浪板块行情接口（涨跌幅+领涨股Top3，核心，失败熔断）
