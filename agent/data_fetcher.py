@@ -472,46 +472,32 @@ def fetch_eastmoney_news_page3(limit: int = 100) -> list:
 
 
 def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
-    """新浪智研MCP新闻搜索——按关键字搜索，稳定可靠。"""
+    """新浪智研MCP新闻搜索。"""
     items = []
+    token = _env("SINA_MCP_TOKEN", "")
+    if not token:
+        return items
     try:
-        token = _env("SINA_MCP_TOKEN", "")
-        if not token:
-            return items
         base = "https://mcp.finance.sina.com.cn/mcp-http"
-        # MCP initialize
         r = requests.post(f"{base}?token={token}", json={
-            "jsonrpc": "2.0", "method": "initialize", "id": 1,
-            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "agent", "version": "1.0"}}
-        }, headers={"Content-Type": "application/json"}, timeout=15)
-        sid = r.headers.get("Mcp-Session-Id", "")
+            "jsonrpc":"2.0","method":"initialize","id":1,
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+        }, timeout=15)
+        sid = r.headers.get("Mcp-Session-Id","")
         if not sid:
             return items
-        # Call newsSearch
-        pages_needed = max(1, limit // 20)
-        for page in range(1, pages_needed + 1):
-            r2 = requests.post(f"{base}?token={token}", json={
-                "jsonrpc": "2.0", "method": "tools/call", "id": 2,
-                "params": {"name": "newsSearch", "arguments": {"keyword": keyword, "num": min(20, limit), "page": page}}
-            }, headers={"Content-Type": "application/json", "Mcp-Session-Id": sid}, timeout=30)
-            d = r2.json()
-            data = d.get("result", {}).get("content", [])
-            if data:
-                text = data[0].get("text", "") if isinstance(data, list) else ""
-                if text:
-                    try:
-                        parsed = json.loads(text)
-                        news_data = parsed.get("result", {}).get("data", {}).get("data", [])
-                        for nd in news_data:
-                            items.append({
-                                "source": "新浪智研",
-                                "time": nd.get("ctime", nd.get("create_time", ""))[:16],
-                                "title": nd.get("title", ""),
-                                "content": nd.get("content", "")[:200],
-                            })
-                    except Exception:
-                        pass
+        r2 = requests.post(f"{base}?token={token}", json={
+            "jsonrpc":"2.0","method":"tools/call","id":2,
+            "params":{"name":"newsSearch","arguments":{"keyword":keyword,"num":limit,"page":1}}
+        }, headers={"Mcp-Session-Id":sid}, timeout=30)
+        d = r2.json()
+        content = d.get("result",{}).get("content",[])
+        if content and isinstance(content,list):
+            text = content[0].get("text","")
+            if text:
+                data = json.loads(text).get("result",{}).get("data",{}).get("data",[])
+                for nd in data:
+                    items.append({"source":"智研","time":str(nd.get("ctime",""))[:16],"title":nd.get("title","")})
     except Exception:
         pass
     return items
