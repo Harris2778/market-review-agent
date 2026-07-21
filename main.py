@@ -391,6 +391,17 @@ async def debug_mcp_news():
         return {"error": str(e)[:200], "trace": traceback.format_exc()[-300:]}
 
 
+@app.get("/debug/futures")
+async def debug_futures():
+    """测试期货+个股API。"""
+    import os as _os
+    token = _os.getenv("SINA_MCP_TOKEN","")[:10]
+    from agent.data_fetcher import fetch_futures, fetch_stock_quote
+    f = fetch_futures("gn","AU0")
+    s = fetch_stock_quote("cn","sh600519")
+    return {"token_prefix": token, "futures": f, "stock": s}
+
+
 @app.get("/debug/news-count")
 async def debug_news_count():
     """检查新闻数据是否进入了snapshot。"""
