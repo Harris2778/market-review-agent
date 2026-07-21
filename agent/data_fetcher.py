@@ -447,6 +447,30 @@ def fetch_eastmoney_news_page2(limit: int = 80) -> list:
     return items
 
 
+def fetch_eastmoney_news_page3(limit: int = 100) -> list:
+    """东方财富第3页新闻。"""
+    items = []
+    try:
+        import uuid as _uuid
+        url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+        params = {
+            "client": "web", "biz": "fastnews", "fastColumn": "102",
+            "sortEnd": "", "pageSize": limit, "pageIndex": 3,
+            "req_trace": str(_uuid.uuid4()).replace("-", "")[:32],
+        }
+        resp = requests.get(url, params=params, timeout=15,
+                          headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.eastmoney.com/"})
+        data = resp.json()
+        for item in data.get("data", {}).get("fastNewsList", []):
+            items.append({
+                "source": "东方财富", "time": item.get("showTime", ""),
+                "title": item.get("title", "")[:150],
+            })
+    except Exception:
+        pass
+    return items
+
+
 def fetch_sina_news(limit: int = 20, date_str: str = "") -> list:
     """新浪财经历史新闻（支持按日期查询）。"""
     items = []
@@ -1048,8 +1072,9 @@ async def collect_market_snapshot(
         "toplist": loop.run_in_executor(None, fetch_top_list, date),
         "cn_macro": loop.run_in_executor(None, fetch_china_macro),
         "us_macro": loop.run_in_executor(None, fetch_us_macro),
-        "em_p1": loop.run_in_executor(None, fetch_eastmoney_news, 80),
-        "em_p2": loop.run_in_executor(None, fetch_eastmoney_news_page2, 80),
+        "em_p1": loop.run_in_executor(None, fetch_eastmoney_news, 100),
+        "em_p2": loop.run_in_executor(None, fetch_eastmoney_news_page2, 100),
+        "em_p3": loop.run_in_executor(None, fetch_eastmoney_news_page3, 100),
         "sina": loop.run_in_executor(None, fetch_sina_news, 30, d1),
         "sina2": loop.run_in_executor(None, fetch_sina_news, 30, d2),
         "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
@@ -1093,7 +1118,7 @@ async def collect_market_snapshot(
                 out.append(it)
         return out
 
-    all_em = _dedup(safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), []))
+    all_em = _dedup(safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), []) + safe(results_raw.get("em_p3"), []))
     all_sina = _dedup(safe(results_raw.get("sina"), []) + safe(results_raw.get("sina2"), []))
     if sector_focus:
         all_em = filter_news_by_sector(all_em, sector_focus)
