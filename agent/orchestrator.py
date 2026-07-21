@@ -242,6 +242,103 @@ def _extract_sector(msg: str) -> Optional[str]:
     return None
 
 
+# ── 多轮对话：历史截断 + 上下文感知意图继承 ──
+
+MAX_HISTORY_MESSAGES = 20  # 最多保留最近 10 轮（user+assistant 各一条为一轮），防 token 膨胀
+
+# 追问/对比类表达（保守清单：只在上文是数据型意图时用于继承判定）
+_FOLLOWUP_PATTERNS = [
+    # 对比：跟昨天比 / 和上周相比 / 对比之前
+    r"(跟|和|与|对比|相比|比).{0,6}(昨天|昨日|前天|上周|之前|上次|早盘|上午)",
+    # 归因：为什么跌 / 怎么回事 / 怎么涨了
+    r"(为什么|为啥|怎么回事|怎么).{0,8}(跌|涨|砸|拉|崩|跳水|异动|杀跌|走强|走弱)",
+    # 走势预判：还会跌吗 / 会不会反弹 / 能不能追
+    r"(还会|还能|会不会|要不要|能不能|可否).{0,6}(跌|涨|反弹|继续|新高|新低|抄底|追|加仓|减仓)",
+    # 维度追问：资金呢 / 主力怎么样 / 北向情况 / 估值呢 / 业绩如何
+    r"(资金|主力|北向|散户|量能|成交|换手|龙虎榜)(呢|怎么样|如何|情况|流向|数据)?$",
+    r"(估值|景气|业绩|新闻|催化|风险|逻辑|基本面|技术面)(呢|怎么样|如何|情况)?$",
+    # 展开追问：继续 / 再说说 / 详细说 / 那怎么办
+    r"^(继续|再说说|详细说|展开说|具体说|深入说)",
+    r"^(那|那么|所以)(呢|怎么样|如何|怎么办|意味着)",
+]
+
+# 意图类型 → 中文描述（用于追问提示行）
+_INTENT_LABELS = {
+    "market_review": "全市场复盘",
+    "sector_deep_dive": "板块深挖",
+}
+
+
+def _trim_history(history: Optional[list]) -> list:
+    """
+    清洗并截断对话历史：只保留 user/assistant 且 content 为非空字符串的条目，
+    最多保留最近 10 轮（20 条）。
+    """
+    if not history:
+        return []
+    cleaned = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content})
+    return cleaned[-MAX_HISTORY_MESSAGES:]
+
+
+def _resolve_contextual_intent(message: str, history: list) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    上下文感知意图识别（detect_intent 的保守包装，detect_intent 本身不变）。
+
+    返回 (intent, sector, context_note_label_or_None)。
+    仅当以下条件全部满足时才继承上文意图，否则原样返回 detect_intent 的结果：
+      1. history 非空，且能找到最近一轮 user 消息；
+      2. 最近一轮 user 消息的意图（复用 detect_intent）是 sector_deep_dive 或 market_review；
+      3a. 上文是板块深挖 且 当前消息含新行业名（裸行业名或 general_chat）→ 继承深挖、切换行业；
+      3b. 上文是板块深挖 且 当前消息识别为 general_chat 且命中追问/对比模式 → 继承原板块；
+      3c. 上文是全市场复盘 且 当前消息识别为 general_chat 且命中追问/对比模式 → 继承复盘。
+    拿不准就落回 detect_intent 原始结果——宁可不继承，也不能错继承。
+    """
+    intent, sector = detect_intent(message)
+    if not history:
+        return intent, sector, None
+
+    prev_user_msg = None
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            prev_user_msg = msg.get("content")
+            break
+    if not prev_user_msg:
+        return intent, sector, None
+
+    prev_intent, prev_sector = detect_intent(prev_user_msg)
+    if prev_intent not in ("market_review", "sector_deep_dive"):
+        return intent, sector, None
+
+    msg = message.strip()
+    new_sector = _extract_sector(msg)
+    # 裸行业名：消息很短且整体就是在说一个行业（如"那半导体呢"、"电子"）
+    bare_sector = bool(new_sector) and len(msg) <= 12
+    # 追问：当前消息识别为 general_chat（规则意图识别没接住）且命中追问模式
+    is_followup = intent == "general_chat" and any(
+        re.search(p, msg) for p in _FOLLOWUP_PATTERNS
+    )
+
+    if prev_intent == "sector_deep_dive":
+        label = f"板块深挖（{prev_sector}板块）"
+        # 切换到新行业：上文在深挖某板块，本条直接点了另一个行业
+        if new_sector and (intent == "general_chat" or bare_sector):
+            return "sector_deep_dive", new_sector, label
+        # 同板块追问：继承原板块
+        if is_followup:
+            return "sector_deep_dive", prev_sector, label
+    elif prev_intent == "market_review" and is_followup:
+        return "market_review", None, _INTENT_LABELS["market_review"]
+
+    return intent, sector, None
+
+
 # ── Markdown 清理 ──
 
 def _clean_markdown(text: str) -> str:
@@ -503,25 +600,36 @@ class MarketReviewAgent:
         return f"snapshot_{trade_date.strftime('%Y%m%d')}" in self._cache
 
     async def process_message(
-        self, message: str, stream: bool = False
+        self, user_message: str, stream: bool = False, history: list = None
     ) -> dict | AsyncGenerator:
-        """处理用户消息。流式模式下自动将dict包装为生成器。"""
-        intent, sector = detect_intent(message)
+        """
+        处理用户消息。流式模式下自动将dict包装为生成器。
+
+        history: 之前的对话轮次 [{"role": "user"|"assistant", "content": str}]，
+        仅保留最近 10 轮（20 条），用于追问场景的意图继承与闲聊上下文。
+        """
+        history = _trim_history(history)
+        intent, sector, inherited_from = _resolve_contextual_intent(user_message, history)
+        # 继承意图的追问：在数据路径的 user prompt 开头加一行上下文说明
+        context_note = (
+            f"用户此前在询问{inherited_from}，本条为追问，请结合该语境组织回答。"
+            if inherited_from else None
+        )
 
         if intent == "general_chat":
-            return await self._chat(message, stream)
+            return await self._chat(user_message, stream, history=history)
         elif intent == "market_review":
-            return await self._market_review(stream)
+            return await self._market_review(stream, context_note=context_note)
         elif intent == "news_only":
             return await self._news_only(sector, stream)
         elif intent == "stock_query":
-            result = await self._stock_query(message, False)
+            result = await self._stock_query(user_message, False)
         elif intent == "futures_query":
-            result = await self._futures_query(message, False)
+            result = await self._futures_query(user_message, False)
         elif intent == "fund_query" or intent == "mcp_query":
-            result = await self._fund_query(message, False)
+            result = await self._fund_query(user_message, False)
         else:
-            return await self._sector_deep_dive(sector, stream)
+            return await self._sector_deep_dive(sector, stream, context_note=context_note)
 
         # 简单查询返回dict → 流式模式包装为生成器
         if stream and isinstance(result, dict):
@@ -533,13 +641,13 @@ class MarketReviewAgent:
             return _wrap()
         return result
 
-    async def _chat(self, message: str, stream: bool):
-        """通用对话。"""
+    async def _chat(self, message: str, stream: bool, history: list = None):
+        """通用对话。带对话历史，让闲聊也有上下文。"""
         system = get_system_prompt("general_chat")
-        return await self._call_llm(system, message, stream)
+        return await self._call_llm(system, message, stream, history=history)
 
-    async def _market_review(self, stream: bool):
-        """全市场复盘。"""
+    async def _market_review(self, stream: bool, context_note: str = None):
+        """全市场复盘。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。"""
         # 1. 确定有效的交易日期
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
@@ -563,7 +671,8 @@ class MarketReviewAgent:
         # 3. 构建 prompt（日期注入系统提示词）
         system = get_system_prompt("market_review").replace("[日期]", date_display)
 
-        user_prompt = f"""交易日：{date_display} {weekday}{date_note}
+        note_line = f"{context_note}\n\n" if context_note else ""
+        user_prompt = f"""{note_line}交易日：{date_display} {weekday}{date_note}
 
 {market_data}
 
@@ -614,8 +723,8 @@ class MarketReviewAgent:
         )
         return valuation, moneyflow, earnings
 
-    async def _sector_deep_dive(self, sector: str, stream: bool):
-        """单板块深度聚焦。"""
+    async def _sector_deep_dive(self, sector: str, stream: bool, context_note: str = None):
+        """单板块深度聚焦。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。"""
         today = datetime.now()
         trade_date = _get_latest_trade_date(today)
         date_str = trade_date.strftime("%Y%m%d")
@@ -640,7 +749,8 @@ class MarketReviewAgent:
         system = get_system_prompt("sector_deep_dive", sector)
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
-        user_prompt = f"""交易日：{date_display} {weekday} | 行业：{sector}
+        note_line = f"{context_note}\n\n" if context_note else ""
+        user_prompt = f"""{note_line}交易日：{date_display} {weekday} | 行业：{sector}
 
 【一、行情与趋势数据】
 {market_data}
@@ -926,13 +1036,17 @@ class MarketReviewAgent:
         return await self._generic_mcp(message, stream)
 
     async def _call_llm(
-        self, system_prompt: str, user_message: str, stream: bool = False
+        self, system_prompt: str, user_message: str, stream: bool = False,
+        history: list = None,
     ):
-        """调用 DeepSeek API。"""
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        """
+        调用 DeepSeek API。
+        history 非空时按 system + history + 当前 user 组装 messages（闲聊上下文）。
+        """
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(_trim_history(history))
+        messages.append({"role": "user", "content": user_message})
 
         if stream:
             return self._stream_response(messages)

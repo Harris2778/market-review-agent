@@ -154,6 +154,8 @@ async def chat_completions(request: Request):
 
     user_message = messages[-1].get("content", "") if messages else ""
     stream = body.get("stream", False)
+    # 多轮对话：提取完整历史（过滤 system 消息，去掉最后一条当前消息，最多保留最近10轮）
+    history = _extract_history(messages)
 
     if not _agent_loaded:
         raise HTTPException(status_code=503, detail=f"智能体加载失败: {_agent_error[-200:] if _agent_error else 'unknown'}")
@@ -162,7 +164,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_chat_completion(agent, user_message, body.get("model", "market-review-agent")),
+            _stream_chat_completion(agent, user_message, body.get("model", "market-review-agent"), history),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -172,7 +174,7 @@ async def chat_completions(request: Request):
         )
     else:
         try:
-            result = await agent.process_message(user_message, stream=False)
+            result = await agent.process_message(user_message, stream=False, history=history)
         except Exception as e:
             logger.error("非流式对话处理失败: %s", e, exc_info=True)
             return JSONResponse(
@@ -204,7 +206,27 @@ async def chat_completions(request: Request):
         })
 
 
-async def _stream_chat_completion(agent, user_message: str, model: str):
+def _extract_history(messages: list) -> list:
+    """
+    从 OpenAI 格式 messages 提取对话历史。
+
+    - 过滤掉 system 消息（编排层使用自己的系统提示词）；
+    - 去掉最后一条（当前用户消息，已单独作为 user_message 传递）；
+    - 只保留 role 为 user/assistant 且 content 为非空字符串的条目；
+    - 最多保留最近 10 轮（20 条），防 token 膨胀。
+    """
+    history = []
+    for msg in messages[:-1]:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            history.append({"role": role, "content": content})
+    return history[-20:]
+
+
+async def _stream_chat_completion(agent, user_message: str, model: str, history: list = None):
     """SSE 流式输出。"""
     try:
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -220,7 +242,7 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
         yield f"data: {json.dumps({'id': response_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {'content': hint}, 'finish_reason': None}]})}\n\n"
 
         # 流式输出内容
-        async for content_chunk in await agent.process_message(user_message, stream=True):
+        async for content_chunk in await agent.process_message(user_message, stream=True, history=history):
             if content_chunk:
                 chunk_data = {
                     "id": response_id,

@@ -1,5 +1,7 @@
 # 市场复盘智能体
 
+[![Tests](https://github.com/Harris2778/market-review-agent/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Harris2778/market-review-agent/actions/workflows/test.yml)
+
 OpenAI 兼容的 A 股市场每日复盘智能体。接入清华清小搭智能体大赛平台。
 
 ## 功能
