@@ -666,6 +666,27 @@ def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
     return items
 
 
+def fetch_revenue_composition(paper_code: str, fr_date: str = "") -> dict:
+    """A股主营构成。paperCode如sz000002，frDate如20231231(可选)"""
+    args = {"paperCode": paper_code}
+    if fr_date:
+        args["frDate"] = fr_date
+    d = _mcp_call("cnFinanceRevenueComposition", args)
+    data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
+    return {"股票": data.get("sname",""), "按产品": data.get("by_product",[]), "按行业": data.get("by_business",[]), "按地区": data.get("by_region",[])}
+
+
+def fetch_sector_components(node: str, sort: str = "percent", num: int = 20) -> list:
+    """指数/行业成分股排行。node如sh000001(上证指数)"""
+    d = _mcp_call("cnSectorComponentsRanking", {"node": node, "sort": sort, "asc": "0", "num": str(num), "page": "1"})
+    items = []
+    data = d.get("data",[]) or []
+    for it in data:
+        items.append({"name": it.get("name",""), "code": it.get("symbol",""), "pct": it.get("percent",""),
+                      "price": it.get("price",""), "pe": it.get("pe",""), "mcap": it.get("totalShare","")})
+    return items
+
+
 def fetch_sw_classify(symbol: str) -> dict:
     """申万行业分类。symbol不带前缀如600519"""
     d = _mcp_call("swSymbolList", {"symbol": symbol})
