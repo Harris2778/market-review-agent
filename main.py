@@ -229,6 +229,24 @@ async def _stream_chat_completion(agent, user_message: str, model: str):
 
 # ── 调试端点 ──
 
+@app.get("/debug/mcp-test")
+async def debug_mcp_test(tool: str = "cnMarketUpdownDistribution"):
+    """测试任意MCP工具——返回原始响应。"""
+    import requests, os
+    token = os.getenv("SINA_MCP_TOKEN","")
+    base = "https://mcp.finance.sina.com.cn/mcp-http"
+    r = requests.post(f"{base}?token={token}", json={
+        "jsonrpc":"2.0","method":"initialize","id":1,
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"a","version":"1"}}
+    }, timeout=15)
+    sid = r.headers.get("Mcp-Session-Id","")
+    r2 = requests.post(f"{base}?token={token}", json={
+        "jsonrpc":"2.0","method":"tools/call","id":2,
+        "params":{"name": tool, "arguments": {}}
+    }, headers={"Mcp-Session-Id":sid}, timeout=30)
+    return {"tool": tool, "response": str(r2.json())[:1500]}
+
+
 @app.get("/debug/hot")
 async def debug_hot():
     """热搜原始响应。"""
