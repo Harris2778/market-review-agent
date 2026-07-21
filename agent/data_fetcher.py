@@ -1385,10 +1385,12 @@ def fetch_forex_batch() -> list:
 
 
 def fetch_futures(market: str = "gn", symbol: str = "AU0") -> dict:
-    """期货行情。market: gn内盘/global外盘/cff股指, symbol: CHA50CFD/AU0等"""
+    """期货行情。market: gn内盘/global外盘/cff股指"""
     d = _mcp_call("future_quotes", {"market": market, "symbol": symbol})
     data = d.get("data",{}) or {}
-    return {"名称": data.get("name",""), "价格": data.get("price",""), "涨跌": data.get("percent",""), "成交量": data.get("volume","")}
+    return {"name": data.get("name",""), "price": data.get("price",""),
+            "pct": data.get("percent",""), "vol": data.get("volume",""),
+            "open": data.get("openPrice",""), "high": data.get("high",""), "low": data.get("low","")}
     """商品期货 + 人民币汇率（yfinance 免费）。"""
     result = {}
     tickers = {

@@ -720,8 +720,8 @@ class MarketReviewAgent:
             for kw, (mkt, sym) in kw_map.items():
                 if kw in msg:
                     d = fetch_futures(mkt, sym)
-                    if d.get("价格"):
-                        return {"role": "assistant", "content": f"{kw}期货：价格{d.get('价格','?')} 涨跌{d.get('涨跌','?')}% 成交量{d.get('成交量','?')} 数据来源：新浪智研"}
+                    if d.get("price"):
+                        return {"role": "assistant", "content": f"{kw}期货：价格{d['price']} 涨跌{d.get('pct','?')}% 成交量{d.get('vol','?')} 数据来源：新浪智研"}
                     return {"role": "assistant", "content": f"{kw}期货数据暂不可用，请稍后再试。"}
         if any(kw in msg for kw in ["热搜","热榜"]):
             h = fetch_hot_stocks()
