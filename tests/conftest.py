@@ -50,4 +50,8 @@ def fake_env(monkeypatch):
     """
     for key, value in FAKE_ENV.items():
         monkeypatch.setenv(key, value)
+    # 测试缺省视为「匿名 B 站」：真实 .env 若配置了 BILI_SESSDATA，
+    # main.py 的 load_dotenv 会把它带进 os.environ，导致匿名路径的
+    # 测试走错 wbi 分支；登录态测试会自行 monkeypatch.setenv 覆盖。
+    monkeypatch.delenv("BILI_SESSDATA", raising=False)
     return FAKE_ENV
