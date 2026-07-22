@@ -5,6 +5,8 @@
     B 站全通（square/popular/搜索/评论，搜索与评论需 buvid3 预热）、
     抖音仅热榜（hot/search/list/，脆弱红利需 newsnow 兜底）、
     小红书无可用无登录端点 v1 缺席、聚合器 newsnow.busiyi.world 四源兜底。
+    东方财富股吧为个股舆情专用通道（get_guba_buzz，不做搜索/评论/热榜，
+    不进 PLATFORM_MODULES），端点定案详见 research/guba_endpoints_recon.md。
 
 合规注记：仅公开数据、低频访问（≤1 req/s + 抖动）、无登录自动化、
     不破解任何签名；平台条款/风控策略变动可能导致端点失效，
@@ -418,3 +420,129 @@ def aggregate_buzz(posts, scorer: Optional[Callable] = None) -> dict:
     except Exception as e:
         logger.warning("aggregate_buzz 异常（返回空骨架）: %s", e, exc_info=True)
         return empty
+
+
+# ── 股吧个股舆情专用通道（东方财富股吧）──
+
+GUBA_MODULE = "social_guba"
+GUBA_SOURCE = "eastmoney_guba"
+_GUBA_CONTENT_MAX = 200  # 帖子正文截断长度（防上下文爆炸）
+
+
+def _normalize_guba_code(code) -> str:
+    """股吧代码归一：提取数字部分，恰为 6 位 A 股代码才有效，否则返回空串。"""
+    digits = re.sub(r"\D", "", str(code or ""))
+    return digits if len(digits) == 6 else ""
+
+
+def _slim_guba_post(post) -> Optional[dict]:
+    """股吧帖子瘦身：platform/post_id/title/content截200/metrics/url/
+    published_at/source；非 dict 输入返回 None（调用方过滤）。绝不抛。"""
+    if not isinstance(post, dict):
+        return None
+    metrics = post.get("metrics")
+    return {
+        "platform": str(post.get("platform") or "guba"),
+        "post_id": str(post.get("post_id") or ""),
+        "title": str(post.get("title") or ""),
+        "content": str(post.get("content") or "")[:_GUBA_CONTENT_MAX],
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "url": str(post.get("url") or ""),
+        "published_at": str(post.get("published_at") or ""),
+        "source": str(post.get("source") or ""),
+    }
+
+
+def get_guba_buzz(code, limit: int = 20, enrich: int = 3, sleep=None) -> dict:
+    """东方财富股吧个股舆情：帖子列表 → 详情富化（正文+点赞）→ 情感聚合。绝不抛。
+
+    定位：**个股舆情专用通道**。股吧端点 2026-07-22 实测定案（详见
+    research/guba_endpoints_recon.md）只有个股吧帖子列表（gbapi
+    Articlelist）与帖子详情（HTML SSR post_article，唯一点赞来源）两条
+    免登录路径；关键词搜索/评论抓取/全站热榜全部判死，因此股吧**不进
+    PLATFORM_MODULES**，不参与 get_hot_all/search_all 分发，只经本函数
+    （及 get_stock_sentiment 工具的 guba 增强块）触达。
+
+    合规注记：仅公开数据、低频访问（≤1 req/s + 抖动，由 social_guba
+    内部限速保证）、无登录；模块缺席/能力缺失/抓取失败/列表为空一律
+    warning + 中文说明进 notes 降级，绝不抛出异常。
+
+    流程：惰性加载 social_guba（缺席即降级）→ fetch_bar_posts(code,
+    limit=limit, sleep=sleep) → enrich_posts(posts, top_n=enrich,
+    sleep=sleep) 回填 content 与 metrics.likes（enrich<=0 跳过富化）→
+    复用 aggregate_buzz 对（富化后）帖子打情感分。
+
+    返回 {code, posts(瘦身：platform/post_id/title/content截200/metrics/
+    url/published_at/source), buzz, sources: ['eastmoney_guba'], notes}。
+    """
+    notes: List[str] = []
+    empty_buzz = {"total": 0,
+                  "sentiment": {"利好": 0, "利空": 0, "中性": 0},
+                  "by_platform": {},
+                  "avg_score": 0.0}
+
+    def _out(code6: str, posts: List[dict], buzz: dict) -> dict:
+        return {"code": code6, "posts": posts, "buzz": buzz,
+                "sources": [GUBA_SOURCE], "notes": notes}
+
+    try:
+        code6 = _normalize_guba_code(code)
+        if not code6:
+            notes.append(f"股吧代码非法（需 6 位 A 股代码）：{code!r}，本轮未抓取")
+            return _out("", [], empty_buzz)
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            enrich = int(enrich)
+        except (TypeError, ValueError):
+            enrich = 3
+        mod = _load_module(GUBA_MODULE)
+        if mod is None:
+            notes.append("股吧模块未就绪（agent/social_guba.py 缺席），本轮无股吧数据")
+            return _out(code6, [], empty_buzz)
+        fetch = _get_capability(mod, "fetch_bar_posts")
+        if fetch is None:
+            notes.append("股吧模块缺少 fetch_bar_posts 能力，本轮无股吧数据")
+            return _out(code6, [], empty_buzz)
+        posts = _safe_fetch(fetch, code6, limit=limit, sleep=sleep)
+        if not posts:
+            notes.append(f"股吧 {code6} 本轮未抓到帖子（端点降级或吧内无新帖）")
+            return _out(code6, [], empty_buzz)
+        if enrich <= 0:
+            notes.append("enrich=0，跳过详情富化（帖子无正文与点赞数）")
+        else:
+            enrich_fn = _get_capability(mod, "enrich_posts")
+            if enrich_fn is None:
+                notes.append("股吧模块缺少 enrich_posts 能力，帖子无正文与点赞数")
+            else:
+                try:
+                    enriched = enrich_fn(posts, top_n=enrich, sleep=sleep)
+                except TypeError:
+                    # 签名不兼容时降级为仅位置参数重试
+                    try:
+                        enriched = enrich_fn(posts)
+                    except Exception as e:  # noqa: BLE001 - 富化失败降级
+                        logger.warning("股吧详情富化失败（保留列表原始数据）: %s", e)
+                        enriched = None
+                        notes.append(f"股吧详情富化失败（{e}），帖子无正文与点赞数")
+                except Exception as e:  # noqa: BLE001 - 富化失败降级
+                    logger.warning("股吧详情富化失败（保留列表原始数据）: %s", e)
+                    enriched = None
+                    notes.append(f"股吧详情富化失败（{e}），帖子无正文与点赞数")
+                if enriched is not None:
+                    if isinstance(enriched, list) and enriched:
+                        posts = [p for p in enriched if isinstance(p, dict)]
+                    else:
+                        notes.append("股吧详情富化返回为空，保留列表原始数据")
+        if not posts:
+            notes.append("股吧帖子经富化后为空，本轮无股吧数据")
+            return _out(code6, [], empty_buzz)
+        buzz = aggregate_buzz(posts)
+        slim = [s for s in (_slim_guba_post(p) for p in posts) if s]
+        return _out(code6, slim, buzz)
+    except Exception as e:  # noqa: BLE001 - 门面绝不抛出
+        logger.warning("get_guba_buzz 异常（返回空骨架）: %s", e, exc_info=True)
+        notes.append(f"股吧舆情通道内部异常，结果可能不完整: {e}")
+        return _out(_normalize_guba_code(code), [], empty_buzz)

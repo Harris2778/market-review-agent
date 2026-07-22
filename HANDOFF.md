@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块 + 社媒舆情爬取v1落地，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块 + 社媒舆情爬取v1 + 东财股吧落地，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -55,6 +55,7 @@ agent/social_zhihu.py      知乎热榜直连（topstory/hot-list）
 agent/social_aggregator.py newsnow 聚合兜底（四源，仅直连失败降级用）
 agent/social_store.py      社媒帖子 SQLite 持久化（social.db，hit_count 幂等累计）
 agent/social_media.py      社媒门面：热榜聚合/搜索分发/股票关联提取/情感聚合
+agent/social_guba.py       东财股吧：个股吧帖子列表+HTML详情正文点赞回填(个股舆情专用)
 agent/sentiment.py         社交情绪层（BettaFish灵感）：东财人气榜+人气历史+涨跌停池
                            + 词典情感打分 + 情绪温度0-100 + 进程内当日缓存
 agent/technical.py         确定性技术分析（daily_stock_analysis灵感）：MA七态/MACD/RSI/
@@ -73,7 +74,7 @@ agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     1636 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     1718 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -384,6 +385,23 @@ BettaFish 的 MediaCrawler（Playwright+登录态）未采用——v1 全部走*
   热度 254 万）；搜「A股」B站 5 帖+9 评论（播放/评论/点赞真实指标）；情感分布与
   降级路径（小红书/空关键词/搜索缺席平台 notes）全部按设计工作
 
+**东财股吧接入（2026-07-22 晚，社媒舆情 v1.5）**
+
+能力：个股股吧帖子列表+正文+点赞（散户情绪第一现场）。端点 2026-07-22 实测定案
+（workspace/research/guba_endpoints_recon.md）。
+
+- agent/social_guba.py：帖子列表 POST gbapi Articlelist（⚠️ 魔法参数
+  deviceid=Wap10.0.0.1+version=200 必带，缺了 rc=0 空数据伪装繁忙）+ 详情走 HTML
+  SSR 内嵌 var post_article={...} 花括号配平提取（点赞数唯一来源；详情 API 被 WAF
+  403 判死）+ enrich_posts 按评论数 top_n 回填正文/点赞；评论/全站热榜(AES 密文)/
+  吧内搜索全部判死未实现
+- social_media.get_guba_buzz：个股舆情专用通道（不进 PLATFORM_MODULES），
+  列表→富化→aggregate_buzz 情感打分；tools.py get_stock_sentiment 追加 guba 块
+  （posts+buzz，股吧失败绝不影响主返回）；prompts 社媒节补股吧引用规范
+- 测试：+82 用例（模块 52+集成 30），全量 1718 passed 全绿
+- 真实 E2E（2026-07-22）：茅台吧 10 帖（阅读/评论/转发/点赞真实，朱少醒调出茅台帖
+  阅读 1.1 万/评论 66/点赞 28 含正文），情感 利好2/利空1/中性7
+
 ## 已知问题
 
 - 社媒端点全部为无登录公开接口，平台风控/结构变动即降级：抖音「无签名直连」是脆弱
@@ -392,6 +410,8 @@ BettaFish 的 MediaCrawler（Playwright+登录态）未采用——v1 全部走*
 - newsnow 聚合器为第三方公共服务，有缓存延迟、无 SLA，仅作兜底
 - 社媒情感为词典弱信号；extract_stock_mentions 代码正则不校验真实性（价格语境已排除）
 - social.db 随抓取增长无清理策略；query_posts 的 LIKE 未转义 %/_（调用方受信）
+- 股吧列表无点赞字段（仅详情页有，enrich 只回填 top_n 条）；评论数仅为计数（评论
+  内容端点全灭）；详情页点赞为抓取时点快照
 - 人气榜接口不含股票名称：名称经 push2 ulist 批量回填，本机系统代理异常时名称留空串
   优雅降级（排名/代码不受影响）；生产无代理环境实测正常
 - 个股人气历史必须传 srcSecurityCode+市场前缀；BJ（北交所）前缀规则按 4/8/920 推导，

@@ -934,6 +934,40 @@ def _append_note(result, note: str):
     return result
 
 
+_GUBA_BUZZ_LIMIT = 10   # get_stock_sentiment 附加股吧舆情的帖子条数
+_GUBA_BUZZ_ENRICH = 3   # 股吧详情富化（回填正文+点赞）的帖子数
+
+
+def _append_guba_block(result, code: str):
+    """get_stock_sentiment 的股吧舆情增强：惰性调 social_media.get_guba_buzz。
+
+    股吧端点 2026-07-22 实测定案仅覆盖个股舆情（帖子+正文+点赞，无评论
+    数据）。成功且结构正常时在返回上追加 guba={posts, buzz} 键，股吧内部
+    降级说明透传进 notes；模块缺席/能力缺失/异常/结构异常一律只进
+    notes，绝不影响人气榜与新闻情感的既有返回。绝不抛。
+    """
+    if not isinstance(result, dict):
+        return result
+    try:
+        social = _get_social_media_module()
+        get_buzz = getattr(social, "get_guba_buzz", None) if social is not None else None
+        if not callable(get_buzz):
+            return _append_note(result, "股吧舆情通道不可用（social_media.get_guba_buzz 未就绪），个股舆情未含股吧数据")
+        guba = get_buzz(code, limit=_GUBA_BUZZ_LIMIT, enrich=_GUBA_BUZZ_ENRICH)
+        if not isinstance(guba, dict):
+            return _append_note(result, "股吧舆情返回结构异常，个股舆情未含股吧数据")
+        result["guba"] = {
+            "posts": guba.get("posts") if isinstance(guba.get("posts"), list) else [],
+            "buzz": guba.get("buzz") if isinstance(guba.get("buzz"), dict) else {},
+        }
+        for note in guba.get("notes") or []:
+            _append_note(result, f"股吧：{note}")
+    except Exception as e:  # noqa: BLE001 - 股吧失败绝不影响主返回
+        logger.warning("股吧舆情增强失败（不影响人气榜与新闻情感）: %s", e)
+        _append_note(result, f"股吧舆情获取失败（已跳过，不影响人气榜与新闻情感）: {e}")
+    return result
+
+
 def _handle_get_market_sentiment(args: dict) -> dict:
     """get_market_sentiment 处理器：市场情绪快照 + 可选新闻情感增强。"""
     sent = _get_sentiment_module()
@@ -946,7 +980,7 @@ def _handle_get_market_sentiment(args: dict) -> dict:
 
 
 def _handle_get_stock_sentiment(args: dict) -> dict:
-    """get_stock_sentiment 处理器：个股人气排名/趋势 + 个股新闻情感增强。"""
+    """get_stock_sentiment 处理器：人气排名/趋势 + 新闻情感 + 股吧舆情增强。"""
     code = _normalize_stock_code(args.get("stock_code"))
     if not code:
         raise _ParamError(f"stock_code 无法归一为 6 位 A 股代码：{args.get('stock_code')!r}")
@@ -956,7 +990,8 @@ def _handle_get_stock_sentiment(args: dict) -> dict:
         return {"ok": False, "code": code, "note": "情绪模块不可用（agent/sentiment.py 未就绪）"}
     news_items, news_note = _inject_stock_news(_get_data_fetcher(), code)
     result = sent.get_stock_sentiment(code, days=days, news_items=news_items)
-    return _append_note(result, news_note)
+    result = _append_note(result, news_note)
+    return _append_guba_block(result, code)
 
 
 def _fetch_stock_daily_rows(df, code: str, days: int):
