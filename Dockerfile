@@ -29,7 +29,8 @@ RUN mkdir -p /data && chown -R agent:agent /app /data \
 ENV PORT=8000 \
     DATA_DIR=/data \
     REPORT_EMBED_BACKEND=fastembed \
-    REPORT_FASTEMBED_CACHE=/opt/fastembed-cache
+    REPORT_FASTEMBED_CACHE=/opt/fastembed-cache \
+    REPORT_FASTEMBED_OFFLINE=1
 EXPOSE 8000
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=30s \

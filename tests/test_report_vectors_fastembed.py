@@ -38,6 +38,14 @@ class _FakeTextEmbedding:
             yield np.full(512, 0.5 + i, dtype=np.float32)
 
 
+@pytest.fixture(autouse=True)
+def _clear_embedder_cache():
+    """每个用例前后清单例缓存，避免跨用例串实例。"""
+    rv._DEFAULT_EMBEDDER_CACHE.clear()
+    yield
+    rv._DEFAULT_EMBEDDER_CACHE.clear()
+
+
 @pytest.fixture()
 def fake_fastembed(monkeypatch):
     """注入假 fastembed 模块，返回模块与记录器。"""
@@ -77,6 +85,21 @@ def test_fastembed_env_overrides(fake_fastembed, monkeypatch):
     assert inst.model == "BAAI/bge-m3"
     assert inst.kwargs == {"cache_dir": "/opt/fx"}
     assert e.name == "fastembed:BAAI/bge-m3"
+
+
+def test_fastembed_offline_mode(fake_fastembed, monkeypatch):
+    """REPORT_FASTEMBED_OFFLINE=1 → local_files_only=True 透传（生产零网络）。"""
+    monkeypatch.setenv("REPORT_FASTEMBED_CACHE", "/opt/fx")
+    monkeypatch.setenv("REPORT_FASTEMBED_OFFLINE", "1")
+    rv.FastembedEmbedder()
+    inst = _FakeTextEmbedding.instances[0]
+    assert inst.kwargs == {"cache_dir": "/opt/fx", "local_files_only": True}
+
+
+def test_fastembed_offline_default_off(fake_fastembed, monkeypatch):
+    monkeypatch.delenv("REPORT_FASTEMBED_OFFLINE", raising=False)
+    rv.FastembedEmbedder()
+    assert "local_files_only" not in _FakeTextEmbedding.instances[0].kwargs
 
 
 def test_fastembed_import_error_propagates(monkeypatch):
@@ -127,3 +150,20 @@ def test_default_unknown_backend_treated_as_auto(monkeypatch, fake_fastembed, no
     monkeypatch.setenv("REPORT_EMBED_BACKEND", "weird")
     e = rv._default_embedder()
     assert isinstance(e, rv.FastembedEmbedder)
+
+
+def test_default_embedder_singleton_cached(monkeypatch, fake_fastembed, no_st):
+    """构造成功后按 backend 缓存：第二次调用不再重建模型。"""
+    monkeypatch.setenv("REPORT_EMBED_BACKEND", "fastembed")
+    e1 = rv._default_embedder()
+    e2 = rv._default_embedder()
+    assert e1 is e2
+    assert len(_FakeTextEmbedding.instances) == 1
+
+
+def test_default_embedder_failure_not_cached(monkeypatch, no_st):
+    """构造失败不缓存：依赖恢复后再次调用可自愈。"""
+    monkeypatch.setenv("REPORT_EMBED_BACKEND", "fastembed")
+    monkeypatch.setitem(sys.modules, "fastembed", None)
+    assert rv._default_embedder() is None
+    assert "fastembed" not in rv._DEFAULT_EMBEDDER_CACHE

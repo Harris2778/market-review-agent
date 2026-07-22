@@ -259,7 +259,11 @@ class FastembedEmbedder:
     环境变量：
     - REPORT_FASTEMBED_MODEL：模型 ID 覆盖（默认 BAAI/bge-small-zh-v1.5）；
     - REPORT_FASTEMBED_CACHE：模型缓存目录（生产镜像构建期预下载到该目录，
-      运行期零网络；不设则 fastembed 用默认 ~/.cache）。
+      运行期零网络；不设则 fastembed 用默认 ~/.cache）；
+    - REPORT_FASTEMBED_OFFLINE=1：以 local_files_only 构造——跳过 HF 元数据
+      联网检查（fastembed 默认每次构造都调 model_info/list_repo_tree，
+      网络不可达时会挂起请求），仅校验本地缓存后离线加载。生产镜像
+      已预下载模型，必须开启。
     """
 
     def __init__(self, model: str = "", dim: int = 512):
@@ -272,6 +276,8 @@ class FastembedEmbedder:
         )
         cache_dir = os.environ.get("REPORT_FASTEMBED_CACHE") or None
         kwargs = {"cache_dir": cache_dir} if cache_dir else {}
+        if (os.environ.get("REPORT_FASTEMBED_OFFLINE") or "").strip() == "1":
+            kwargs["local_files_only"] = True
         self.name = f"fastembed:{model}"
         self.dim = int(dim)
         self._model = TextEmbedding(model, **kwargs)
@@ -283,21 +289,33 @@ class FastembedEmbedder:
         ]
 
 
+# 默认 Embedder 单例缓存（按 backend 值）；只缓存成功构造，失败不缓存。
+_DEFAULT_EMBEDDER_CACHE: Dict[str, Any] = {}
+
+
 def _default_embedder() -> Optional[Any]:
     """惰性构造生产 Embedder；所有后端均不可用时返回 None（降级检索）。
 
     后端选择：REPORT_EMBED_BACKEND=st|fastembed|auto（默认 auto）。
     auto 顺序：sentence-transformers（本地索引构建机全量后端）
     → fastembed（生产容器轻量后端）。未知值按 auto 处理。
+
+    构造成功按 backend 值做单例缓存：onnxruntime/torch 模型加载成本高，
+    每次查询重建会拖慢每个请求；失败不缓存（ImportError 很便宜，且允许
+    依赖装好后下次调用自愈）。
     """
     backend = (os.environ.get("REPORT_EMBED_BACKEND") or "auto").strip().lower()
+    if backend in _DEFAULT_EMBEDDER_CACHE:
+        return _DEFAULT_EMBEDDER_CACHE[backend]
     chain = {
         "st": (BgeEmbedder,),
         "fastembed": (FastembedEmbedder,),
     }.get(backend, (BgeEmbedder, FastembedEmbedder))
     for cls in chain:
         try:
-            return cls()
+            embedder = cls()
+            _DEFAULT_EMBEDDER_CACHE[backend] = embedder
+            return embedder
         except Exception as e:  # noqa: BLE001 - 逐后端降级
             logger.info("Embedder 后端不可用（%s）: %s", cls.__name__, e)
     logger.warning("所有 Embedder 后端均不可用，向量检索按不可用降级")
