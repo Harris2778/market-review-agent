@@ -301,17 +301,17 @@ class TestReportContentPrompt:
 
 
 # ════════════════════════════════════════════════
-# 8. get_tool_catalog() 24 行 + 既有工具回归
+# 8. get_tool_catalog() 28 行 + 既有工具回归
 # ════════════════════════════════════════════════
 
-class TestToolCatalog24:
-    def test_catalog_24_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 24
+class TestToolCatalog28:
+    def test_catalog_28_lines(self):
+        assert len(tools_mod.TOOL_REGISTRY) == 28
         catalog = tools_mod.get_tool_catalog()
-        assert "共 24 个" in catalog
+        assert "共 28 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 24, (
-            f"目录应有 24 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 28, (
+            f"目录应有 28 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tool_in_short_desc_and_catalog(self):
@@ -336,7 +336,12 @@ class TestToolCatalog24:
         assert existing <= registered, (
             f"既有工具丢失：{existing - registered}"
         )
-        assert registered - existing == {"search_report_content"}
+        # 新增工具：研报全文（v2）+ 第十二波开源灵感模块 4 个
+        assert registered - existing == {
+            "search_report_content",
+            "get_market_sentiment", "get_stock_sentiment",
+            "get_technical_analysis", "analyze_with_persona",
+        }
 
         # v1 研报工具分发路径不变（仍走 report_library）
         fake_rl = SimpleNamespace(

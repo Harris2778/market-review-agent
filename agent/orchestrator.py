@@ -82,6 +82,26 @@ except ImportError as e:
     is_mcp_error = None
     mcp_error_brief = None
 
+# 第十二波：Agent 工程三件套（agent/agent_audit.py，纯 stdlib 无重依赖，模块顶层导入）。
+# Scratchpad 审计日志 / ToolCallGuard 工具调用软护栏 / microcompact 上下文压缩。
+# 导入失败时三件套整体降级，不影响主流程。
+try:
+    from .agent_audit import Scratchpad, ToolCallGuard, microcompact
+except ImportError as e:
+    logger.warning("agent/agent_audit.py 未就绪，审计三件套将整体降级: %s", e)
+    Scratchpad = None
+    ToolCallGuard = None
+    microcompact = None
+
+
+def _audit_safe(func, *args, **kwargs):
+    """审计三件套钩子的统一防御调用：任何异常只记 log 并返回 None，绝不影响主流程。"""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        logger.warning("Agent 审计钩子异常（忽略，不影响主流程）: %s", e, exc_info=True)
+        return None
+
 
 def _log_stream_violations(label: str, violations: list) -> None:
     """流式路径 log-only：记录疑似无出处数字的数量与前几条原文，绝不抛出、不拦截。"""
@@ -1940,8 +1960,30 @@ class MarketReviewAgent:
         tool_context_parts = []  # 工具返回摘要，供自我审查核对数字出处
         loop = asyncio.get_running_loop()
 
+        # 第十二波：Agent 工程三件套接入（全部 fail-safe，任何异常不影响主循环）
+        # Scratchpad：本次会话的 JSONL 审计日志（session_id 缺省短 uuid）
+        scratchpad = _audit_safe(Scratchpad) if Scratchpad is not None else None
+        if scratchpad is not None:
+            _audit_safe(scratchpad.log_init, user_message)
+        # ToolCallGuard：工具调用软护栏（只警告不阻断，警告注入工具结果尾部）
+        guard = _audit_safe(ToolCallGuard) if ToolCallGuard is not None else None
+
         try:
             for _ in range(self._AGENT_MAX_ROUNDS):
+                # microcompact 上下文压缩：每轮调 LLM 前执行；
+                # cleared>0 时把压缩事实记入审计思考流
+                if microcompact is not None:
+                    compacted = _audit_safe(microcompact, messages)
+                    if isinstance(compacted, tuple) and len(compacted) == 2:
+                        messages, compact_stats = compacted
+                        if (scratchpad is not None and isinstance(compact_stats, dict)
+                                and compact_stats.get("cleared")):
+                            _audit_safe(
+                                scratchpad.log_thinking,
+                                f"microcompact 清理 {compact_stats['cleared']} 条历史工具结果"
+                                f"（{compact_stats.get('chars_before')}"
+                                f"→{compact_stats.get('chars_after')} 字符）",
+                            )
                 # 工具循环阶段一律非流式（tool calling 无法流式）
                 completion = await self.client.chat.completions.create(
                     model=self.model,
@@ -1996,12 +2038,26 @@ class MarketReviewAgent:
                     except Exception as e:
                         logger.warning("Agent 工具参数解析失败(%s): %s", fn_name, e, exc_info=True)
                         fn_args = {}
+                    # 审计钩子：调用落盘 + 软护栏检查（警告不阻断，注入工具结果尾部）
+                    if scratchpad is not None:
+                        _audit_safe(scratchpad.log_tool_call, fn_name, fn_args)
+                    guard_warning = (
+                        _audit_safe(guard.check, fn_name, fn_args)
+                        if guard is not None else None
+                    )
                     try:
                         result = await loop.run_in_executor(None, execute_tool, fn_name, fn_args)
                     except Exception as e:
                         logger.warning("Agent 工具执行异常(%s): %s", fn_name, e, exc_info=True)
                         result = {"ok": False, "error": f"工具执行异常: {e}"}
+                    # 审计钩子：实际调用计数 + 结果落盘
+                    if guard is not None:
+                        _audit_safe(guard.record, fn_name, fn_args)
+                    if scratchpad is not None:
+                        _audit_safe(scratchpad.log_tool_result, fn_name, result)
                     content = json.dumps(result, ensure_ascii=False)[:self._TOOL_RESULT_MAX_CHARS]
+                    if guard_warning:
+                        content = f"{content}\n{guard_warning}"
                     tool_context_parts.append(f"[{fn_name}] {content[:800]}")
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": content})
         except Exception as e:

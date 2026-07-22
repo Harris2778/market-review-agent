@@ -12,6 +12,7 @@
 - 内部同步调用，编排层负责放线程池
 """
 
+import importlib
 import json
 import logging
 
@@ -454,6 +455,100 @@ TOOL_REGISTRY: list = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_market_sentiment",
+            "description": "获取 A 股市场级社交情绪快照：情绪温度（0-100，含冰点/低迷/中性/活跃/亢奋标签）"
+                           "+ 涨跌停/炸板统计（涨停数、跌停数、炸板率、最高连板）+ 东方财富人气榜 TOP10"
+                           "+ 注入新闻的情感分布（利好/利空/中性）。"
+                           "判断市场情绪温度、短线赚钱效应时使用。情绪是辅助信号，不是买卖依据。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "交易日期，格式 YYYY-MM-DD 或 YYYYMMDD；缺省为当日。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_sentiment",
+            "description": "获取个股社交情绪：东方财富人气榜当前排名、近 N 天排名均值与变化趋势"
+                           "（上升/下降/平稳/未知）+ 该股相关新闻的情感分布（利好/利空/中性）。"
+                           "分析个股散户关注度、人气异动时使用。情绪是辅助信号，不是买卖依据。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stock_code": _REPORT_STOCK_CODE_PARAM,
+                    "days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "default": 30,
+                        "description": "人气历史回溯天数，默认 30，最大 120。",
+                    },
+                },
+                "required": ["stock_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_technical_analysis",
+            "description": "获取个股技术分析仪表盘：均线排列（七态）、乖离率、MACD、RSI、量能状态、"
+                           "支撑/压力位与 0-100 综合评分，并给出评分带结论（强势/偏多/中性/偏空/弱势）"
+                           "与置信度上限（confidence_cap）及数据质量护栏说明（guardrail_reason）。"
+                           "指标与评分为本地确定性计算，原样引用；回答技术分析、趋势形态类问题时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stock_code": _REPORT_STOCK_CODE_PARAM,
+                    "days": {
+                        "type": "integer",
+                        "minimum": 30,
+                        "maximum": 250,
+                        "default": 120,
+                        "description": "参与计算的最近日线根数，默认 120，最大 250。",
+                    },
+                },
+                "required": ["stock_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_with_persona",
+            "description": "获取指定投资人格的方法论分析框架（打分权重、阈值、分析规则、输出 schema、"
+                           "分析清单与免责声明）。用户要求用某种投资风格（价值/成长/趋势/逆向）"
+                           "分析标的时先调本工具拿框架，再按框架 checklist 逐项调用其他数据工具取数分析。"
+                           "框架结论的 signal 只能取枚举值，confidence 不超过 0.9，末尾须带免责声明。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "persona": {
+                        "type": "string",
+                        "enum": ["value_cn", "growth_cn", "trend_cn", "contrarian_cn"],
+                        "description": "投资人格：value_cn=价值、growth_cn=成长、"
+                                       "trend_cn=趋势、contrarian_cn=逆向。",
+                    },
+                    "stock_code": {
+                        "type": "string",
+                        "description": "可选，待分析的 A 股股票代码（如 sh600519、600519），"
+                                       "仅作上下文标注，不影响框架内容。",
+                    },
+                },
+                "required": ["persona"],
+            },
+        },
+    },
 ]
 
 
@@ -656,6 +751,307 @@ _REPORT_VEC_IMPL = {
 }
 
 
+# ── 开源灵感模块工具分发（sentiment / technical / personas 本地分析层）──
+# 与 _IMPL 查表模式一致：工具名 → 本地处理器(args) -> dict。这三个工具的
+# 底层不是单一数据函数，而是 Stage 1 交付的本地分析模块（BettaFish 灵感
+# 社交情绪层 / daily_stock_analysis 灵感确定性技术分析 / Fincept 灵感
+# 投资人格框架库），处理器负责多步编排与降级；execute_tool 查表顺序在
+# 三表之后追加 _ANALYSIS_IMPL，不改旧条目。
+
+
+def _lazy_import_module(mod_name: str):
+    """惰性导入 agent 包内分析模块，导入失败返回 None（不让 ImportError 冒到编排层）。
+
+    依次尝试：包内相对导入（agent.xxx）→ 绝对导入（agent.xxx）→ 裸名导入
+    （同目录已加入 sys.path 的场景）；任何候选失败都继续尝试下一个，
+    全部失败记 warning 返回 None。
+    """
+    candidates = []
+    package = __package__ or "agent"
+    candidates.append((f".{mod_name}", package))
+    candidates.append((f"agent.{mod_name}", None))
+    candidates.append((mod_name, None))
+    for name, pkg in candidates:
+        try:
+            if pkg:
+                return importlib.import_module(name, package=pkg)
+            return importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - 惰性解析绝不抛出
+            continue
+    logger.warning("%s 模块导入失败（分析类工具将优雅降级）", mod_name)
+    return None
+
+
+def _get_sentiment_module():
+    """惰性解析 agent/sentiment.py（BettaFish 灵感社交情绪层），失败返回 None。"""
+    return _lazy_import_module("sentiment")
+
+
+def _get_technical_module():
+    """惰性解析 agent/technical.py（确定性技术分析层），失败返回 None。"""
+    return _lazy_import_module("technical")
+
+
+def _get_personas_module():
+    """惰性解析 agent/personas.py（投资人格框架库），失败返回 None。"""
+    return _lazy_import_module("personas")
+
+
+def _prefixed_symbol(code: str) -> str:
+    """6 位 A 股代码 → 带交易所前缀小写（600519→sh600519）；归一失败原样返回。"""
+    c = _normalize_stock_code(code)
+    if not c:
+        return _clean_str(code)
+    if c[0] == "6":
+        return "sh" + c
+    if c[0] in "489":
+        return "bj" + c
+    return "sz" + c
+
+
+def _to_ts_code(code: str) -> str:
+    """6 位 A 股代码 → Tushare ts_code（600519→600519.SH）；归一失败原样返回。"""
+    c = _normalize_stock_code(code)
+    if not c:
+        return _clean_str(code)
+    if c[0] == "6":
+        return f"{c}.SH"
+    if c[0] in "489":
+        return f"{c}.BJ"
+    return f"{c}.SZ"
+
+
+def _inject_market_news(df):
+    """市场情绪的可选新闻增强：取低代价的东财实时快讯单源注入情感分布。
+
+    返回 (news_items, note)；取数不可用/失败/为空时 news_items=None 且
+    note 为中文说明，绝不抛异常。
+    """
+    fetch_news = getattr(df, "fetch_eastmoney_news", None) if df is not None else None
+    if not callable(fetch_news):
+        return None, "未注入市场新闻（数据层无低代价当日新闻函数），情感分布仅含人气/涨跌停信号"
+    try:
+        items = fetch_news(limit=30)
+    except Exception as e:
+        logger.warning("市场情绪新闻注入失败（降级不注入）: %s", e)
+        return None, "市场新闻获取失败，情感分布未计入新闻"
+    if isinstance(items, list) and items:
+        return items, None
+    return None, "市场新闻为空，情感分布未计入新闻"
+
+
+def _inject_stock_news(df, code: str):
+    """个股情绪的新闻增强：复用 data_fetcher.fetch_stock_news 取该股新闻注入情感分布。
+
+    返回 (news_items, note)；取数不可用/失败/为空时 news_items=None 且
+    note 为中文说明，绝不抛异常。
+    """
+    fetch_news = getattr(df, "fetch_stock_news", None) if df is not None else None
+    if not callable(fetch_news):
+        return None, "未注入个股新闻（数据层个股新闻函数不可用），情感分布未计入"
+    try:
+        items = fetch_news(symbol=_prefixed_symbol(code), market="cn", limit=10)
+    except Exception as e:
+        logger.warning("个股新闻注入失败（降级不注入）: %s", e)
+        return None, "个股新闻获取失败，情感分布未计入新闻"
+    if isinstance(items, list) and items:
+        return items, None
+    return None, "个股新闻为空，情感分布未计入新闻"
+
+
+def _append_note(result, note: str):
+    """把一条降级说明追加进底层返回的 notes 列表（防御式，结构异常则忽略）。"""
+    if note and isinstance(result, dict):
+        notes = result.setdefault("notes", [])
+        if isinstance(notes, list):
+            notes.append(note)
+    return result
+
+
+def _handle_get_market_sentiment(args: dict) -> dict:
+    """get_market_sentiment 处理器：市场情绪快照 + 可选新闻情感增强。"""
+    sent = _get_sentiment_module()
+    if sent is None:
+        return {"ok": False, "note": "情绪模块不可用（agent/sentiment.py 未就绪）"}
+    date_arg = _clean_str(args.get("date")) or None
+    news_items, news_note = _inject_market_news(_get_data_fetcher())
+    snapshot = sent.get_market_sentiment(date=date_arg, news_items=news_items)
+    return _append_note(snapshot, news_note)
+
+
+def _handle_get_stock_sentiment(args: dict) -> dict:
+    """get_stock_sentiment 处理器：个股人气排名/趋势 + 个股新闻情感增强。"""
+    code = _normalize_stock_code(args.get("stock_code"))
+    if not code:
+        raise _ParamError(f"stock_code 无法归一为 6 位 A 股代码：{args.get('stock_code')!r}")
+    days = _clamp_int(args.get("days"), 30, 1, 120)
+    sent = _get_sentiment_module()
+    if sent is None:
+        return {"ok": False, "code": code, "note": "情绪模块不可用（agent/sentiment.py 未就绪）"}
+    news_items, news_note = _inject_stock_news(_get_data_fetcher(), code)
+    result = sent.get_stock_sentiment(code, days=days, news_items=news_items)
+    return _append_note(result, news_note)
+
+
+def _fetch_stock_daily_rows(df, code: str, days: int):
+    """经 data_fetcher 的 Tushare 连接取个股日线（升序 rows，限近 days 行）。
+
+    data_fetcher 现有个股 K 线函数（fetch_stock_kline）只含日期/收盘/涨跌幅，
+    不足以支撑技术指标，这里直接复用其 Tushare 连接（_get_pro）调 pro.daily。
+    返回 (rows, note)；任何失败 rows=None 且 note 为中文说明，绝不抛异常。
+    """
+    if df is None:
+        return None, "数据采集模块不可用，技术分析取数失败"
+    get_pro = getattr(df, "_get_pro", None)
+    if not callable(get_pro):
+        return None, "data_fetcher 未提供 Tushare 连接（_get_pro 缺失），技术分析取数失败"
+    try:
+        pro = get_pro()
+    except Exception as e:
+        return None, f"Tushare 连接失败：{e}"
+    if pro is None or not callable(getattr(pro, "daily", None)):
+        return None, "Tushare 连接不可用（TUSHARE_TOKEN 未配置或连接失败）"
+    from datetime import datetime as _dt, timedelta as _td
+    end = _dt.now().strftime("%Y%m%d")
+    start = (_dt.now() - _td(days=days * 2 + 30)).strftime("%Y%m%d")
+    try:
+        daily_df = pro.daily(ts_code=_to_ts_code(code), start_date=start, end_date=end)
+    except Exception as e:
+        return None, f"Tushare daily 取数失败：{e}"
+    try:
+        records = daily_df.to_dict("records")
+    except Exception:  # noqa: BLE001 - 绝不抛出
+        return None, "Tushare daily 返回结构异常，技术分析取数失败"
+    rows = [r for r in records if isinstance(r, dict)]
+    rows.sort(key=lambda r: str(r.get("trade_date", "")))
+    if not rows:
+        return None, f"Tushare daily 无 {code} 近期日线数据"
+    return rows[-days:], None
+
+
+def _latest_expected_trade_day(tech, df):
+    """最近的应有交易日（'YYYY-MM-DD'）+ 判定方式说明（note，无补充说明为 None）。
+
+    优先用 data_fetcher 的 Tushare 交易日历（trade_cal）；日历不可用时回退
+    agent.technical.is_trade_day 的周一~周五启发式。绝不抛异常。
+    """
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    get_pro = getattr(df, "_get_pro", None) if df is not None else None
+    if callable(get_pro):
+        try:
+            pro = get_pro()
+            cal_df = pro.trade_cal(
+                exchange="SSE",
+                start_date=(today - _td(days=14)).strftime("%Y%m%d"),
+                end_date=today.strftime("%Y%m%d"),
+            )
+            records = cal_df.to_dict("records")
+            open_days = sorted({
+                f"{str(r.get('cal_date'))[:4]}-{str(r.get('cal_date'))[4:6]}-{str(r.get('cal_date'))[6:8]}"
+                for r in records
+                if isinstance(r, dict) and str(r.get("is_open")) == "1"
+                and len(str(r.get("cal_date"))) == 8
+            })
+            open_days = [d for d in open_days if d <= today.isoformat()]
+            if open_days:
+                return open_days[-1], None
+        except Exception as e:
+            logger.warning("交易日历获取失败，stale 判定改用启发式: %s", e)
+    d = today
+    for _ in range(14):
+        try:
+            if tech.is_trade_day(d.isoformat()):
+                return d.isoformat(), "交易日历不可用，stale 判定用周一~周五启发式"
+        except Exception:  # noqa: BLE001 - 绝不抛出
+            break
+        d -= _td(days=1)
+    return None, "交易日历不可用且启发式判定失败，未做 stale 检查"
+
+
+_TECH_SOURCE = "Tushare daily + agent.technical 本地确定性计算"
+
+
+def _handle_get_technical_analysis(args: dict) -> dict:
+    """get_technical_analysis 处理器：取日线 → compute_indicators → verdict 护栏。"""
+    code = _normalize_stock_code(args.get("stock_code"))
+    if not code:
+        raise _ParamError(f"stock_code 无法归一为 6 位 A 股代码：{args.get('stock_code')!r}")
+    days = _clamp_int(args.get("days"), 120, 30, 250)
+    tech = _get_technical_module()
+    if tech is None:
+        return {"ok": False, "note": "技术分析模块不可用（agent/technical.py 未就绪）"}
+    df = _get_data_fetcher()
+    rows, fetch_note = _fetch_stock_daily_rows(df, code, days)
+    if rows is None:
+        return {"ok": False, "note": fetch_note, "source": _TECH_SOURCE}
+    indicators = tech.compute_indicators(rows)
+    if not isinstance(indicators, dict) or not indicators.get("ok"):
+        note = indicators.get("note") if isinstance(indicators, dict) else None
+        return {"ok": False, "note": note or "技术指标计算失败", "source": _TECH_SOURCE}
+    as_of = indicators.get("as_of")
+    notes = []
+    expected, cal_note = _latest_expected_trade_day(tech, df)
+    if cal_note:
+        notes.append(cal_note)
+    stale = bool(expected and isinstance(as_of, str) and as_of < expected)
+    data_quality = {
+        "stale": stale,
+        "no_volume": indicators.get("volume_state") == "missing",
+        "insufficient": False,
+    }
+    verdict = tech.verdict_from_score(indicators.get("score"), data_quality)
+    return {
+        "ok": True,
+        "as_of": as_of,
+        "close": indicators.get("close"),
+        "indicators": indicators,
+        "verdict": verdict,
+        "source": f"Tushare daily（as_of {as_of}）+ agent.technical 本地确定性计算",
+        "notes": notes,
+    }
+
+
+def _handle_analyze_with_persona(args: dict) -> dict:
+    """analyze_with_persona 处理器：渲染人格方法论框架；未知人格降级为清单。"""
+    key = _clean_str(args.get("persona"))
+    pers = _get_personas_module()
+    if pers is None:
+        return {"note": "投资人格模块不可用（agent/personas.py 未就绪）", "available": []}
+    framework = pers.render_persona_framework(key)
+    if framework is None:
+        return {"note": f"未知投资人格「{key}」，请从可用人格中选择",
+                "available": pers.list_personas()}
+    return {
+        "persona": key,
+        "stock_code": _normalize_stock_code(args.get("stock_code")) or None,
+        "framework": framework,
+        "guidance": "请按该框架调用其他数据工具取数后逐项分析，结论需过 validate 纪律",
+        "source": "agent/persona_defs.json（本地方法论框架库）",
+    }
+
+
+# 情绪层工具名 → 处理器（agent/sentiment.py，BettaFish 灵感社交情绪层）
+_SENTIMENT_IMPL = {
+    "get_market_sentiment": _handle_get_market_sentiment,
+    "get_stock_sentiment": _handle_get_stock_sentiment,
+}
+
+# 技术分析工具名 → 处理器（agent/technical.py，确定性技术分析层）
+_TECH_IMPL = {
+    "get_technical_analysis": _handle_get_technical_analysis,
+}
+
+# 投资人格工具名 → 处理器（agent/personas.py，Fincept 灵感人格框架库）
+_PERSONA_IMPL = {
+    "analyze_with_persona": _handle_analyze_with_persona,
+}
+
+# 开源灵感模块工具汇总表：execute_tool 查表顺序追加在最后
+# （_REPORT_VEC_IMPL → _REPORT_IMPL → _IMPL → _ANALYSIS_IMPL），不改旧条目
+_ANALYSIS_IMPL = {**_SENTIMENT_IMPL, **_TECH_IMPL, **_PERSONA_IMPL}
+
+
 def _clamp_int(value, default: int, lo: int, hi: int) -> int:
     """整数参数兜底：非法值用默认值，并夹在 [lo, hi] 区间。"""
     try:
@@ -700,12 +1096,15 @@ def execute_tool(name: str, args: dict) -> dict:
     if not isinstance(args, dict):
         return {"ok": False, "error": f"工具参数必须是对象，收到 {type(args).__name__}"}
 
-    # 查表顺序：研报全文向量 _REPORT_VEC_IMPL → 研报库 _REPORT_IMPL → 数据层 _IMPL；
-    # 三表都不命中才报未注册
+    # 查表顺序：研报全文向量 _REPORT_VEC_IMPL → 研报库 _REPORT_IMPL → 数据层 _IMPL
+    # → 开源灵感模块 _ANALYSIS_IMPL；四表都不命中才报未注册
     vec_impl = _REPORT_VEC_IMPL.get(name)
     report_impl = _REPORT_IMPL.get(name)
     impl = vec_impl or report_impl or _IMPL.get(name)
     if not impl:
+        handler = _ANALYSIS_IMPL.get(name)
+        if handler is not None:
+            return _execute_analysis_tool(name, handler, args)
         return {"ok": False, "error": f"未注册的工具：{name}"}
     fetcher_name, arg_builder = impl
 
@@ -752,6 +1151,26 @@ def execute_tool(name: str, args: dict) -> dict:
         return {"ok": False, "error": f"工具执行出错：{e}"}
 
 
+def _execute_analysis_tool(name: str, handler, args: dict) -> dict:
+    """开源灵感模块工具（_ANALYSIS_IMPL）的执行入口：必填校验 + 绝不抛异常包装。
+
+    handler 返回的 dict 作为 data 原样返回（其内部自带 ok/note 降级语义）；
+    handler 抛 _ParamError 转成 ok=False 中文提示。
+    """
+    missing = [k for k in _required_params(name)
+               if k not in args or args[k] in (None, "")]
+    if missing:
+        return {"ok": False, "error": f"缺少必填参数：{', '.join(missing)}"}
+    try:
+        data = handler(args)
+        return {"ok": True, "data": _json_safe(data)}
+    except _ParamError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        logger.warning("分析类工具执行失败 name=%s", name, exc_info=True)
+        return {"ok": False, "error": f"工具执行出错：{e}"}
+
+
 # ── 工具目录（调试 / 测试断言用）──
 
 _SHORT_DESC = {
@@ -779,6 +1198,10 @@ _SHORT_DESC = {
     "search_research_reports": "券商研报检索（评级/目标价/盈利预测）",
     "get_rating_summary": "券商评级聚合（评级分布/目标价区间）",
     "search_report_content": "研报正文全文检索（观点细节/论证逻辑）",
+    "get_market_sentiment": "市场社交情绪快照（温度+涨跌停统计+人气榜）",
+    "get_stock_sentiment": "个股社交情绪（人气排名趋势+新闻情感分布）",
+    "get_technical_analysis": "个股技术分析仪表盘（指标+评分带+护栏）",
+    "analyze_with_persona": "投资人格方法论框架（价值/成长/趋势/逆向）",
 }
 
 

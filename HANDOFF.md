@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化落地，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块落地，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -47,7 +47,15 @@ agent/industry_kb.py       行业知识库：31申万行业档案(chain/drivers/
                            + industry_kb_data.json，format_kb_block 注入块(≤400字)
 agent/history_lens.py      以史为鉴：get_history_note(sector,mode) 历史判断回顾注入块
                            + get_accuracy_summary 命中率汇总（读问责存档JSONL）
-agent/tools.py             21 个 OpenAI function calling 工具（完整 JSON Schema）
+agent/tools.py             28 个 OpenAI function calling 工具（完整 JSON Schema）
+agent/sentiment.py         社交情绪层（BettaFish灵感）：东财人气榜+人气历史+涨跌停池
+                           + 词典情感打分 + 情绪温度0-100 + 进程内当日缓存
+agent/technical.py         确定性技术分析（daily_stock_analysis灵感）：MA七态/MACD/RSI/
+                           量能五态/支撑压力/0-100评分 + 数据质量护栏 + 交易日历
+agent/agent_audit.py       Agent工程三件套（Dexter灵感）：Scratchpad JSONL审计 +
+                           ToolCallGuard软护栏 + microcompact上下文管理
+agent/personas.py          投资人格框架库（Fincept灵感）：persona_defs.json四人格
+                           （价值/成长/趋势/逆向）+ 框架渲染 + LLM产出归一化校验
 agent/data_fetcher.py      数据采集：30+ 函数（Tushare/新浪MCP/yfinance/FRED）
                            + 板块extras当日缓存（进程内dict+锁）+ 景气度报告期直查
                            + 新闻注入净化 _sanitize_news_text（所有新闻源+pool双保险）
@@ -58,7 +66,7 @@ agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     1377 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -297,8 +305,56 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
   未收录正确跳过）；bge 建索引 7 篇 160 块；工具层语义检索「AI 算力产业链
   观点」命中算力过剩/资本开支相关段落（score 0.62+）排序合理
 
+**开源借鉴移植（2026-07-22 晚，新工作线落地）**
+
+能力：借鉴四个开源项目的精华设计（BettaFish 社交情绪 / FinceptTerminal 投资人格 /
+daily_stock_analysis 技术仪表盘 / Dexter Agent 工程），全部自写代码（License 红线：
+BettaFish=GPL、Fincept=AGPL+商业双许可，只移植思路不复制）。工具 24→28。
+
+- agent/sentiment.py（BettaFish 灵感，合规数据源替代其社媒爬虫）：东财人气榜
+  （getAllCurrentList，POST，data 直为 list、无 name——名称经 push2 ulist 批量回填，
+  失败留空串降级）+ 个股人气历史（getHisList，⚠️ 参数是 srcSecurityCode 且必须带
+  SH/SZ/BJ 市场前缀，stockCode/entityId 均报 -1，2026-07-22 实测定案）+ 涨跌停池
+  （push2ex 涨停/跌停/炸板三池）+ 中文金融利好/利空词典确定性打分（scorer 可注入）
+  + 情绪温度 0-100（涨停/跌停/炸板率/最高连板加权公式，模块常量带注释）；进程内当日缓存
+- agent/technical.py（daily_stock_analysis 灵感）：纯函数确定性技术分析——
+  MA 七态/乖离率/量能五态/MACD(12,26,9)/RSI6·12/支撑压力/0-100 评分（权重常量可覆盖），
+  + verdict_from_score 评分带→结论 + 数据质量护栏（insufficient→cap0.3/stale→0.5/
+  no_volume→0.7 取最严）+ is_trade_day（calendar 注入优先，否则周一~五启发式）
+- agent/agent_audit.py（Dexter 灵感）：Scratchpad JSONL 审计（每次 Agent 查询一文件，
+  ${DATA_DIR:-data}/scratchpad，best-effort 吞错）+ ToolCallGuard 软护栏（单工具
+  调用>3 次或参数相似度≥0.7 时生成中文警告注入工具结果尾部，绝不阻断）
+  + microcompact（tool 消息>8 条或总字符>80k 时最旧的替换为占位符，保留最近 4 条，
+  assistant tool_calls 配对完好）
+- agent/personas.py + persona_defs.json（Fincept 灵感）：配置驱动的四个 A 股方法论
+  框架——value_cn/growth_cn/trend_cn/contrarian_cn（instructions/权重/阈值/规则/输出
+  schema 全原创中文）；validate_persona_output 归一化（signal 枚举外→观望，
+  confidence 钳≤0.9，violations 记录）
+- tools.py 新增 4 工具：get_market_sentiment（市场情绪快照）/ get_stock_sentiment
+  （个股人气+新闻情感）/ get_technical_analysis（技术仪表盘，Tushare daily 取数+
+  trade_cal 判 stale）/ analyze_with_persona（人格框架+指引）；走 _ANALYSIS_IMPL
+  第四查表 + _lazy_import_module 惰性解析，绝不抛异常
+- orchestrator._agent_query 接入审计三件套（钩子经 _audit_safe 包裹，异常零影响主循环）
+- system_prompts AGENT_QUERY_PROMPT 追加三节：情绪引用规范 / 技术分析纪律
+  （置信度不得突破 confidence_cap，guardrail_reason 原文透传）/ 投资人格框架用法
+- 测试：+319 用例（sentiment 92/technical 77/agent_audit 52/personas 55/集成 43），
+  全量 1377 passed 全绿（test_report_tools 等 3 处工具总数断言按惯例 24→28）
+- 真实 E2E（2026-07-22）：涨跌停池 47 涨停/36 炸板/最高连板 5；人气榜 top10 含名称
+  （紫光股份 1/德明利 2）；茅台人气 44（30 日均 26.9，趋势下降）；情绪温度 68.6 活跃；
+  技术分析茅台 as_of 2026-07-22 收 1305.0 弱多头 MACD 多头 score 60.25→偏多，
+  confidence_cap 1.0 无护栏触发
+
 ## 已知问题
 
+- 人气榜接口不含股票名称：名称经 push2 ulist 批量回填，本机系统代理异常时名称留空串
+  优雅降级（排名/代码不受影响）；生产无代理环境实测正常
+- 个股人气历史必须传 srcSecurityCode+市场前缀；BJ（北交所）前缀规则按 4/8/920 推导，
+  未经实网验证（东财 sc 格式以实测为准）
+- 情绪温度/词典情感为确定性弱信号，反讽/新词无能为力；scorer 注入点已预留（可换 LLM 打分）
+- 技术分析 RSI 用简单平均法（Cutler's），与 Wilder 平滑口径数值有差异（趋势方向一致）；
+  无交易日历时 stale 判定退化为周一~五启发式，调休工作日可能误判
+- ToolCallGuard 相似度为字符级 SequenceMatcher，语义相近字面不同的重复查询不敏感（低成本有意设计）
+- Scratchpad 每会话一文件无轮转清理，长期运行需运维侧定期归档
 - 东财 PDF 的 EO_Bot 挑战兜底求解未端到端复验（infoCode 直链实测直 200 未触发）；
   若未来直链也触发挑战且 cookie 重载失效，东财全文通道退化（warning 可观测，新浪兜底）
 - pdf.dfcfw.com 调试期间对该 IP 触发过 400 级限流（约 10 分钟自愈）；每日低频无碍
@@ -336,5 +392,8 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
   DATA_DIR 推导；研报库缺省 ${DATA_DIR:-data}/reports.db）
 研报库v2：`REPORT_EMBED_MODEL`（bge 模型本地路径或 HF ID，缺省 HF 默认；
   国内 huggingface.co 不可达时用 ModelScope 下载后设本地路径）
+开源移植线（均可选）：`SCRATCHPAD_DIR`（Agent 审计 JSONL 目录，缺省
+  ${DATA_DIR:-data}/scratchpad）、`PERSONA_DEFS_PATH`（人格定义文件覆盖路径，
+  缺省 agent/persona_defs.json）；情绪端点免登录零新增 Key
 推送：`PUSH_WEBHOOK_URL`（未配置只生成不发送）、`PUSH_TIME`（默认 15:40 上海，工作日）
 配额：`RATE_LIMIT_PER_MIN`（默认 30）、`QUOTA_DAILY`（默认 500，上海时区自然日）
