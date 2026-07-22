@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块 + 社媒舆情爬取v1 + 东财股吧 + 清小搭实测崩坏修复落地，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块 + 社媒舆情爬取v1 + 东财股吧 + 清小搭实测崩坏修复 + 舆情分布化落地，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -56,6 +56,8 @@ agent/social_aggregator.py newsnow 聚合兜底（四源，仅直连失败降级
 agent/social_store.py      社媒帖子 SQLite 持久化（social.db，hit_count 幂等累计）
 agent/social_media.py      社媒门面：热榜聚合/搜索分发/股票关联提取/情感聚合
 agent/social_guba.py       东财股吧：个股吧帖子列表+HTML详情正文点赞回填(个股舆情专用)
+agent/sentiment_llm.py     DeepSeek批量情感打分(20条/次,失败回退词典)
+agent/sentiment_aggregate.py 舆情分布聚合(双分布/置信度/快照趋势)
 agent/sentiment.py         社交情绪层（BettaFish灵感）：东财人气榜+人气历史+涨跌停池
                            + 词典情感打分 + 情绪温度0-100 + 进程内当日缓存
 agent/technical.py         确定性技术分析（daily_stock_analysis灵感）：MA七态/MACD/RSI/
@@ -74,7 +76,7 @@ agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     1812 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     1984 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -422,6 +424,29 @@ BettaFish 的 MediaCrawler（Playwright+登录态）未采用——v1 全部走*
   属公开信息聚合整理，标注平台+日期+「仅作辅助参考」，不得套用拒答话术；能力边界
   如实说明）+ 角色定位补社媒数据源 + AGENT_QUERY_PROMPT 社媒节顶部不得拒答兜底句
 - 测试：+94 用例（路由 72+合规 22），全量 1812 passed 全绿
+**舆情分布化（2026-07-23 凌晨，用户反馈「舆情是分布不是轶事」）**
+
+能力：社媒情绪从「引用个别帖子」升级为「整体分布为主体」——大样本采集 →
+DeepSeek 批量打分 → 条数/点赞加权双分布 + 样本量置信度 + 快照趋势，
+单条引用降级为各情感桶点赞最高的代表性样本。
+
+- agent/sentiment_llm.py：DeepSeek 批量打分（20 条/次，JSON 容错提取，
+  批次失败词典回退 method='fallback'；标签体系 乐观/中性/悲观，词典 利好/利空 归并）
+- agent/sentiment_aggregate.py：aggregate_distribution（双分布+likes+1 加权+
+  置信度 n<30 低/30-100 中/≥100 高）+ pick_representatives 分桶取样 +
+  social.db sentiment_snapshots 表（platform+target+date 主键幂等）+
+  get_trend（近 2 快照乐观占比差 >15pct 判转向）
+- 采集扩容：B站评论 pn 翻页（单视频上限 500 条防爆）+ collect_keyword_samples
+  （跨 5 视频合并评论，带 source_video）+ collect_guba_samples（个股吧 80-100 帖）
+- social_media.get_sentiment_distribution：code/keyword/合并三路径全链编排；
+  tools get_stock_sentiment 追加 sentiment_distribution 块（n+分布+置信度+趋势+
+  代表性样本），search_social_media with_comments 时同挂；prompts 补 4 条
+  分布引用纪律（分布为主体/n<30 必声明/单条仅点缀禁概括整体/趋势必说明）
+- 测试：+172 用例（llm 43/聚合 52/扩容 38/接线 39），全量 1984 passed 全绿
+- 真实 E2E（2026-07-23）：茅台吧 n=80 LLM 打分 19.7s——乐观 35.0%/中性 46.2%/
+  悲观 18.8%（置信度中）；B站评论关键词路径 n=10 置信度低如实标注，
+  加权分布与条数分布分离（46 赞评论权重凸显）
+
 - 本地真实 API 复验 Q1-Q7（2026-07-22 深夜）：情绪温度 68.6 活跃+涨跌停结构、
   茅台人气 42+股吧机构减持叙事、中际旭创股吧 H股IPO/公募重仓登顶、四平台热榜、
   B站评论真实引用、逆向框架「观望」结论（PE 分位 0%+业绩预忧 66.7%）、
@@ -444,6 +469,10 @@ BettaFish 的 MediaCrawler（Playwright+登录态）未采用——v1 全部走*
   把该词降级即可）
 - 生产端 Q1 曾现板块/北向数据缺失（本地复测正常）——疑似 Railway 侧 Tushare/数据源
   波动，需看 Railway View logs 确认，与本次修复无关
+- 分布化已知限制：股吧列表帖无 likes（enrich=0 时加权=等权，代表性样本赞 0——
+  后续可 enrich 少量热帖改善）；B站关键词搜索相关性依赖平台搜索排序（「茅台」
+  可能召回弱相关视频）；LLM 打分每标的约 10-20s 延迟+极少 API 成本；趋势判定
+  需 ≥2 天快照积累，首日恒「数据不足」
 - 人气榜接口不含股票名称：名称经 push2 ulist 批量回填，本机系统代理异常时名称留空串
   优雅降级（排名/代码不受影响）；生产无代理环境实测正常
 - 个股人气历史必须传 srcSecurityCode+市场前缀；BJ（北交所）前缀规则按 4/8/920 推导，

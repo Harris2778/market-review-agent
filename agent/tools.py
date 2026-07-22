@@ -968,6 +968,41 @@ def _append_guba_block(result, code: str):
     return result
 
 
+_GUBA_DIST_POST_LIMIT = 80  # get_stock_sentiment 情绪分布块的股吧帖子采样条数
+
+
+def _append_distribution_block(result, code: str = None, keyword: str = None):
+    """情绪分布增强块：惰性调 social_media.get_sentiment_distribution（分布化改造）。
+
+    舆情呈现从「引用个别帖子/评论」升级为「整体情绪分布」为主体。成功且
+    结构正常时在返回上追加 sentiment_distribution={target, samples_total,
+    dist, weighted_dist, confidence, trend, representatives, method,
+    sources, notes} 键；模块缺席/能力缺失/异常/结构异常一律只进 notes，
+    绝不影响主返回。绝不抛。
+    """
+    if not isinstance(result, dict):
+        return result
+    try:
+        social = _get_social_media_module()
+        get_dist = getattr(social, "get_sentiment_distribution", None) \
+            if social is not None else None
+        if not callable(get_dist):
+            return _append_note(result, "情绪分布通道不可用（social_media.get_sentiment_distribution 未就绪），未挂情绪分布")
+        if code:
+            dist = get_dist(code=code, post_limit=_GUBA_DIST_POST_LIMIT)
+        else:
+            dist = get_dist(keyword=keyword)
+        if not isinstance(dist, dict):
+            return _append_note(result, "情绪分布返回结构异常，未挂情绪分布")
+        result["sentiment_distribution"] = dist
+        for note in dist.get("notes") or []:
+            _append_note(result, f"情绪分布：{note}")
+    except Exception as e:  # noqa: BLE001 - 分布块失败绝不影响主返回
+        logger.warning("情绪分布增强失败（不影响主返回）: %s", e)
+        _append_note(result, f"情绪分布获取失败（已跳过，不影响主返回）: {e}")
+    return result
+
+
 def _handle_get_market_sentiment(args: dict) -> dict:
     """get_market_sentiment 处理器：市场情绪快照 + 可选新闻情感增强。"""
     sent = _get_sentiment_module()
@@ -980,7 +1015,7 @@ def _handle_get_market_sentiment(args: dict) -> dict:
 
 
 def _handle_get_stock_sentiment(args: dict) -> dict:
-    """get_stock_sentiment 处理器：人气排名/趋势 + 新闻情感 + 股吧舆情增强。"""
+    """get_stock_sentiment 处理器：人气排名/趋势 + 新闻情感 + 股吧舆情 + 情绪分布。"""
     code = _normalize_stock_code(args.get("stock_code"))
     if not code:
         raise _ParamError(f"stock_code 无法归一为 6 位 A 股代码：{args.get('stock_code')!r}")
@@ -991,7 +1026,8 @@ def _handle_get_stock_sentiment(args: dict) -> dict:
     news_items, news_note = _inject_stock_news(_get_data_fetcher(), code)
     result = sent.get_stock_sentiment(code, days=days, news_items=news_items)
     result = _append_note(result, news_note)
-    return _append_guba_block(result, code)
+    result = _append_guba_block(result, code)
+    return _append_distribution_block(result, code=code)
 
 
 def _fetch_stock_daily_rows(df, code: str, days: int):
@@ -1329,6 +1365,8 @@ def _handle_search_social_media(args: dict) -> dict:
     }
     if args.get("with_comments") is True:
         out["comments"] = [s for s in (_slim_social_comment(c) for c in comments) if s]
+        # 分布化改造：有评论时追加整体情绪分布块（失败只进 notes，不影响主返回）
+        out = _append_distribution_block(out, keyword=keyword)
     return out
 
 

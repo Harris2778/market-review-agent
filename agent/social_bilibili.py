@@ -54,6 +54,11 @@ DEFAULT_TIMEOUT = 10
 DEFAULT_RATE = 1.0    # 同一轮内连续请求间隔下限（秒）：≤1 req/s
 DEFAULT_JITTER = 0.3  # 随机抖动上限（秒）
 
+# 评论翻页参数：plain 版 x/v2/reply 响应带 data.page{num,size,count,acount}
+# 分页元信息，确认支持 pn 翻页（recon 报告第 3 节）；每页固定 ps=20。
+REPLY_PAGE_SIZE = 20   # 翻页每页大小
+REPLY_PAGE_MAX = 25    # 翻页页数安全上限（25 页 × 20 条 = 最多 500 条）
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _AID_RE = re.compile(r"^\d+$")
 
@@ -449,6 +454,13 @@ def fetch_comments(post_id, limit: int = 20, session=None,
 
     post_id 接受 aid 纯数字或 bvid（bvid 先经 view 接口转 aid）。
     失败记 warning 返回 []，绝不抛。
+
+    翻页：plain 版响应带 data.page 分页元信息，确认支持 pn 翻页。
+    limit<=20 维持单页直取（ps=limit，与既有行为一致）；limit>20 进入
+    内部翻页循环（ps=20 每页，页间经 _RateGate 限速），终止条件：
+    空页 / data.cursor.next==0 或 is_end / 短页（不足 ps 即末页）/
+    页数达 REPLY_PAGE_MAX（25 页 = 500 条上限）/ 单页请求失败
+    （失败保留已抓部分，绝不抛）。
     """
     pid = str(post_id or "").strip()
     if not pid or limit <= 0:
@@ -470,8 +482,33 @@ def fetch_comments(post_id, limit: int = 20, session=None,
             logger.warning("bilibili_view 响应缺少 aid：bvid=%s", pid)
             return []
         aid = str(aid_val)
-    payload = _get_json(sess, REPLY_URL, gate=gate, tag="bilibili_reply",
-                        params={"type": 1, "oid": aid, "sort": 1, "ps": limit})
-    if payload is None:
-        return []
-    return _parse_replies(payload, limit, aid)
+    if limit <= REPLY_PAGE_SIZE:
+        payload = _get_json(sess, REPLY_URL, gate=gate, tag="bilibili_reply",
+                            params={"type": 1, "oid": aid, "sort": 1, "ps": limit})
+        if payload is None:
+            return []
+        return _parse_replies(payload, limit, aid)
+    # 翻页循环：ps=20 每页，保留已抓部分，任何单页失败即止损退出
+    comments: List[Dict] = []
+    pn = 1
+    while len(comments) < limit and pn <= REPLY_PAGE_MAX:
+        payload = _get_json(sess, REPLY_URL, gate=gate, tag="bilibili_reply",
+                            params={"type": 1, "oid": aid, "sort": 1,
+                                    "ps": REPLY_PAGE_SIZE, "pn": pn})
+        if payload is None:
+            logger.warning("bilibili_reply 第 %s 页抓取失败，保留已抓 %s 条",
+                           pn, len(comments))
+            break
+        page = _parse_replies(payload, REPLY_PAGE_SIZE, aid)
+        if not page:
+            break  # 空页终止
+        comments.extend(page)
+        data = payload.get("data")
+        cursor = data.get("cursor") if isinstance(data, dict) else None
+        if isinstance(cursor, dict):
+            if _to_int(cursor.get("next")) == 0 or cursor.get("is_end"):
+                break  # 游标到尾终止
+        if len(page) < REPLY_PAGE_SIZE:
+            break  # 短页即末页
+        pn += 1
+    return comments[:limit]

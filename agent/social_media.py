@@ -546,3 +546,629 @@ def get_guba_buzz(code, limit: int = 20, enrich: int = 3, sleep=None) -> dict:
         logger.warning("get_guba_buzz 异常（返回空骨架）: %s", e, exc_info=True)
         notes.append(f"股吧舆情通道内部异常，结果可能不完整: {e}")
         return _out(_normalize_guba_code(code), [], empty_buzz)
+
+
+# ── 情绪分布主入口（舆情「分布化」改造 · 并行接线层）──
+#
+# 定位：把「引用个别帖子/评论」的轶事式舆情升级为「整体情绪分布」为主体
+# （样本量 n + 乐观/中性/悲观占比 + 置信度 + 趋势 + 代表性样本点缀）。
+#
+# 并行契约（兄弟 Worker 交付，一律惰性 importlib+getattr 探测，缺席降级进 notes）：
+#   - sentiment_llm.score_texts_batch(texts, client=None, ...) ->
+#       [{index, label(乐观/中性/悲观), score, method:'llm'|'fallback'}]（契约绝不抛）
+#   - sentiment_aggregate.aggregate_distribution(items) ->
+#       {n, dist, weighted_dist, confidence, method}
+#     / pick_representatives(items, per_bucket=2)
+#     / save_snapshot(snapshot, db_path=None)
+#     / get_trend(platform, target, days=7, db_path=None)
+#   - 同文件采集扩容 Worker：collect_guba_samples(code, post_limit, enrich, sleep)
+#     -> {code, posts, notes}；collect_keyword_samples(keyword, video_limit,
+#     comments_per_video, sleep) -> {keyword, videos_used, comments, notes}
+#
+# 打分路径：use_llm 且 sentiment_llm 就绪 → LLM 批量打分并回填条目
+#   sentiment/sentiment_score；否则降级 agent.sentiment.score_news_sentiment
+#   词典打分（scorer 默认，标签 利好/利空/中性 由聚合层归并为 乐观/悲观/中性）。
+#   method 标注 'llm' / 'lexicon' / 'mixed'（合并路径双平台打分方式不一致时）。
+
+SENTIMENT_LLM_MODULE = "sentiment_llm"
+SENTIMENT_AGG_MODULE = "sentiment_aggregate"
+_DIST_BUCKETS = ("乐观", "中性", "悲观")
+_DIST_TEXT_MAX = 100        # 打分输入文本（title+content）截断长度
+_DIST_REPS_PER_BUCKET = 2   # pick_representatives 每桶代表样本数
+_DIST_TREND_DAYS = 7        # 情绪趋势回看天数
+
+
+def _dist_text(item) -> str:
+    """提取打分输入文本：title + content 拼接后截 _DIST_TEXT_MAX 字。绝不抛。"""
+    if not isinstance(item, dict):
+        return ""
+    text = f"{item.get('title') or ''}\n{item.get('content') or ''}".strip()
+    return text[:_DIST_TEXT_MAX]
+
+
+def _dist_confidence_for(n: int) -> dict:
+    """置信度分档（全局契约）：n<30 低（必须声明样本不足）；30≤n<100 中；n≥100 高。"""
+    if n < 30:
+        return {"level": "低", "reason": f"样本不足（n={n} < 30），分布仅供参考"}
+    if n < 100:
+        return {"level": "中", "reason": f"样本量中等（n={n}），分布可作参考"}
+    return {"level": "高", "reason": f"样本量充足（n={n}），分布较稳健"}
+
+
+def _empty_dist(n: int = 0) -> dict:
+    """分布空骨架：对齐 aggregate_distribution 返回结构。"""
+    return {
+        "n": n,
+        "dist": {b: {"count": 0, "pct": 0.0} for b in _DIST_BUCKETS},
+        "weighted_dist": {b: 0.0 for b in _DIST_BUCKETS},
+        "confidence": _dist_confidence_for(n),
+        "method": "none",
+    }
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _collect_dist_samples(code6: str, kw: str, post_limit: int,
+                          comment_limit: int, sleep, notes: List[str]):
+    """采集层惰性调用（采集扩容 Worker 同文件并行交付，globals 探测缺席即降级）。
+
+    返回 [(platform, target, items)]：code 路径 ('guba', code, posts)，
+    keyword 路径 ('bilibili', keyword, comments)。函数缺席/调用失败/返回
+    结构异常/为空一律记中文 note 降级，绝不抛。
+    """
+    groups = []
+    if code6:
+        fn = globals().get("collect_guba_samples")
+        if not callable(fn):
+            notes.append("股吧采样函数 collect_guba_samples 未就绪"
+                         "（采集层并行交付中），股吧样本缺席")
+        else:
+            res = None
+            try:
+                res = fn(code6, post_limit=post_limit, sleep=sleep)
+            except TypeError:
+                # 签名不兼容时降级为仅位置参数重试
+                try:
+                    res = fn(code6)
+                except Exception as e:  # noqa: BLE001 - 采集失败降级
+                    logger.warning("股吧样本采集失败（降级缺席）: %s", e)
+                    notes.append(f"股吧样本采集失败（{e}），股吧样本缺席")
+            except Exception as e:  # noqa: BLE001 - 采集失败降级
+                logger.warning("股吧样本采集失败（降级缺席）: %s", e)
+                notes.append(f"股吧样本采集失败（{e}），股吧样本缺席")
+            if isinstance(res, dict):
+                for n in res.get("notes") or []:
+                    notes.append(f"股吧：{n}")
+                posts = [p for p in (res.get("posts") or []) if isinstance(p, dict)]
+                if posts:
+                    groups.append(("guba", code6, posts))
+                else:
+                    notes.append("股吧本轮无有效帖子样本")
+            elif res is not None:
+                notes.append("股吧采样返回结构异常，股吧样本缺席")
+    if kw:
+        fn = globals().get("collect_keyword_samples")
+        if not callable(fn):
+            notes.append("关键词采样函数 collect_keyword_samples 未就绪"
+                         "（采集层并行交付中），关键词样本缺席")
+        else:
+            res = None
+            try:
+                res = fn(kw, comments_per_video=comment_limit, sleep=sleep)
+            except TypeError:
+                try:
+                    res = fn(kw)
+                except Exception as e:  # noqa: BLE001 - 采集失败降级
+                    logger.warning("关键词样本采集失败（降级缺席）: %s", e)
+                    notes.append(f"关键词样本采集失败（{e}），关键词样本缺席")
+            except Exception as e:  # noqa: BLE001 - 采集失败降级
+                logger.warning("关键词样本采集失败（降级缺席）: %s", e)
+                notes.append(f"关键词样本采集失败（{e}），关键词样本缺席")
+            if isinstance(res, dict):
+                for n in res.get("notes") or []:
+                    notes.append(f"关键词：{n}")
+                comments = [c for c in (res.get("comments") or [])
+                            if isinstance(c, dict)]
+                if comments:
+                    groups.append(("bilibili", kw, comments))
+                else:
+                    notes.append("关键词本轮无有效评论样本")
+            elif res is not None:
+                notes.append("关键词采样返回结构异常，关键词样本缺席")
+    return groups
+
+
+def _score_items_llm(items, client, sleep, platform: str, notes: List[str]) -> bool:
+    """LLM 批量打分路径：texts 截 100 字 → score_texts_batch → 按 index 回填
+    条目 sentiment（乐观/中性/悲观）与 sentiment_score（夹取 [-1,1]）。
+
+    返回 True=LLM 路径已用；模块缺席/能力缺失/异常/结构异常一律记 note
+    并返回 False（调用方降级词典）。契约承诺绝不抛，仍全防御。
+    """
+    mod = _load_module(SENTIMENT_LLM_MODULE)
+    if mod is None:
+        notes.append(f"{platform}: LLM 打分模块 sentiment_llm 未就绪，降级词典打分")
+        return False
+    batch_fn = _get_capability(mod, "score_texts_batch")
+    if batch_fn is None:
+        notes.append(f"{platform}: LLM 打分能力 score_texts_batch 缺失，降级词典打分")
+        return False
+    texts = [_dist_text(it) for it in items]
+    try:
+        results = batch_fn(texts, client=client, sleep=sleep)
+    except TypeError:
+        try:
+            results = batch_fn(texts)
+        except Exception as e:  # noqa: BLE001 - LLM 失败降级词典
+            logger.warning("%s LLM 批量打分失败（降级词典）: %s", platform, e)
+            notes.append(f"{platform}: LLM 批量打分失败（{e}），降级词典打分")
+            return False
+    except Exception as e:  # noqa: BLE001 - LLM 失败降级词典
+        logger.warning("%s LLM 批量打分失败（降级词典）: %s", platform, e)
+        notes.append(f"{platform}: LLM 批量打分失败（{e}），降级词典打分")
+        return False
+    if not isinstance(results, list):
+        notes.append(f"{platform}: LLM 批量打分返回结构异常，降级词典打分")
+        return False
+    by_index = {}
+    for r in results:
+        if isinstance(r, dict) and isinstance(r.get("index"), int):
+            by_index[r["index"]] = r
+    fallback_hits = 0
+    for i, item in enumerate(items):
+        r = by_index.get(i)
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "")
+        if label in _DIST_BUCKETS:
+            item["sentiment"] = label
+        item["sentiment_score"] = round(
+            max(-1.0, min(1.0, _safe_float(r.get("score")))), 4)
+        if r.get("method") == "fallback":
+            fallback_hits += 1
+    if fallback_hits:
+        notes.append(f"{platform}: LLM 打分中 {fallback_hits} 条内部降级为"
+                     "兜底打分（method=fallback）")
+    return True
+
+
+def _score_items_lexicon(items, platform: str, notes: List[str]) -> bool:
+    """词典打分路径：复用 score_news_sentiment（scorer 默认），把标签/分数回填
+    到原条目上（保留 metrics 等其余字段）；标签 利好/利空/中性 由聚合层归并。
+    失败记 note 返回 False，绝不抛。"""
+    try:
+        scored = score_news_sentiment(items)
+    except Exception as e:  # noqa: BLE001 - 词典打分失败降级
+        logger.warning("%s 词典打分失败（条目 sentiment 留空）: %s", platform, e)
+        notes.append(f"{platform}: 词典打分异常（{e}），条目 sentiment 留空")
+        return False
+    for item, s in zip(items, scored):
+        if not isinstance(s, dict):
+            continue
+        item["sentiment"] = s.get("sentiment")
+        item["sentiment_score"] = s.get("sentiment_score", 0.0)
+    return True
+
+
+def _aggregate_group(items, platform: str, notes: List[str]):
+    """单平台聚合：aggregate_distribution 算分布 + pick_representatives 取样本。
+
+    返回 (agg, reps)；agg 对齐 aggregate_distribution 结构（失败给空骨架，
+    n 兜底为条目数），reps 失败给 []。任何失败记 note，绝不抛。
+    """
+    mod = _load_module(SENTIMENT_AGG_MODULE)
+    agg_fn = _get_capability(mod, "aggregate_distribution")
+    agg = None
+    if agg_fn is None:
+        notes.append(f"{platform}: 聚合能力 aggregate_distribution 未就绪"
+                     "（聚合层并行交付中），分布降级为空骨架")
+    else:
+        noted = False
+        try:
+            candidate = agg_fn(items)
+        except Exception as e:  # noqa: BLE001 - 聚合失败降级空骨架
+            logger.warning("%s 分布聚合异常（降级空骨架）: %s", platform, e)
+            candidate = None
+            noted = True
+            notes.append(f"{platform}: 分布聚合异常（{e}），降级为空骨架")
+        if isinstance(candidate, dict):
+            agg = candidate
+        elif not noted:
+            notes.append(f"{platform}: 分布聚合返回结构异常或为空，降级为空骨架")
+    if agg is None:
+        agg = _empty_dist(n=len(items))
+    rep_fn = _get_capability(mod, "pick_representatives")
+    reps = []
+    if rep_fn is None:
+        notes.append(f"{platform}: 代表样本能力 pick_representatives 未就绪"
+                     "（聚合层并行交付中），无代表性样本")
+    else:
+        try:
+            cand = rep_fn(items, per_bucket=_DIST_REPS_PER_BUCKET)
+        except TypeError:
+            try:
+                cand = rep_fn(items)
+            except Exception as e:  # noqa: BLE001 - 代表样本失败降级
+                logger.warning("%s 代表样本选取失败（降级空）: %s", platform, e)
+                cand = None
+                notes.append(f"{platform}: 代表样本选取失败（{e}），降级为空")
+        except Exception as e:  # noqa: BLE001 - 代表样本失败降级
+            logger.warning("%s 代表样本选取失败（降级空）: %s", platform, e)
+            cand = None
+            notes.append(f"{platform}: 代表样本选取失败（{e}），降级为空")
+        if isinstance(cand, (list, dict)):
+            reps = cand
+        elif cand is not None:
+            notes.append(f"{platform}: 代表样本返回结构异常，降级为空")
+    return agg, reps
+
+
+def _snapshot_and_trend(platform: str, target: str, agg: dict, notes: List[str]):
+    """落快照 + 取趋势：save_snapshot 落本轮分布，get_trend 取近 _DIST_TREND_DAYS 天。
+
+    快照/趋势失败只记 note，绝不影响本轮分布返回。返回 trend（失败为 None）。
+    """
+    mod = _load_module(SENTIMENT_AGG_MODULE)
+    snapshot = {
+        "platform": platform,
+        "target": target,
+        "date": datetime.now().date().isoformat(),
+        "n": agg.get("n"),
+        "dist": agg.get("dist"),
+        "weighted_dist": agg.get("weighted_dist"),
+        "confidence": agg.get("confidence"),
+    }
+    save_fn = _get_capability(mod, "save_snapshot")
+    if save_fn is None:
+        notes.append(f"{platform}: 快照能力 save_snapshot 未就绪，本轮未落快照")
+    else:
+        try:
+            save_fn(snapshot)
+        except Exception as e:  # noqa: BLE001 - 快照失败不影响分布
+            logger.warning("%s 快照落盘失败（不影响本轮分布）: %s", platform, e)
+            notes.append(f"{platform}: 快照落盘失败（{e}），不影响本轮分布")
+    trend_fn = _get_capability(mod, "get_trend")
+    trend = None
+    if trend_fn is None:
+        notes.append(f"{platform}: 趋势能力 get_trend 未就绪，本轮无趋势数据")
+    else:
+        try:
+            trend = trend_fn(platform, target, days=_DIST_TREND_DAYS)
+        except TypeError:
+            try:
+                trend = trend_fn(platform, target)
+            except Exception as e:  # noqa: BLE001 - 趋势失败降级
+                logger.warning("%s 趋势读取失败（本轮无趋势数据）: %s", platform, e)
+                notes.append(f"{platform}: 趋势读取失败（{e}），本轮无趋势数据")
+        except Exception as e:  # noqa: BLE001 - 趋势失败降级
+            logger.warning("%s 趋势读取失败（本轮无趋势数据）: %s", platform, e)
+            notes.append(f"{platform}: 趋势读取失败（{e}），本轮无趋势数据")
+    return trend
+
+
+def _merge_group_dists(aggs) -> dict:
+    """合并多平台分布（平台分别统计后归并）：count 求和重算 pct，
+    weighted_dist 按各平台 n 加权平均，confidence 按合并 n 重新分档。绝不抛。"""
+    n = 0
+    counts = {b: 0 for b in _DIST_BUCKETS}
+    weighted_sum = {b: 0.0 for b in _DIST_BUCKETS}
+    for agg in aggs or []:
+        if not isinstance(agg, dict):
+            continue
+        n_i = _safe_int(agg.get("n"))
+        n += n_i
+        dist = agg.get("dist") if isinstance(agg.get("dist"), dict) else {}
+        for b in _DIST_BUCKETS:
+            bucket = dist.get(b) if isinstance(dist.get(b), dict) else {}
+            counts[b] += _safe_int(bucket.get("count"))
+        w = agg.get("weighted_dist") if isinstance(agg.get("weighted_dist"), dict) else {}
+        for b in _DIST_BUCKETS:
+            weighted_sum[b] += _safe_float(w.get(b)) * n_i
+    if n <= 0:
+        n = sum(counts.values())  # aggregate 未提供 n 时用 count 合计兜底
+    dist = {b: {"count": counts[b],
+                "pct": round(counts[b] / n * 100.0, 1) if n else 0.0}
+            for b in _DIST_BUCKETS}
+    weighted = {b: round(weighted_sum[b] / n, 1) if n else 0.0
+                for b in _DIST_BUCKETS}
+    return {"n": n, "dist": dist, "weighted_dist": weighted,
+            "confidence": _dist_confidence_for(n)}
+
+
+def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
+                               comment_limit: int = 120, use_llm: bool = True,
+                               client=None, sleep=None) -> dict:
+    """个股/关键词社媒情绪分布主入口：采样 → 打分 → 聚合分布 → 快照/趋势。绝不抛。
+
+    路径：
+    - code 路径：collect_guba_samples(code, post_limit) 取股吧帖子；
+    - keyword 路径：collect_keyword_samples(keyword) 取 B 站评论；
+    - 两者都给则两路都采集，平台分别统计后归并（dist 计数求和重算 pct，
+      weighted_dist 按平台 n 加权，confidence 按合并 n 重新分档）。
+
+    打分：use_llm 且 sentiment_llm 就绪 → score_texts_batch 批量打分
+    （标签回填条目 sentiment/sentiment_score）；否则降级
+    sentiment.score_news_sentiment 词典打分（scorer 默认）。method 标注
+    'llm' / 'lexicon' / 'mixed'（合并路径双平台打分方式不一致时）。
+
+    返回 {target:{code/keyword}, samples_total, dist, weighted_dist,
+    confidence, trend, representatives, method, sources, notes}；
+    合并路径 trend/representatives 为 {平台: 值} 字典。任何子步骤失败
+    降级进 notes，绝不抛异常。
+    """
+    notes: List[str] = []
+
+    def _out(target, samples_total, dist, weighted_dist, confidence, trend,
+             representatives, method, sources):
+        return {
+            "target": target,
+            "samples_total": samples_total,
+            "dist": dist,
+            "weighted_dist": weighted_dist,
+            "confidence": confidence,
+            "trend": trend,
+            "representatives": representatives,
+            "method": method,
+            "sources": sources,
+            "notes": notes,
+        }
+
+    try:
+        code6 = _normalize_guba_code(code) if code else ""
+        kw = str(keyword or "").strip()
+        if code and not code6:
+            notes.append(f"股吧代码非法（需 6 位 A 股代码）：{code!r}，股吧路径跳过")
+        target = {}
+        if code6:
+            target["code"] = code6
+        if kw:
+            target["keyword"] = kw
+        if not code6 and not kw:
+            notes.append("code 与 keyword 均缺失/非法，本轮无样本可打分")
+            empty = _empty_dist(0)
+            return _out(target, 0, empty["dist"], empty["weighted_dist"],
+                        empty["confidence"], None, [], "none", [])
+        try:
+            post_limit = max(1, int(post_limit))
+        except (TypeError, ValueError):
+            post_limit = 80
+        try:
+            comment_limit = max(1, int(comment_limit))
+        except (TypeError, ValueError):
+            comment_limit = 120
+
+        groups = _collect_dist_samples(code6, kw, post_limit, comment_limit,
+                                       sleep, notes)
+        if not groups:
+            notes.append("本轮无任何有效样本（采集层缺席或为空）")
+            empty = _empty_dist(0)
+            return _out(target, 0, empty["dist"], empty["weighted_dist"],
+                        empty["confidence"], None, [], "none", [])
+
+        per_group = []
+        methods = []
+        for platform, target_value, items in groups:
+            used_llm = _score_items_llm(items, client, sleep, platform, notes) \
+                if use_llm else False
+            if not used_llm:
+                _score_items_lexicon(items, platform, notes)
+            methods.append("llm" if used_llm else "lexicon")
+            agg, reps = _aggregate_group(items, platform, notes)
+            trend = _snapshot_and_trend(platform, target_value, agg, notes)
+            per_group.append({
+                "platform": platform, "target": target_value, "items": items,
+                "agg": agg, "reps": reps, "trend": trend,
+            })
+
+        overall_method = methods[0] if len(set(methods)) == 1 else "mixed"
+        sources = ["eastmoney_guba" if g["platform"] == "guba" else g["platform"]
+                   for g in per_group]
+
+        if len(per_group) == 1:
+            g = per_group[0]
+            agg = g["agg"]
+            empty = _empty_dist(len(g["items"]))
+            return _out(
+                target,
+                _safe_int(agg.get("n"), len(g["items"])),
+                agg.get("dist") if isinstance(agg.get("dist"), dict)
+                else empty["dist"],
+                agg.get("weighted_dist") if isinstance(agg.get("weighted_dist"), dict)
+                else empty["weighted_dist"],
+                agg.get("confidence") if isinstance(agg.get("confidence"), dict)
+                else empty["confidence"],
+                g["trend"], g["reps"], overall_method, sources)
+        # 合并路径：平台分别统计后归并
+        merged = _merge_group_dists([g["agg"] for g in per_group])
+        trends = {g["platform"]: g["trend"] for g in per_group}
+        reps = {g["platform"]: g["reps"] for g in per_group}
+        return _out(target, merged["n"], merged["dist"], merged["weighted_dist"],
+                    merged["confidence"], trends, reps, overall_method, sources)
+    except Exception as e:  # noqa: BLE001 - 门面绝不抛出
+        logger.warning("get_sentiment_distribution 异常（返回空骨架）: %s", e,
+                       exc_info=True)
+        notes.append(f"情绪分布主流程内部异常，结果为空骨架: {e}")
+        empty = _empty_dist(0)
+        return _out({}, 0, empty["dist"], empty["weighted_dist"],
+                    empty["confidence"], None, [], "none", [])
+
+
+# ── 采样扩容：关键词评论样本 + 股吧帖子样本（分布化舆情数据源）──
+#
+# 面向「整体情绪分布」改造：下游聚合 Worker 基于这两个函数拿到数百条
+# 样本后做分布统计，单条引用降级为代表性点缀。契约：
+#   collect_keyword_samples → {keyword, videos_used, comments, notes}
+#   collect_guba_samples    → {code, posts, notes}
+# 两者均绝不抛异常，任何降级进 notes。
+
+
+def collect_keyword_samples(keyword, video_limit: int = 5,
+                            comments_per_video: int = 30, sleep=None) -> dict:
+    """B 站关键词评论样本扩容采集：搜索前 N 个视频 → 逐视频拉评论 → 合并。绝不抛。
+
+    流程：惰性加载 B 站模块（search 能力缺失即降级）→ search(keyword,
+    limit=video_limit) → 逐视频 fetch_comments(post_id,
+    limit=comments_per_video) → 合并为评论样本列表。
+
+    评论条目为统一 Comment 契约 {platform, post_id, author, content,
+    likes, published_at} 另加 source_video 键（源视频标题，供代表性
+    引用与追溯）。部分视频评论失败/为空跳过并进 notes，绝不抛。
+
+    返回 {keyword, videos_used: [{post_id, title, comments}], comments,
+    notes}；videos_used 只含实际采到评论的视频。
+    """
+    notes: List[str] = []
+    kw = str(keyword or "").strip()
+    videos_used: List[dict] = []
+    comments: List[dict] = []
+
+    def _out() -> dict:
+        return {"keyword": kw, "videos_used": videos_used,
+                "comments": comments, "notes": notes}
+
+    try:
+        try:
+            video_limit = max(1, int(video_limit))
+        except (TypeError, ValueError):
+            video_limit = 5
+        try:
+            comments_per_video = max(1, int(comments_per_video))
+        except (TypeError, ValueError):
+            comments_per_video = 30
+        if not kw:
+            notes.append("搜索关键词为空，未执行评论采样")
+            return _out()
+        mod = _load_module(PLATFORM_MODULES["bilibili"])
+        search = _get_capability(mod, "search")
+        if search is None:
+            notes.append("B 站模块未就绪或缺少 search 能力，本轮无评论样本")
+            return _out()
+        videos = _safe_fetch(search, kw, limit=video_limit,
+                             sleep=sleep)[:video_limit]
+        if not videos:
+            notes.append(f"关键词「{kw}」搜索无视频结果或端点降级，"
+                         "本轮无评论样本")
+            return _out()
+        fetch_comments = _get_capability(mod, "fetch_comments")
+        if fetch_comments is None:
+            notes.append("B 站模块缺少 fetch_comments 能力，本轮无评论样本")
+            return _out()
+        for v in videos:
+            pid = str(v.get("post_id") or "").strip()
+            title = str(v.get("title") or "").strip()
+            if not pid:
+                notes.append(f"视频「{title or '?'}」缺少 post_id，"
+                             "评论采样跳过")
+                continue
+            batch = _safe_fetch(fetch_comments, pid,
+                                limit=comments_per_video, sleep=sleep)
+            if not batch:
+                notes.append(f"视频「{title or pid}」评论抓取失败或为空，"
+                             "已跳过")
+                continue
+            for c in batch:
+                c["source_video"] = title
+            comments.extend(batch)
+            videos_used.append({"post_id": pid, "title": title,
+                                "comments": len(batch)})
+        if not comments:
+            notes.append("全部视频评论采样失败，本轮无评论样本")
+        return _out()
+    except Exception as e:  # noqa: BLE001 - 门面绝不抛出
+        logger.warning("collect_keyword_samples 异常（返回已有部分结果）: %s",
+                       e, exc_info=True)
+        notes.append(f"关键词评论采样内部异常，结果可能不完整: {e}")
+        return _out()
+
+
+def collect_guba_samples(code, post_limit: int = 100, enrich: int = 0,
+                         sleep=None) -> dict:
+    """股吧帖子样本扩容采集：fetch_bar_posts 分页拉帖，可选 enrich 回填。绝不抛。
+
+    流程：代码归一（6 位 A 股）→ 惰性加载 social_guba →
+    fetch_bar_posts(code, limit=post_limit) → enrich>0 时
+    enrich_posts(posts, top_n=enrich) 回填 top 正文与点赞。
+
+    返回 {code, posts, notes}；posts 为统一 Post 契约原样透传（不瘦身、
+    不打分，交由下游聚合 Worker 处理）。模块缺席/能力缺失/抓取失败/
+    富化失败一律降级进 notes，绝不抛异常。
+    """
+    notes: List[str] = []
+    posts: List[dict] = []
+
+    def _out(code6: str) -> dict:
+        return {"code": code6, "posts": posts, "notes": notes}
+
+    try:
+        code6 = _normalize_guba_code(code)
+        if not code6:
+            notes.append(f"股吧代码非法（需 6 位 A 股代码）：{code!r}，"
+                         "本轮未采样")
+            return _out("")
+        try:
+            post_limit = max(1, int(post_limit))
+        except (TypeError, ValueError):
+            post_limit = 100
+        try:
+            enrich = max(0, int(enrich))
+        except (TypeError, ValueError):
+            enrich = 0
+        mod = _load_module(GUBA_MODULE)
+        if mod is None:
+            notes.append("股吧模块未就绪（agent/social_guba.py 缺席），"
+                         "本轮无帖子样本")
+            return _out(code6)
+        fetch = _get_capability(mod, "fetch_bar_posts")
+        if fetch is None:
+            notes.append("股吧模块缺少 fetch_bar_posts 能力，本轮无帖子样本")
+            return _out(code6)
+        posts.extend(_safe_fetch(fetch, code6, limit=post_limit, sleep=sleep))
+        if not posts:
+            notes.append(f"股吧 {code6} 本轮未抓到帖子"
+                         "（端点降级或吧内无新帖）")
+            return _out(code6)
+        if enrich > 0:
+            enrich_fn = _get_capability(mod, "enrich_posts")
+            if enrich_fn is None:
+                notes.append("股吧模块缺少 enrich_posts 能力，"
+                             "帖子无正文与点赞数")
+            else:
+                try:
+                    enriched = enrich_fn(list(posts), top_n=enrich,
+                                         sleep=sleep)
+                except TypeError:
+                    # 签名不兼容时降级为仅位置参数重试
+                    try:
+                        enriched = enrich_fn(list(posts))
+                    except Exception as e:  # noqa: BLE001 - 富化失败降级
+                        logger.warning("股吧详情富化失败（保留列表原始数据）: %s", e)
+                        enriched = None
+                        notes.append(f"股吧详情富化失败（{e}），"
+                                     "帖子无正文与点赞数")
+                except Exception as e:  # noqa: BLE001 - 富化失败降级
+                    logger.warning("股吧详情富化失败（保留列表原始数据）: %s", e)
+                    enriched = None
+                    notes.append(f"股吧详情富化失败（{e}），帖子无正文与点赞数")
+                if enriched is not None:
+                    if isinstance(enriched, list) and enriched:
+                        posts[:] = [p for p in enriched if isinstance(p, dict)]
+                    else:
+                        notes.append("股吧详情富化返回为空，保留列表原始数据")
+        return _out(code6)
+    except Exception as e:  # noqa: BLE001 - 门面绝不抛出
+        logger.warning("collect_guba_samples 异常（返回已有部分结果）: %s",
+                       e, exc_info=True)
+        notes.append(f"股吧帖子采样内部异常，结果可能不完整: {e}")
+        return _out(_normalize_guba_code(code))
