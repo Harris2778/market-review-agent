@@ -324,6 +324,79 @@ async def usage_stats():
     }
 
 
+# ── 研报库管理端点（挂卷后库文件同步：本机爬取 → 上传生产卷）──
+
+_REPORTS_DB_MAX_BYTES = _env_int("REPORTS_DB_UPLOAD_MAX_MB", 200) * 1024 * 1024
+
+
+def _reports_db_path() -> str:
+    """研报库路径解析（复用 agent.report_library 的惰性解析契约，失败时按 DATA_DIR 推导）。"""
+    try:
+        from agent.report_library import _db_path
+        return _db_path(None)
+    except Exception:  # noqa: BLE001 - 路径解析兜底，绝不影响端点可用性
+        return os.path.join(os.getenv("DATA_DIR") or "data", "reports.db")
+
+
+@app.get("/v1/admin/reports-db/info", dependencies=[Depends(verify_api_key)])
+async def reports_db_info():
+    """研报库状态查询（需 Bearer 鉴权；查询本身不消耗限流与配额计数）。"""
+    path = _reports_db_path()
+    info: dict = {"path": path, "exists": os.path.exists(path)}
+    if info["exists"]:
+        info["size_bytes"] = os.path.getsize(path)
+        try:
+            import sqlite3
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+                info["total_reports"] = conn.execute(
+                    "SELECT COUNT(*) FROM reports"
+                ).fetchone()[0]
+                info["latest_publish_date"] = conn.execute(
+                    "SELECT MAX(publish_date) FROM reports"
+                ).fetchone()[0]
+        except Exception as e:  # noqa: BLE001 - 库损坏/无表时如实上报而非 500
+            info["stats_error"] = str(e)
+    return info
+
+
+@app.post("/v1/admin/reports-db", dependencies=[Depends(verify_api_key)])
+async def upload_reports_db(request: Request):
+    """
+    上传研报库 SQLite 文件（整体替换，需 Bearer 鉴权；不消耗限流与配额计数）。
+
+    请求体为数据库文件原始字节流（Content-Type: application/octet-stream）。
+    写入采用 临时文件 + os.replace 原子替换，正在进行的查询不会读到半截文件。
+    用途：研报在本地 Mac 爬取（东财等源对海外 IP 不友好），产出库文件后
+    上传到生产卷（DATA_DIR=/data 时落 /data/reports.db）。
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="请求体为空：需要 SQLite 文件字节流")
+    if len(body) > _REPORTS_DB_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过上限（{_REPORTS_DB_MAX_BYTES // 1024 // 1024}MB）",
+        )
+    if not body.startswith(b"SQLite format 3\x00"):
+        raise HTTPException(status_code=400, detail="不是合法的 SQLite 数据库文件")
+    path = _reports_db_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = path + ".uploading"
+        with open(tmp_path, "wb") as f:
+            f.write(body)
+        os.replace(tmp_path, path)
+    except OSError as e:
+        logger.error("研报库写入失败 path=%s: %s", path, e, exc_info=True)
+        try:
+            os.unlink(path + ".uploading")
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"研报库写入失败：{e}")
+    logger.info("研报库已更新 path=%s size=%d", path, len(body))
+    return {"ok": True, "path": path, "size_bytes": len(body)}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
