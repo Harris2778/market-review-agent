@@ -65,6 +65,11 @@ DEFAULT_JITTER = 0.3  # 随机抖动上限（秒）
 REPLY_PAGE_SIZE = 20   # 翻页每页大小
 REPLY_PAGE_MAX = 25    # 翻页页数安全上限（25 页 × 20 条 = 最多 500 条）
 
+# wbi 登录态评论排序：2=按时间倒序（舆情采样要近期评论；mode=3 热度排序
+# 拉到的全是旧热评——实测 79 条中 7 天内 0 条，会被 since_days 时间窗
+# 全部过滤；mode=2 实测 63 条中 17 条在 7 天内）
+_WBI_REPLY_MODE = 2
+
 _TAG_RE = re.compile(r"<[^>]+>")
 _AID_RE = re.compile(r"^\d+$")
 
@@ -310,6 +315,8 @@ def _fetch_comments_wbi(session, aid: str, limit: int, gate: "_RateGate",
                         mixin_key: str) -> List[Dict]:
     """登录态 wbi 签名评论路径（x/v2/reply/wbi/main，cursor 翻页）。
 
+    排序用 mode=2（按时间倒序，模块常量 _WBI_REPLY_MODE）：舆情采样要
+    近期评论，mode=3 热度排序拉到的旧热评会被 since_days 时间窗过滤掉。
     单页失败保留已抓部分即止损；绝不抛。返回评论列表（可能为空）。
     """
     comments: List[Dict] = []
@@ -318,7 +325,7 @@ def _fetch_comments_wbi(session, aid: str, limit: int, gate: "_RateGate",
         if len(comments) >= limit:
             break
         params = _sign_wbi_params(
-            {"type": 1, "oid": aid, "mode": 3,
+            {"type": 1, "oid": aid, "mode": _WBI_REPLY_MODE,
              "ps": REPLY_PAGE_SIZE, "next": next_cursor},
             mixin_key)
         payload = _get_json(session, REPLY_WBI_URL, gate=gate,
@@ -591,10 +598,11 @@ def fetch_comments(post_id, limit: int = 20, session=None,
     失败记 warning 返回 []，绝不抛。
 
     登录态增强：配置 BILI_SESSDATA 环境变量时，会话挂载 SESSDATA cookie
-    并走 wbi 签名路径（x/v2/reply/wbi/main，mode=3，cursor 翻页）拉全量
-    评论——匿名状态每视频仅返回约 3 条热评。wbi 签名材料（nav wbi_img）
-    获取失败时降级为不带签名的带 cookie 请求（plain 路径）。无 SESSDATA
-    时行为与既有完全一致。
+    并走 wbi 签名路径（x/v2/reply/wbi/main，mode=2 按时间倒序，cursor
+    翻页）拉近期全量评论——匿名状态每视频仅返回约 3 条热评；热度排序
+    （mode=3）的旧热评会被 since_days 时间窗过滤，故用时间倒序。
+    wbi 签名材料（nav wbi_img）获取失败时降级为不带签名的带 cookie
+    请求（plain 路径）。无 SESSDATA 时行为与既有完全一致。
 
     翻页：plain 版响应带 data.page 分页元信息，确认支持 pn 翻页。
     limit<=20 维持单页直取（ps=limit，与既有行为一致）；limit>20 进入

@@ -1182,10 +1182,14 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
 def collect_keyword_samples(keyword, video_limit: int = 5,
                             comments_per_video: int = 30, sleep=None,
                             since_days: int = 7) -> dict:
-    """B 站关键词评论样本扩容采集：搜索前 N 个视频 → 逐视频拉评论 → 合并。绝不抛。
+    """B 站关键词评论样本扩容采集：搜索 → 精选有评论的新视频 → 逐视频拉评论
+    → 合并。绝不抛。
 
-    流程：惰性加载 B 站模块（search 能力缺失即降级）→ search(keyword,
-    limit=video_limit, order="pubdate")（按发布时间倒序采样）→ 逐视频
+    流程：惰性加载 B 站模块（search 能力缺失即降级）→ 双路搜索
+    （order="pubdate" 按发布时间倒序保新鲜 + 缺省综合排序保有评论沉淀的
+    热门视频，实测：纯 pubdate 的新视频大多 0 评论，纯综合的老视频文本
+    会被时间窗过滤但近期评论正是舆情样本主体）→ 合并去重后按
+    「有评论优先、发布时间新优先」精选 video_limit 个 → 逐视频
     fetch_comments(post_id, limit=comments_per_video) → 合并为评论样本列表
     → since_days 时间窗过滤（默认近 7 天；时间缺失/解析失败的条目保留并
     进 notes 说明，宁可多留不可误杀）。
@@ -1226,8 +1230,33 @@ def collect_keyword_samples(keyword, video_limit: int = 5,
         if search is None:
             notes.append("B 站模块未就绪或缺少 search 能力，本轮无评论样本")
             return _out()
-        videos = _safe_fetch(search, kw, limit=video_limit,
-                             sleep=sleep, order="pubdate")[:video_limit]
+        # 双路搜索：pubdate 保新鲜 + 综合排序保有评论沉淀的热门视频，
+        # 合并去重后「有评论优先、发布时间新优先」精选（实测：纯 pubdate
+        # 的新视频大多 0 评论，纯综合的老视频近期评论恰是舆情样本主体）。
+        videos_new = _safe_fetch(search, kw, limit=video_limit,
+                                 sleep=sleep, order="pubdate") or []
+        videos_hot = _safe_fetch(search, kw, limit=video_limit,
+                                 sleep=sleep) or []
+        seen_ids = set()
+        merged: List[dict] = []
+        for v in list(videos_new) + list(videos_hot):
+            if not isinstance(v, dict):
+                continue
+            pid = str(v.get("post_id") or "").strip()
+            if pid:
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+            # 无 post_id 的视频放行给下游循环（那里会记 notes 并跳过）
+            merged.append(v)
+
+        def _pick_key(v: dict):
+            m = v.get("metrics") if isinstance(v.get("metrics"), dict) else {}
+            has_comments = 1 if (m.get("comments") or 0) > 0 else 0
+            return (has_comments, str(v.get("published_at") or ""))
+
+        merged.sort(key=_pick_key, reverse=True)
+        videos = merged[:video_limit]
         if not videos:
             notes.append(f"关键词「{kw}」搜索无视频结果或端点降级，"
                          "本轮无评论样本")

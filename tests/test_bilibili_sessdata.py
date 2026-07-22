@@ -116,12 +116,13 @@ def test_sessdata_signed_path(monkeypatch):
     assert [c["content"] for c in out] == ["全量评论甲", "全量评论乙"]
     # cookie 已挂载
     assert sess.cookies.get("SESSDATA") == "fake-sessdata-123"
-    # 签名请求：w_rid（32 位 hex）+ wts
+    # 签名请求：w_rid（32 位 hex）+ wts + mode=2（按时间倒序）
     wbi_calls = sess.calls_for("reply/wbi/main")
     assert len(wbi_calls) == 1
     params = wbi_calls[0]["params"]
     assert "w_rid" in params and len(params["w_rid"]) == 32
     assert "wts" in params
+    assert params["mode"] == 2
     assert params["type"] == 1 and params["oid"] == "123"
     # plain 端点未被调用
     assert sess.calls_for("x/v2/reply?") == []
@@ -149,6 +150,12 @@ def test_sessdata_wbi_pagination(monkeypatch):
     wbi_calls = sess.calls_for("reply/wbi/main")
     assert len(wbi_calls) == 2
     assert wbi_calls[1]["params"]["next"] == 1  # cursor 前进
+    assert all(c["params"]["mode"] == 2 for c in wbi_calls)  # 每页均时间倒序
+
+
+def test_wbi_reply_mode_constant_and_reason():
+    """_WBI_REPLY_MODE=2（按时间倒序）：热度排序的旧热评会被时间窗过滤。"""
+    assert sb._WBI_REPLY_MODE == 2
 
 
 def test_sessdata_wbi_page_failure_keeps_partial(monkeypatch):
