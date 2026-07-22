@@ -549,6 +549,72 @@ TOOL_REGISTRY: list = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_social_hot",
+            "description": "获取社媒平台热榜舆情：微博/知乎/抖音/B站热榜聚合（逐平台直连、聚合器兜底、"
+                           "去重）+ 情感分布（利好/利空/中性）+ 股票关联提取（代码/名称命中统计）。"
+                           "了解社媒热议焦点、散户舆情方向、热榜里被讨论的个股时使用。"
+                           "社媒情绪噪声大，仅作辅助参考，不构成买卖依据。"
+                           "小红书 v1 暂未覆盖，指定 platform=xiaohongshu 会返回缺席原因说明。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "default": "all",
+                        "description": "平台选择：all=全部支持平台（微博/知乎/抖音/B站，默认），"
+                                       "或单个平台 weibo / zhihu / douyin / bilibili。"
+                                       "xiaohongshu（小红书）暂未覆盖，传入会返回中文缺席说明。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "default": 10,
+                        "description": "每个平台返回热榜条数，默认 10，最多 30。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_social_media",
+            "description": "按关键词搜索社媒内容：v1 仅 B 站具备搜索能力（视频+专栏），"
+                           "可选附带前 3 条结果的热门评论；返回结果附带情感分布"
+                           "（利好/利空/中性）与股票关联提取（代码/名称命中统计）。"
+                           "追踪某个主题、事件或个股在社媒的讨论时使用。"
+                           "微博/知乎/抖音仅有热榜无搜索能力，会在 notes 中说明。"
+                           "社媒情绪噪声大，仅作辅助参考，不构成买卖依据。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "搜索关键词（必填），如 茅台、降息、人形机器人。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "default": 10,
+                        "description": "返回搜索结果条数，默认 10，最多 30。",
+                    },
+                    "with_comments": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "是否附带评论：true 时对前 3 条有 post_id 的 B 站结果"
+                                       "各取最多 10 条热门评论并入返回。默认 false。",
+                    },
+                },
+                "required": ["keyword"],
+            },
+        },
+    },
 ]
 
 
@@ -1047,9 +1113,199 @@ _PERSONA_IMPL = {
     "analyze_with_persona": _handle_analyze_with_persona,
 }
 
+
+# ── 社媒舆情工具分发（social_media 门面，微舆 BettaFish 式爬取层）──
+
+def _get_social_media_module():
+    """惰性解析 agent/social_media.py（社媒舆情门面），失败返回 None。"""
+    return _lazy_import_module("social_media")
+
+
+def _get_social_bilibili_module():
+    """惰性解析 agent/social_bilibili.py（B 站评论能力），失败返回 None。"""
+    return _lazy_import_module("social_bilibili")
+
+
+_SOCIAL_COMMENT_TOP_N = 3   # with_comments=true 时只对前 3 条 B 站结果取评论
+_SOCIAL_COMMENT_LIMIT = 10  # 每条 B 站帖子取评论条数（常量）
+_SOCIAL_CONTENT_MAX = 200   # 帖子/评论正文截断长度（防上下文爆炸）
+
+
+def _slim_social_post(post) -> dict:
+    """帖子瘦身：只保留 platform/title/metrics/url/published_at/source，
+    content 截 200 字；非 dict 输入返回 None（调用方过滤）。绝不抛。"""
+    if not isinstance(post, dict):
+        return None
+    metrics = post.get("metrics")
+    return {
+        "platform": str(post.get("platform") or ""),
+        "title": str(post.get("title") or ""),
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "url": str(post.get("url") or ""),
+        "published_at": str(post.get("published_at") or ""),
+        "source": str(post.get("source") or ""),
+        "content": str(post.get("content") or "")[:_SOCIAL_CONTENT_MAX],
+    }
+
+
+def _slim_social_comment(comment) -> dict:
+    """评论瘦身：保留 platform/post_id/author/likes/published_at，content 截 200 字。"""
+    if not isinstance(comment, dict):
+        return None
+    return {
+        "platform": str(comment.get("platform") or ""),
+        "post_id": str(comment.get("post_id") or ""),
+        "author": str(comment.get("author") or ""),
+        "likes": comment.get("likes") if isinstance(comment.get("likes"), int) else 0,
+        "published_at": str(comment.get("published_at") or ""),
+        "content": str(comment.get("content") or "")[:_SOCIAL_CONTENT_MAX],
+    }
+
+
+def _social_enrich(social, items):
+    """对帖子（可含评论）做情感聚合 + 股票关联提取；任一步失败降级为空骨架，
+    并把说明追加进 notes。返回 (buzz, stock_mentions, notes)。绝不抛。"""
+    notes: list = []
+    buzz = {"total": 0, "sentiment": {"利好": 0, "利空": 0, "中性": 0},
+            "by_platform": {}, "avg_score": 0.0}
+    mentions: dict = {}
+    try:
+        buzz = social.aggregate_buzz(items)
+        if not isinstance(buzz, dict):
+            raise TypeError("aggregate_buzz 返回非 dict")
+    except Exception as e:  # noqa: BLE001 - 富化步骤绝不抛出
+        logger.warning("社媒情感聚合失败（降级空骨架）: %s", e)
+        notes.append("情感聚合失败，buzz 为空骨架")
+    try:
+        mentions = social.extract_stock_mentions(items)
+        if not isinstance(mentions, dict):
+            raise TypeError("extract_stock_mentions 返回非 dict")
+    except Exception as e:  # noqa: BLE001 - 富化步骤绝不抛出
+        logger.warning("社媒股票关联提取失败（降级空结果）: %s", e)
+        notes.append("股票关联提取失败，stock_mentions 为空")
+    return buzz, mentions, notes
+
+
+def _social_post_cap(result: dict, limit: int) -> int:
+    """posts 条数上限 = limit × 平台数（platforms 计数缺失时按 1 个平台兜底）。"""
+    platforms = result.get("platforms") if isinstance(result, dict) else None
+    n = len(platforms) if isinstance(platforms, dict) and platforms else 1
+    return limit * max(1, n)
+
+
+def _handle_get_social_hot(args: dict) -> dict:
+    """get_social_hot 处理器：热榜门面 + buzz 情感聚合 + 股票关联提取。"""
+    social = _get_social_media_module()
+    if social is None:
+        return {"ok": False, "note": "社媒舆情模块不可用（agent/social_media.py 未就绪）"}
+    limit = _clamp_int(args.get("limit"), 10, 1, 30)
+    platform = _clean_str(args.get("platform")).lower() or "all"
+    unsupported = getattr(social, "UNSUPPORTED_PLATFORMS", None) or {}
+    if platform in unsupported:
+        return {"ok": False, "platform": platform, "note": unsupported[platform]}
+    platforms_arg = None if platform == "all" else [platform]
+    hot = social.get_hot_all(platforms=platforms_arg, limit=limit)
+    if not isinstance(hot, dict):
+        return {"ok": False, "note": "社媒热榜门面返回结构异常，本轮无结果"}
+    posts = [p for p in (hot.get("posts") or []) if isinstance(p, dict)]
+    capped = posts[:_social_post_cap(hot, limit)]
+    buzz, mentions, enrich_notes = _social_enrich(social, capped)
+    slim_posts = [s for s in (_slim_social_post(p) for p in capped) if s]
+    notes = list(hot.get("notes") or []) + enrich_notes
+    if not slim_posts:
+        notes.append("本轮未抓到社媒热榜内容")
+    return {
+        "ok": True,
+        "date": hot.get("date"),
+        "platforms": hot.get("platforms") or {},
+        "sources": hot.get("sources") or {},
+        "posts": slim_posts,
+        "buzz": buzz,
+        "stock_mentions": mentions,
+        "notes": notes,
+    }
+
+
+def _fetch_bili_comments(posts) -> tuple:
+    """对前 3 条有 post_id 的 B 站帖子各取最多 _SOCIAL_COMMENT_LIMIT 条评论。
+
+    返回 (comments, notes)；评论模块缺失/单帖失败均降级记 note，绝不抛。
+    """
+    notes: list = []
+    bili = _get_social_bilibili_module()
+    fetch_comments = getattr(bili, "fetch_comments", None) if bili is not None else None
+    if not callable(fetch_comments):
+        notes.append("B 站评论模块不可用，未取评论")
+        return [], notes
+    targets = [p for p in posts
+               if str(p.get("platform") or "").strip().lower() == "bilibili"
+               and str(p.get("post_id") or "").strip()][:_SOCIAL_COMMENT_TOP_N]
+    comments: list = []
+    for post in targets:
+        try:
+            batch = fetch_comments(post["post_id"], limit=_SOCIAL_COMMENT_LIMIT)
+        except Exception as e:  # noqa: BLE001 - 单帖评论失败降级
+            logger.warning("B 站评论抓取失败（跳过该帖）: %s", e)
+            notes.append(f"B 站帖子 {post['post_id']} 评论抓取失败，已跳过")
+            continue
+        if isinstance(batch, list):
+            comments.extend(c for c in batch if isinstance(c, dict))
+    if targets and not comments:
+        notes.append("B 站评论均为空或抓取失败")
+    return comments, notes
+
+
+def _handle_search_social_media(args: dict) -> dict:
+    """search_social_media 处理器：关键词搜索 + 可选评论 + buzz + 股票关联。"""
+    social = _get_social_media_module()
+    if social is None:
+        return {"ok": False, "note": "社媒舆情模块不可用（agent/social_media.py 未就绪）"}
+    keyword = _clean_str(args.get("keyword"))
+    if not keyword:
+        raise _ParamError("keyword 不能为空：请输入要搜索的社媒关键词")
+    limit = _clamp_int(args.get("limit"), 10, 1, 30)
+    result = social.search_all(keyword, limit=limit)
+    if not isinstance(result, dict):
+        return {"ok": False, "note": "社媒搜索门面返回结构异常，本轮无结果",
+                "keyword": keyword}
+    posts = [p for p in (result.get("posts") or []) if isinstance(p, dict)]
+    capped = posts[:_social_post_cap(result, limit)]
+    notes = list(result.get("notes") or [])
+    comments: list = []
+    if args.get("with_comments") is True:
+        comments, comment_notes = _fetch_bili_comments(capped)
+        notes.extend(comment_notes)
+    scored_items = capped + comments  # buzz 与股票关联对帖子+评论合并计算
+    buzz, mentions, enrich_notes = _social_enrich(social, scored_items)
+    notes.extend(enrich_notes)
+    slim_posts = [s for s in (_slim_social_post(p) for p in capped) if s]
+    if not slim_posts:
+        notes.append("本次搜索无社媒结果")
+    out = {
+        "ok": True,
+        "keyword": result.get("keyword") or keyword,
+        "date": result.get("date"),
+        "platforms": result.get("platforms") or {},
+        "sources": result.get("sources") or {},
+        "posts": slim_posts,
+        "buzz": buzz,
+        "stock_mentions": mentions,
+        "notes": notes,
+    }
+    if args.get("with_comments") is True:
+        out["comments"] = [s for s in (_slim_social_comment(c) for c in comments) if s]
+    return out
+
+
+# 社媒舆情工具名 → 处理器（agent/social_media.py 门面，v2-social 爬取层）
+_SOCIAL_IMPL = {
+    "get_social_hot": _handle_get_social_hot,
+    "search_social_media": _handle_search_social_media,
+}
+
 # 开源灵感模块工具汇总表：execute_tool 查表顺序追加在最后
 # （_REPORT_VEC_IMPL → _REPORT_IMPL → _IMPL → _ANALYSIS_IMPL），不改旧条目
-_ANALYSIS_IMPL = {**_SENTIMENT_IMPL, **_TECH_IMPL, **_PERSONA_IMPL}
+_ANALYSIS_IMPL = {**_SENTIMENT_IMPL, **_TECH_IMPL, **_PERSONA_IMPL, **_SOCIAL_IMPL}
 
 
 def _clamp_int(value, default: int, lo: int, hi: int) -> int:
@@ -1202,6 +1458,8 @@ _SHORT_DESC = {
     "get_stock_sentiment": "个股社交情绪（人气排名趋势+新闻情感分布）",
     "get_technical_analysis": "个股技术分析仪表盘（指标+评分带+护栏）",
     "analyze_with_persona": "投资人格方法论框架（价值/成长/趋势/逆向）",
+    "get_social_hot": "社媒热榜舆情（微博/知乎/抖音/B站+情感分布+股票关联）",
+    "search_social_media": "社媒关键词搜索（B站+可选评论+情感分布+股票关联）",
 }
 
 

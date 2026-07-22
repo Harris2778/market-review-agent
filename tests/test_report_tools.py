@@ -358,18 +358,18 @@ class TestReportCitationPrompt:
 
 # ════════════════════════════════════════════════
 # 9. get_tool_catalog() 行数（v1 落地时 23；v2 全文工具接入后 24；
-#    第十二波开源灵感模块工具接入后 28，
-#    28 行专项断言见 tests/test_opensource_tools.py）
+#    第十二波开源灵感模块工具接入后 28；社媒舆情接线后 30，
+#    30 行专项断言见 tests/test_social_tools.py）
 # ════════════════════════════════════════════════
 
 class TestToolCatalog:
-    def test_catalog_28_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 28
+    def test_catalog_30_lines(self):
+        assert len(tools_mod.TOOL_REGISTRY) == 30
         catalog = tools_mod.get_tool_catalog()
-        assert "共 28 个" in catalog
+        assert "共 30 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 28, (
-            f"目录应有 28 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 30, (
+            f"目录应有 30 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tools_in_short_desc_and_catalog(self):

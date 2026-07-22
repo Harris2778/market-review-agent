@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块落地，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化 + 开源借鉴移植四模块 + 社媒舆情爬取v1落地，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -47,7 +47,14 @@ agent/industry_kb.py       行业知识库：31申万行业档案(chain/drivers/
                            + industry_kb_data.json，format_kb_block 注入块(≤400字)
 agent/history_lens.py      以史为鉴：get_history_note(sector,mode) 历史判断回顾注入块
                            + get_accuracy_summary 命中率汇总（读问责存档JSONL）
-agent/tools.py             28 个 OpenAI function calling 工具（完整 JSON Schema）
+agent/tools.py             30 个 OpenAI function calling 工具（完整 JSON Schema）
+agent/social_weibo.py      微博热搜直连（桌面端 ajax/side/hotSearch）
+agent/social_douyin.py     抖音热榜直连（无签名公开端点，脆弱红利内置降级）
+agent/social_bilibili.py   B站三件套：热搜/搜索(video·article)/评论(412 buvid3热身重试)
+agent/social_zhihu.py      知乎热榜直连（topstory/hot-list）
+agent/social_aggregator.py newsnow 聚合兜底（四源，仅直连失败降级用）
+agent/social_store.py      社媒帖子 SQLite 持久化（social.db，hit_count 幂等累计）
+agent/social_media.py      社媒门面：热榜聚合/搜索分发/股票关联提取/情感聚合
 agent/sentiment.py         社交情绪层（BettaFish灵感）：东财人气榜+人气历史+涨跌停池
                            + 词典情感打分 + 情绪温度0-100 + 进程内当日缓存
 agent/technical.py         确定性技术分析（daily_stock_analysis灵感）：MA七态/MACD/RSI/
@@ -66,7 +73,7 @@ agent/system_prompts.py    提示词：v6.0 合规 + 五维板块框架 + Agent/
 scripts/score_accountability.py  打分CLI：--days 5（唯一允许触网路径，lazy Tushare）
 DEPLOY.md                  Railway 挂卷部署手册（Volume /data + DATA_DIR 环境变量）
 eval/                      离线评估集：12 cases + rubric.py（复用validators）+ run_eval.py
-tests/                     1377 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
+tests/                     1636 个测试，全 mock 零网络（ARCHIVE_DIR/CHART_DIR 隔离到 /tmp）
 ```
 
 ## 核心能力（按开发顺序）
@@ -344,8 +351,47 @@ BettaFish=GPL、Fincept=AGPL+商业双许可，只移植思路不复制）。工
   技术分析茅台 as_of 2026-07-22 收 1305.0 弱多头 MACD 多头 score 60.25→偏多，
   confidence_cap 1.0 无护栏触发
 
+**社媒舆情爬取 v1（2026-07-22 晚，微舆 BettaFish 式能力落地）**
+
+能力：微博/知乎/抖音/B站 四平台热榜直连 + B站搜索/评论 + 情感聚合 + 股票关联提取。
+BettaFish 的 MediaCrawler（Playwright+登录态）未采用——v1 全部走**无登录公开端点**
+（端点 2026-07-22 实测定案，规格见 workspace/research/social_endpoints_recon.md）。
+
+- agent/social_weibo.py：桌面热搜 weibo.com/ajax/side/hotSearch（data.realtime[]，
+  url 拼 s.weibo.com 搜索页；⚠️ 移动端全线 432 Sina Visitor 判死未实现）
+- agent/social_douyin.py：热榜 aweme/v1/web/hot/search/list/（无签名直连红利，
+  脆弱——结构漂移即降级空列表+warning；搜索/评论需 X-Bogus 判死）
+- agent/social_bilibili.py（主力源，三件套全通）：热搜 search/square（+可选 popular
+  六维指标）+ 搜索 search/type（video/article，<em> 标签清洗）+ 评论 x/v2/reply
+  plain 版（wbi 变体 -403 判死）；⚠️ 412 风控——_warmup 拿 buvid3 后自动重试恰好一次
+- agent/social_zhihu.py：热榜 api.zhihu.com/topstory/hot-list（billboard 403 /
+  search_v3 400 判死，知乎搜索缺席）
+- agent/social_aggregator.py：newsnow 聚合兜底（weibo/zhihu/douyin/bilibili 四源，
+  有缓存无 SLA，仅直连失败降级用；小红书源实测 500 不存在）
+- agent/social_store.py：SQLite 持久化（${DATA_DIR:-data}/social.db，SOCIAL_DB_PATH
+  可覆盖；social_posts 表 platform+post_id 主键幂等 upsert，hit_count 累计）
+- agent/social_media.py 门面：惰性 importlib+getattr 能力探测（不 import 平台函数），
+  get_hot_all（直连→聚合器兜底→去重→落盘）/ search_all（仅有搜索能力平台分发，
+  缺席进 notes）/ extract_stock_mentions（6位代码正则+价格语境排除+自选股名称匹配）
+  / aggregate_buzz（复用 sentiment 词典打分）
+- tools.py 28→30：get_social_hot（全平台热榜+buzz+股票关联，posts 瘦身封顶）/
+  search_social_media（B站搜索，with_comments=true 拉前 3 条视频评论合并打分）；
+  prompts 追加「## 社媒舆情引用规范」（标注平台+日期/情绪仅辅助/能力边界诚实）
+- 小红书 v1 整体缺席（无可用无登录端点，x-s 签名超出合规边界），工具层中文 note 说明
+- 测试：+232 用例（weibo 25/douyin 27/bilibili 39/zhihu 20/aggregator 20/store 20/
+  门面 47/集成 34），全量 1636 passed 全绿（工具总数断言按惯例 28→30 共 3 处）
+- 真实 E2E（2026-07-22）：四平台直连各 5 条热榜（微博 top「别再给AI乱传文件了」
+  热度 254 万）；搜「A股」B站 5 帖+9 评论（播放/评论/点赞真实指标）；情感分布与
+  降级路径（小红书/空关键词/搜索缺席平台 notes）全部按设计工作
+
 ## 已知问题
 
+- 社媒端点全部为无登录公开接口，平台风控/结构变动即降级：抖音「无签名直连」是脆弱
+  红利随时可能加签；B站 412 靠 buvid3 热身自愈（双 412 放弃）；微博移动端/知乎搜索/
+  小红书已判死，v2 需 Cookie 池或 headless 方案并单独评估合规
+- newsnow 聚合器为第三方公共服务，有缓存延迟、无 SLA，仅作兜底
+- 社媒情感为词典弱信号；extract_stock_mentions 代码正则不校验真实性（价格语境已排除）
+- social.db 随抓取增长无清理策略；query_posts 的 LIKE 未转义 %/_（调用方受信）
 - 人气榜接口不含股票名称：名称经 push2 ulist 批量回填，本机系统代理异常时名称留空串
   优雅降级（排名/代码不受影响）；生产无代理环境实测正常
 - 个股人气历史必须传 srcSecurityCode+市场前缀；BJ（北交所）前缀规则按 4/8/920 推导，
@@ -394,6 +440,7 @@ BettaFish=GPL、Fincept=AGPL+商业双许可，只移植思路不复制）。工
   国内 huggingface.co 不可达时用 ModelScope 下载后设本地路径）
 开源移植线（均可选）：`SCRATCHPAD_DIR`（Agent 审计 JSONL 目录，缺省
   ${DATA_DIR:-data}/scratchpad）、`PERSONA_DEFS_PATH`（人格定义文件覆盖路径，
-  缺省 agent/persona_defs.json）；情绪端点免登录零新增 Key
+  缺省 agent/persona_defs.json）、`SOCIAL_DB_PATH`（社媒帖子库，缺省
+  ${DATA_DIR:-data}/social.db）；情绪/社媒端点免登录零新增 Key
 推送：`PUSH_WEBHOOK_URL`（未配置只生成不发送）、`PUSH_TIME`（默认 15:40 上海，工作日）
 配额：`RATE_LIMIT_PER_MIN`（默认 30）、`QUOTA_DAILY`（默认 500，上海时区自然日）
