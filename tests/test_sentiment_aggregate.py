@@ -225,9 +225,10 @@ class TestRepresentatives:
         items = [_item("乐观", likes=5), _item("悲观", likes=3),
                  _item("中性", likes=1)]
         r = sa.pick_representatives(items)
-        assert set(r.keys()) == {"乐观", "悲观", "中性"}
+        assert set(r.keys()) == {"乐观", "悲观", "中性", "无关"}
         assert len(r["乐观"]) == 1 and len(r["悲观"]) == 1
         assert len(r["中性"]) == 1
+        assert r["无关"] == []
 
     def test_lexicon_labels_bucketed(self):
         """利好/利空归入乐观/悲观桶。"""
@@ -260,7 +261,7 @@ class TestRepresentatives:
 
     def test_empty_items_empty_buckets(self):
         r = sa.pick_representatives([])
-        assert r == {"乐观": [], "悲观": [], "中性": []}
+        assert r == {"乐观": [], "悲观": [], "中性": [], "无关": []}
 
     def test_unknown_label_goes_neutral(self):
         r = sa.pick_representatives([_item("看多", likes=4)])
@@ -274,6 +275,85 @@ class TestRepresentatives:
     def test_never_raises_on_junk(self):
         r = sa.pick_representatives([None, "x", {"sentiment": "乐观"}])
         assert len(r["乐观"]) == 1
+
+    def test_irrelevant_bucket_populated(self):
+        """「无关」条目进入无关桶，不挤占中性桶。"""
+        r = sa.pick_representatives([_item("无关", likes=7),
+                                     _item("中性", likes=2)])
+        assert len(r["无关"]) == 1 and r["无关"][0]["likes"] == 7
+        assert len(r["中性"]) == 1
+
+
+# ═══════════════════════════════════════════
+# 四桶分布与 bull_bear 多空比
+# ═══════════════════════════════════════════
+
+
+class TestFourBuckets:
+    def test_dist_has_four_buckets(self):
+        """dist/weighted_dist 均为四桶（乐观/悲观/中性/无关）。"""
+        r = sa.aggregate_distribution([_item("乐观")])
+        assert set(r["dist"]) == {"乐观", "悲观", "中性", "无关"}
+        assert set(r["weighted_dist"]) == {"乐观", "悲观", "中性", "无关"}
+
+    def test_irrelevant_counted_own_bucket(self):
+        items = ([_item("乐观") for _ in range(2)]
+                 + [_item("悲观")]
+                 + [_item("中性")]
+                 + [_item("无关") for _ in range(4)])
+        r = sa.aggregate_distribution(items)
+        assert r["n"] == 8
+        assert r["dist"]["无关"]["count"] == 4
+        assert r["dist"]["无关"]["pct"] == 50.0
+        assert r["dist"]["乐观"]["pct"] == 25.0
+        assert r["unknown_count"] == 0
+
+    def test_irrelevant_weight_counted_in_weighted_dist(self):
+        """无关桶权重照常统计（likes+1 基础票）。"""
+        items = [_item("乐观", likes=0), _item("无关", likes=9)]
+        r = sa.aggregate_distribution(items)
+        # 权重 1 : 10 → 乐观 9.1 / 无关 90.9
+        assert r["weighted_dist"]["无关"] == pytest.approx(10 / 11 * 100, abs=0.1)
+        assert r["weighted_dist"]["乐观"] == pytest.approx(1 / 11 * 100, abs=0.1)
+
+    def test_bucket_order(self):
+        assert sa.BUCKETS == ("乐观", "悲观", "中性", "无关")
+
+
+class TestBullBear:
+    def test_basic_ratio_on_bull_bear_subset(self):
+        """多空比仅在乐观+悲观子集上计算，两者之和为 100。"""
+        items = ([_item("乐观") for _ in range(3)]
+                 + [_item("悲观")]
+                 + [_item("中性") for _ in range(2)]
+                 + [_item("无关") for _ in range(4)])
+        r = sa.aggregate_distribution(items)
+        bb = r["bull_bear"]
+        assert bb == {"乐观_pct": 75.0, "悲观_pct": 25.0}
+        assert bb["乐观_pct"] + bb["悲观_pct"] == 100.0
+
+    def test_neutral_and_irrelevant_excluded(self):
+        """中性/无关条目不参与多空比分母。"""
+        items = [_item("乐观"), _item("中性"), _item("无关")]
+        r = sa.aggregate_distribution(items)
+        assert r["bull_bear"] == {"乐观_pct": 100.0, "悲观_pct": 0.0}
+
+    def test_all_neutral_edge_none_with_note(self):
+        """全中性边界：乐观+悲观样本数为 0 → 双 None + note。"""
+        r = sa.aggregate_distribution([_item("中性"), _item("无关")])
+        bb = r["bull_bear"]
+        assert bb["乐观_pct"] is None and bb["悲观_pct"] is None
+        assert bb["note"] == "样本中无明确多空观点"
+
+    def test_all_unknown_labels_also_none(self):
+        """未知标签归中性后同样无多空观点。"""
+        r = sa.aggregate_distribution([_item("???"), _item("看多")])
+        assert r["bull_bear"]["乐观_pct"] is None
+        assert r["unknown_count"] == 2
+
+    def test_only_bear_side(self):
+        r = sa.aggregate_distribution([_item("悲观"), _item("利空")])
+        assert r["bull_bear"] == {"乐观_pct": 0.0, "悲观_pct": 100.0}
 
 
 # ═══════════════════════════════════════════

@@ -338,7 +338,7 @@ def test_model_param_passed_and_default():
 
 
 def test_prompt_contains_definitions_and_numbering():
-    """prompt 含三标签定义与编号列表；system/user 双消息。"""
+    """prompt 含四标签定义与编号列表；system/user 双消息。"""
     client = static_client(llm_json([
         {"i": 0, "label": "乐观", "score": 0.1},
         {"i": 1, "label": "中性", "score": 0.0},
@@ -347,8 +347,11 @@ def test_prompt_contains_definitions_and_numbering():
     messages = client.chat.completions.calls[0]["messages"]
     assert messages[0]["role"] == "system"
     user = messages[1]["content"]
-    assert "乐观" in user and "悲观" in user and "中性" in user
-    assert "看多" in user and "嘲讽看空" in user and "无法判断" in user
+    assert "乐观" in user and "悲观" in user and "中性" in user and "无关" in user
+    assert "看多" in user and "嘲讽看空" in user
+    assert "无多空倾向的纯信息" in user
+    assert "闲聊、广告、玩梗、纯表情" in user
+    assert "乐观|悲观|中性|无关" in user
     assert "[0] 文本零零" in user and "[1] 文本壹壹" in user
     assert "JSON" in user
 
@@ -541,4 +544,51 @@ def test_make_llm_scorer_invalid_label_sanitized():
     scorer = sl.make_llm_scorer(client=static_client("garbage no array"))
     out = scorer({"title": "随便"})
     assert out["sentiment"] in ("乐观", "中性", "悲观")
+    assert isinstance(out["sentiment_score"], float)
+
+
+# ═══════════════════════════════════════════
+# 8. 四标签体系（乐观/悲观/中性/无关）
+# ═══════════════════════════════════════════
+
+def test_valid_labels_is_four_bucket_set():
+    """VALID_LABELS 为四标签，含「无关」。"""
+    assert sl.VALID_LABELS == ("乐观", "悲观", "中性", "无关")
+
+
+def test_irrelevant_label_accepted():
+    """「无关」是合法标签，不再被当作非法条目补中性。"""
+    client = static_client(llm_json([
+        {"i": 0, "label": "无关", "score": 0.0},
+        {"i": 1, "label": "乐观", "score": 0.5},
+    ]))
+    out = sl.score_texts_batch(["今天天气真好哈哈哈", "业绩超预期"], client=client)
+    assert out[0]["label"] == "无关" and out[0]["method"] == "llm"
+    assert out[1]["label"] == "乐观"
+
+
+def test_irrelevant_score_forced_zero():
+    """模型给「无关」条目非零 score 时一律归 0（无关不计入多空强度）。"""
+    client = static_client(llm_json([
+        {"i": 0, "label": "无关", "score": 0.9},
+        {"i": 1, "label": "无关", "score": -0.7},
+    ]))
+    out = sl.score_texts_batch(["广告一则", "纯表情"], client=client)
+    assert out[0]["label"] == "无关" and out[0]["score"] == 0.0
+    assert out[1]["label"] == "无关" and out[1]["score"] == 0.0
+
+
+def test_make_llm_scorer_irrelevant_passthrough():
+    """scorer 注入契约兼容「无关」标签且 score 为 0。"""
+    scorer = sl.make_llm_scorer(
+        client=static_client(llm_json([{"i": 0, "label": "无关", "score": 0.0}])))
+    out = scorer({"title": "闲聊灌水"})
+    assert out == {"sentiment": "无关", "sentiment_score": 0.0, "hits": []}
+
+
+def test_make_llm_scorer_invalid_label_sanitized_four_labels():
+    """scorer 兜底断言覆盖四标签全集。"""
+    scorer = sl.make_llm_scorer(client=static_client("garbage no array"))
+    out = scorer({"title": "随便"})
+    assert out["sentiment"] in ("乐观", "悲观", "中性", "无关")
     assert isinstance(out["sentiment_score"], float)

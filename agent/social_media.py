@@ -26,9 +26,10 @@
 
 import importlib
 import logging
+import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 from . import social_store
@@ -555,7 +556,7 @@ def get_guba_buzz(code, limit: int = 20, enrich: int = 3, sleep=None) -> dict:
 #
 # 并行契约（兄弟 Worker 交付，一律惰性 importlib+getattr 探测，缺席降级进 notes）：
 #   - sentiment_llm.score_texts_batch(texts, client=None, ...) ->
-#       [{index, label(乐观/中性/悲观), score, method:'llm'|'fallback'}]（契约绝不抛）
+#       [{index, label(乐观/悲观/中性/无关), score, method:'llm'|'fallback'}]（契约绝不抛）
 #   - sentiment_aggregate.aggregate_distribution(items) ->
 #       {n, dist, weighted_dist, confidence, method}
 #     / pick_representatives(items, per_bucket=2)
@@ -572,10 +573,31 @@ def get_guba_buzz(code, limit: int = 20, enrich: int = 3, sleep=None) -> dict:
 
 SENTIMENT_LLM_MODULE = "sentiment_llm"
 SENTIMENT_AGG_MODULE = "sentiment_aggregate"
-_DIST_BUCKETS = ("乐观", "中性", "悲观")
+_DIST_BUCKETS = ("乐观", "悲观", "中性", "无关")
 _DIST_TEXT_MAX = 100        # 打分输入文本（title+content）截断长度
 _DIST_REPS_PER_BUCKET = 2   # pick_representatives 每桶代表样本数
 _DIST_TREND_DAYS = 7        # 情绪趋势回看天数
+
+# 采样深度档（全局契约）：standard 维持既有量级；deep 扩容
+_DEPTH_STANDARD = "standard"
+_DEPTH_DEEP = "deep"
+_DEEP_POST_LIMIT = 300          # deep 档股吧帖子采样条数
+_DEEP_COMMENT_LIMIT = 400       # deep 档关键词评论总量上限
+_DEEP_VIDEO_LIMIT = 15          # deep 档搜索视频数（补偿匿名每视频仅约 3 条热评）
+_DEEP_COMMENTS_PER_VIDEO = 50   # deep 档每视频评论数
+_DEFAULT_SINCE_DAYS = 7         # 采样时间窗默认天数
+
+# B 站匿名降级透明化说明（实测 2026-07-23：匿名每视频仅约 3 条热评且多为旧评）
+_BILI_ANON_NOTE = ("B站匿名访问每视频仅返回约3条热评，"
+                   "配置 BILI_SESSDATA 环境变量可拉取全量评论")
+
+
+def _bili_sessdata_configured() -> bool:
+    """BILI_SESSDATA 环境变量是否已配置。绝不抛。"""
+    try:
+        return bool((os.environ.get("BILI_SESSDATA") or "").strip())
+    except Exception:
+        return False
 
 
 def _dist_text(item) -> str:
@@ -596,14 +618,90 @@ def _dist_confidence_for(n: int) -> dict:
 
 
 def _empty_dist(n: int = 0) -> dict:
-    """分布空骨架：对齐 aggregate_distribution 返回结构。"""
+    """分布空骨架：对齐 aggregate_distribution 返回结构（四桶 + bull_bear）。"""
     return {
         "n": n,
         "dist": {b: {"count": 0, "pct": 0.0} for b in _DIST_BUCKETS},
         "weighted_dist": {b: 0.0 for b in _DIST_BUCKETS},
+        "bull_bear": {"乐观_pct": None, "悲观_pct": None,
+                      "note": "样本中无明确多空观点"},
         "confidence": _dist_confidence_for(n),
         "method": "none",
     }
+
+
+# ── 采样时间窗工具（since_days 过滤 + window 输出）──
+
+
+def _parse_sample_time(value):
+    """解析样本时间为 aware datetime（UTC）：ISO 字符串 / unix 秒（数值或数字
+    字符串）；naive ISO 按 UTC 处理；缺失/非法返回 None。绝不抛。"""
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d+(\.\d+)?", text):
+            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _filter_by_time_window(items, since_days, notes: List[str],
+                           label: str) -> List[dict]:
+    """按 published_at 过滤近 since_days 天样本（宁可多留不可误杀）。
+
+    时间字段缺失/解析失败的条目保留并计数进 notes 说明；since_days 非法
+    回落默认 7 天，<=0 不过滤。绝不抛。
+    """
+    try:
+        days = int(since_days)
+    except (TypeError, ValueError):
+        days = _DEFAULT_SINCE_DAYS
+    if days <= 0:
+        return list(items or [])
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    kept: List[dict] = []
+    missing = 0
+    dropped = 0
+    for it in items or []:
+        t = _parse_sample_time(it.get("published_at"))
+        if t is None:
+            missing += 1
+            kept.append(it)  # 时间缺失：保留，不误杀
+        elif t >= cutoff:
+            kept.append(it)
+        else:
+            dropped += 1
+    if missing:
+        notes.append(f"{label}：{missing} 条样本缺少可解析时间，"
+                     "已保留未按时间窗过滤")
+    if dropped:
+        notes.append(f"{label}：按近 {days} 天时间窗过滤掉 {dropped} 条较早样本")
+    return kept
+
+
+def _sample_window(groups) -> dict:
+    """从实际样本的 published_at 计算时间窗 {"from": 最早ISO, "to": 最晚ISO}；
+    无任何可解析时间 → {"from": None, "to": None}。绝不抛。"""
+    times = []
+    for _platform, _target, items in groups or []:
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            dt = _parse_sample_time(it.get("published_at"))
+            if dt is not None:
+                times.append(dt)
+    if not times:
+        return {"from": None, "to": None}
+    return {"from": min(times).isoformat(), "to": max(times).isoformat()}
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -621,12 +719,15 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _collect_dist_samples(code6: str, kw: str, post_limit: int,
-                          comment_limit: int, sleep, notes: List[str]):
+                          video_limit: int, comments_per_video: int,
+                          comment_total_cap, since_days, sleep,
+                          notes: List[str]):
     """采集层惰性调用（采集扩容 Worker 同文件并行交付，globals 探测缺席即降级）。
 
     返回 [(platform, target, items)]：code 路径 ('guba', code, posts)，
-    keyword 路径 ('bilibili', keyword, comments)。函数缺席/调用失败/返回
-    结构异常/为空一律记中文 note 降级，绝不抛。
+    keyword 路径 ('bilibili', keyword, comments)。since_days 时间窗透传采集
+    函数；comment_total_cap 非 None 时对关键词评论总量截断（deep 档用）。
+    函数缺席/调用失败/返回结构异常/为空一律记中文 note 降级，绝不抛。
     """
     groups = []
     if code6:
@@ -637,7 +738,8 @@ def _collect_dist_samples(code6: str, kw: str, post_limit: int,
         else:
             res = None
             try:
-                res = fn(code6, post_limit=post_limit, sleep=sleep)
+                res = fn(code6, post_limit=post_limit, sleep=sleep,
+                         since_days=since_days)
             except TypeError:
                 # 签名不兼容时降级为仅位置参数重试
                 try:
@@ -666,7 +768,9 @@ def _collect_dist_samples(code6: str, kw: str, post_limit: int,
         else:
             res = None
             try:
-                res = fn(kw, comments_per_video=comment_limit, sleep=sleep)
+                res = fn(kw, video_limit=video_limit,
+                         comments_per_video=comments_per_video, sleep=sleep,
+                         since_days=since_days)
             except TypeError:
                 try:
                     res = fn(kw)
@@ -681,6 +785,15 @@ def _collect_dist_samples(code6: str, kw: str, post_limit: int,
                     notes.append(f"关键词：{n}")
                 comments = [c for c in (res.get("comments") or [])
                             if isinstance(c, dict)]
+                if comment_total_cap is not None and len(comments) > 0:
+                    try:
+                        cap = int(comment_total_cap)
+                    except (TypeError, ValueError):
+                        cap = 0
+                    if cap > 0 and len(comments) > cap:
+                        notes.append(f"关键词：评论样本超总量上限 {cap} 条，"
+                                     f"已截断（原 {len(comments)} 条）")
+                        comments = comments[:cap]
                 if comments:
                     groups.append(("bilibili", kw, comments))
                 else:
@@ -692,7 +805,7 @@ def _collect_dist_samples(code6: str, kw: str, post_limit: int,
 
 def _score_items_llm(items, client, sleep, platform: str, notes: List[str]) -> bool:
     """LLM 批量打分路径：texts 截 100 字 → score_texts_batch → 按 index 回填
-    条目 sentiment（乐观/中性/悲观）与 sentiment_score（夹取 [-1,1]）。
+    条目 sentiment（乐观/悲观/中性/无关）与 sentiment_score（夹取 [-1,1]）。
 
     返回 True=LLM 路径已用；模块缺席/能力缺失/异常/结构异常一律记 note
     并返回 False（调用方降级词典）。契约承诺绝不抛，仍全防御。
@@ -883,13 +996,22 @@ def _merge_group_dists(aggs) -> dict:
             for b in _DIST_BUCKETS}
     weighted = {b: round(weighted_sum[b] / n, 1) if n else 0.0
                 for b in _DIST_BUCKETS}
+    pos_neg = counts["乐观"] + counts["悲观"]
+    if pos_neg > 0:
+        bull_bear = {"乐观_pct": round(counts["乐观"] / pos_neg * 100.0, 1),
+                     "悲观_pct": round(counts["悲观"] / pos_neg * 100.0, 1)}
+    else:
+        bull_bear = {"乐观_pct": None, "悲观_pct": None,
+                     "note": "样本中无明确多空观点"}
     return {"n": n, "dist": dist, "weighted_dist": weighted,
+            "bull_bear": bull_bear,
             "confidence": _dist_confidence_for(n)}
 
 
 def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
                                comment_limit: int = 120, use_llm: bool = True,
-                               client=None, sleep=None) -> dict:
+                               client=None, sleep=None, depth: str = "standard",
+                               since_days: int = 7) -> dict:
     """个股/关键词社媒情绪分布主入口：采样 → 打分 → 聚合分布 → 快照/趋势。绝不抛。
 
     路径：
@@ -898,12 +1020,21 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
     - 两者都给则两路都采集，平台分别统计后归并（dist 计数求和重算 pct，
       weighted_dist 按平台 n 加权，confidence 按合并 n 重新分档）。
 
+    深度档 depth：standard（缺省）维持既有量级（post_limit/comment_limit
+    参数直传，视频 5 个）；deep 扩容为 post_limit=300 / comment_limit=400
+    （评论总量上限）/ video_limit=8 / comments_per_video=50。未知档按
+    standard 处理并进 notes。
+    时间窗 since_days（默认 7）：透传采集层按样本 published_at 过滤近
+    since_days 天样本（时间缺失条目保留并记 notes）。
+
     打分：use_llm 且 sentiment_llm 就绪 → score_texts_batch 批量打分
     （标签回填条目 sentiment/sentiment_score）；否则降级
     sentiment.score_news_sentiment 词典打分（scorer 默认）。method 标注
     'llm' / 'lexicon' / 'mixed'（合并路径双平台打分方式不一致时）。
 
-    返回 {target:{code/keyword}, samples_total, dist, weighted_dist,
+    返回 {target:{code/keyword}, samples_total, dist（四桶：乐观/悲观/中性/
+    无关）, weighted_dist, bull_bear（多空比，仅乐观+悲观子集相对占比）,
+    window（{"from"/"to"} 样本实际时间跨度，无时间信息则双 None 并记 notes）,
     confidence, trend, representatives, method, sources, notes}；
     合并路径 trend/representatives 为 {平台: 值} 字典。任何子步骤失败
     降级进 notes，绝不抛异常。
@@ -911,12 +1042,15 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
     notes: List[str] = []
 
     def _out(target, samples_total, dist, weighted_dist, confidence, trend,
-             representatives, method, sources):
+             representatives, method, sources, bull_bear=None, window=None):
         return {
             "target": target,
             "samples_total": samples_total,
             "dist": dist,
             "weighted_dist": weighted_dist,
+            "bull_bear": bull_bear,
+            "window": window if window is not None
+                      else {"from": None, "to": None},
             "confidence": confidence,
             "trend": trend,
             "representatives": representatives,
@@ -939,7 +1073,13 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
             notes.append("code 与 keyword 均缺失/非法，本轮无样本可打分")
             empty = _empty_dist(0)
             return _out(target, 0, empty["dist"], empty["weighted_dist"],
-                        empty["confidence"], None, [], "none", [])
+                        empty["confidence"], None, [], "none", [],
+                        bull_bear=empty["bull_bear"])
+        # 深度档：standard 维持既有量级；deep 扩容固定配额
+        depth_norm = str(depth or _DEPTH_STANDARD).strip().lower()
+        if depth_norm not in (_DEPTH_STANDARD, _DEPTH_DEEP):
+            notes.append(f"未知深度档 depth={depth!r}，已按 standard 档处理")
+            depth_norm = _DEPTH_STANDARD
         try:
             post_limit = max(1, int(post_limit))
         except (TypeError, ValueError):
@@ -948,14 +1088,33 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
             comment_limit = max(1, int(comment_limit))
         except (TypeError, ValueError):
             comment_limit = 120
+        if depth_norm == _DEPTH_DEEP:
+            post_limit = _DEEP_POST_LIMIT
+            comment_total_cap = _DEEP_COMMENT_LIMIT
+            video_limit = _DEEP_VIDEO_LIMIT
+            comments_per_video = _DEEP_COMMENTS_PER_VIDEO
+        else:
+            comment_total_cap = None
+            video_limit = 5
+            comments_per_video = comment_limit
+        try:
+            since_days = int(since_days)
+        except (TypeError, ValueError):
+            since_days = _DEFAULT_SINCE_DAYS
 
-        groups = _collect_dist_samples(code6, kw, post_limit, comment_limit,
-                                       sleep, notes)
+        groups = _collect_dist_samples(code6, kw, post_limit, video_limit,
+                                       comments_per_video, comment_total_cap,
+                                       since_days, sleep, notes)
         if not groups:
             notes.append("本轮无任何有效样本（采集层缺席或为空）")
             empty = _empty_dist(0)
             return _out(target, 0, empty["dist"], empty["weighted_dist"],
-                        empty["confidence"], None, [], "none", [])
+                        empty["confidence"], None, [], "none", [],
+                        bull_bear=empty["bull_bear"])
+
+        window = _sample_window(groups)
+        if window["from"] is None and window["to"] is None:
+            notes.append("样本缺少可解析时间，无法计算 window 时间窗")
 
         per_group = []
         methods = []
@@ -980,6 +1139,9 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
             g = per_group[0]
             agg = g["agg"]
             empty = _empty_dist(len(g["items"]))
+            bull_bear = (agg.get("bull_bear")
+                         if isinstance(agg.get("bull_bear"), dict)
+                         else empty["bull_bear"])
             return _out(
                 target,
                 _safe_int(agg.get("n"), len(g["items"])),
@@ -989,20 +1151,23 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
                 else empty["weighted_dist"],
                 agg.get("confidence") if isinstance(agg.get("confidence"), dict)
                 else empty["confidence"],
-                g["trend"], g["reps"], overall_method, sources)
+                g["trend"], g["reps"], overall_method, sources,
+                bull_bear=bull_bear, window=window)
         # 合并路径：平台分别统计后归并
         merged = _merge_group_dists([g["agg"] for g in per_group])
         trends = {g["platform"]: g["trend"] for g in per_group}
         reps = {g["platform"]: g["reps"] for g in per_group}
         return _out(target, merged["n"], merged["dist"], merged["weighted_dist"],
-                    merged["confidence"], trends, reps, overall_method, sources)
+                    merged["confidence"], trends, reps, overall_method, sources,
+                    bull_bear=merged["bull_bear"], window=window)
     except Exception as e:  # noqa: BLE001 - 门面绝不抛出
         logger.warning("get_sentiment_distribution 异常（返回空骨架）: %s", e,
                        exc_info=True)
         notes.append(f"情绪分布主流程内部异常，结果为空骨架: {e}")
         empty = _empty_dist(0)
         return _out({}, 0, empty["dist"], empty["weighted_dist"],
-                    empty["confidence"], None, [], "none", [])
+                    empty["confidence"], None, [], "none", [],
+                    bull_bear=empty["bull_bear"])
 
 
 # ── 采样扩容：关键词评论样本 + 股吧帖子样本（分布化舆情数据源）──
@@ -1015,16 +1180,20 @@ def get_sentiment_distribution(code=None, keyword=None, post_limit: int = 80,
 
 
 def collect_keyword_samples(keyword, video_limit: int = 5,
-                            comments_per_video: int = 30, sleep=None) -> dict:
+                            comments_per_video: int = 30, sleep=None,
+                            since_days: int = 7) -> dict:
     """B 站关键词评论样本扩容采集：搜索前 N 个视频 → 逐视频拉评论 → 合并。绝不抛。
 
     流程：惰性加载 B 站模块（search 能力缺失即降级）→ search(keyword,
-    limit=video_limit) → 逐视频 fetch_comments(post_id,
-    limit=comments_per_video) → 合并为评论样本列表。
+    limit=video_limit, order="pubdate")（按发布时间倒序采样）→ 逐视频
+    fetch_comments(post_id, limit=comments_per_video) → 合并为评论样本列表
+    → since_days 时间窗过滤（默认近 7 天；时间缺失/解析失败的条目保留并
+    进 notes 说明，宁可多留不可误杀）。
 
     评论条目为统一 Comment 契约 {platform, post_id, author, content,
     likes, published_at} 另加 source_video 键（源视频标题，供代表性
     引用与追溯）。部分视频评论失败/为空跳过并进 notes，绝不抛。
+    匿名降级透明化：环境无 BILI_SESSDATA 时 notes 追加匿名热评受限说明。
 
     返回 {keyword, videos_used: [{post_id, title, comments}], comments,
     notes}；videos_used 只含实际采到评论的视频。
@@ -1035,6 +1204,8 @@ def collect_keyword_samples(keyword, video_limit: int = 5,
     comments: List[dict] = []
 
     def _out() -> dict:
+        if not _bili_sessdata_configured() and _BILI_ANON_NOTE not in notes:
+            notes.append(_BILI_ANON_NOTE)
         return {"keyword": kw, "videos_used": videos_used,
                 "comments": comments, "notes": notes}
 
@@ -1056,7 +1227,7 @@ def collect_keyword_samples(keyword, video_limit: int = 5,
             notes.append("B 站模块未就绪或缺少 search 能力，本轮无评论样本")
             return _out()
         videos = _safe_fetch(search, kw, limit=video_limit,
-                             sleep=sleep)[:video_limit]
+                             sleep=sleep, order="pubdate")[:video_limit]
         if not videos:
             notes.append(f"关键词「{kw}」搜索无视频结果或端点降级，"
                          "本轮无评论样本")
@@ -1085,6 +1256,9 @@ def collect_keyword_samples(keyword, video_limit: int = 5,
                                 "comments": len(batch)})
         if not comments:
             notes.append("全部视频评论采样失败，本轮无评论样本")
+        else:
+            comments[:] = _filter_by_time_window(comments, since_days,
+                                                 notes, "关键词")
         return _out()
     except Exception as e:  # noqa: BLE001 - 门面绝不抛出
         logger.warning("collect_keyword_samples 异常（返回已有部分结果）: %s",
@@ -1094,12 +1268,14 @@ def collect_keyword_samples(keyword, video_limit: int = 5,
 
 
 def collect_guba_samples(code, post_limit: int = 100, enrich: int = 0,
-                         sleep=None) -> dict:
+                         sleep=None, since_days: int = 7) -> dict:
     """股吧帖子样本扩容采集：fetch_bar_posts 分页拉帖，可选 enrich 回填。绝不抛。
 
     流程：代码归一（6 位 A 股）→ 惰性加载 social_guba →
     fetch_bar_posts(code, limit=post_limit) → enrich>0 时
-    enrich_posts(posts, top_n=enrich) 回填 top 正文与点赞。
+    enrich_posts(posts, top_n=enrich) 回填 top 正文与点赞 →
+    since_days 时间窗过滤（默认近 7 天；时间缺失/解析失败的条目保留并
+    进 notes 说明，宁可多留不可误杀）。
 
     返回 {code, posts, notes}；posts 为统一 Post 契约原样透传（不瘦身、
     不打分，交由下游聚合 Worker 处理）。模块缺席/能力缺失/抓取失败/
@@ -1166,6 +1342,7 @@ def collect_guba_samples(code, post_limit: int = 100, enrich: int = 0,
                         posts[:] = [p for p in enriched if isinstance(p, dict)]
                     else:
                         notes.append("股吧详情富化返回为空，保留列表原始数据")
+        posts[:] = _filter_by_time_window(posts, since_days, notes, "股吧")
         return _out(code6)
     except Exception as e:  # noqa: BLE001 - 门面绝不抛出
         logger.warning("collect_guba_samples 异常（返回已有部分结果）: %s",

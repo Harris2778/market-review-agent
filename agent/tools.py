@@ -493,6 +493,13 @@ TOOL_REGISTRY: list = [
                         "default": 30,
                         "description": "人气历史回溯天数，默认 30，最大 120。",
                     },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["standard", "deep"],
+                        "default": "standard",
+                        "description": "情绪分布采样深度档：standard=标准采样（默认），"
+                                       "deep=扩大采样量（更多帖子/评论，耗时更长）。",
+                    },
                 },
                 "required": ["stock_code"],
             },
@@ -609,6 +616,13 @@ TOOL_REGISTRY: list = [
                         "default": False,
                         "description": "是否附带评论：true 时对前 3 条有 post_id 的 B 站结果"
                                        "各取最多 10 条热门评论并入返回。默认 false。",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["standard", "deep"],
+                        "default": "standard",
+                        "description": "情绪分布采样深度档（with_comments=true 时生效）："
+                                       "standard=标准采样（默认），deep=扩大采样量。",
                     },
                 },
                 "required": ["keyword"],
@@ -971,13 +985,15 @@ def _append_guba_block(result, code: str):
 _GUBA_DIST_POST_LIMIT = 80  # get_stock_sentiment 情绪分布块的股吧帖子采样条数
 
 
-def _append_distribution_block(result, code: str = None, keyword: str = None):
+def _append_distribution_block(result, code: str = None, keyword: str = None,
+                               depth: str = "standard"):
     """情绪分布增强块：惰性调 social_media.get_sentiment_distribution（分布化改造）。
 
     舆情呈现从「引用个别帖子/评论」升级为「整体情绪分布」为主体。成功且
     结构正常时在返回上追加 sentiment_distribution={target, samples_total,
-    dist, weighted_dist, confidence, trend, representatives, method,
-    sources, notes} 键；模块缺席/能力缺失/异常/结构异常一律只进 notes，
+    dist, weighted_dist, bull_bear, window, confidence, trend,
+    representatives, method, sources, notes} 键；depth（standard/deep）
+    透传采样深度档；模块缺席/能力缺失/异常/结构异常一律只进 notes，
     绝不影响主返回。绝不抛。
     """
     if not isinstance(result, dict):
@@ -988,10 +1004,13 @@ def _append_distribution_block(result, code: str = None, keyword: str = None):
             if social is not None else None
         if not callable(get_dist):
             return _append_note(result, "情绪分布通道不可用（social_media.get_sentiment_distribution 未就绪），未挂情绪分布")
+        if depth not in ("standard", "deep"):
+            depth = "standard"
         if code:
-            dist = get_dist(code=code, post_limit=_GUBA_DIST_POST_LIMIT)
+            dist = get_dist(code=code, post_limit=_GUBA_DIST_POST_LIMIT,
+                            depth=depth)
         else:
-            dist = get_dist(keyword=keyword)
+            dist = get_dist(keyword=keyword, depth=depth)
         if not isinstance(dist, dict):
             return _append_note(result, "情绪分布返回结构异常，未挂情绪分布")
         result["sentiment_distribution"] = dist
@@ -1020,6 +1039,7 @@ def _handle_get_stock_sentiment(args: dict) -> dict:
     if not code:
         raise _ParamError(f"stock_code 无法归一为 6 位 A 股代码：{args.get('stock_code')!r}")
     days = _clamp_int(args.get("days"), 30, 1, 120)
+    depth = _clean_str(args.get("depth")) or "standard"
     sent = _get_sentiment_module()
     if sent is None:
         return {"ok": False, "code": code, "note": "情绪模块不可用（agent/sentiment.py 未就绪）"}
@@ -1027,7 +1047,7 @@ def _handle_get_stock_sentiment(args: dict) -> dict:
     result = sent.get_stock_sentiment(code, days=days, news_items=news_items)
     result = _append_note(result, news_note)
     result = _append_guba_block(result, code)
-    return _append_distribution_block(result, code=code)
+    return _append_distribution_block(result, code=code, depth=depth)
 
 
 def _fetch_stock_daily_rows(df, code: str, days: int):
@@ -1366,7 +1386,8 @@ def _handle_search_social_media(args: dict) -> dict:
     if args.get("with_comments") is True:
         out["comments"] = [s for s in (_slim_social_comment(c) for c in comments) if s]
         # 分布化改造：有评论时追加整体情绪分布块（失败只进 notes，不影响主返回）
-        out = _append_distribution_block(out, keyword=keyword)
+        depth = _clean_str(args.get("depth")) or "standard"
+        out = _append_distribution_block(out, keyword=keyword, depth=depth)
     return out
 
 

@@ -11,8 +11,10 @@
    并按近两个有效快照的乐观占比差判定趋势方向。
 
 标签兼容（全局契约）：
-- LLM 体系「乐观/中性/悲观」与词典体系「利好/利空/中性」双兼容：
+- LLM 体系「乐观/悲观/中性/无关」四桶与词典体系「利好/利空/中性」双兼容：
   利好→乐观、利空→悲观归并；未知标签归入中性并计入 unknown_count。
+- bull_bear 多空比：仅在乐观+悲观子集上计算的相对占比（两者之和为 100）；
+  无关/中性条目不参与；乐观+悲观样本数为 0 时两个占比均为 None 并附 note。
 
 权重契约：条目 metrics.likes（缺省回退顶层 likes，再缺省 0）+ 1 为权重
 （0 赞也有基础票）。
@@ -34,19 +36,21 @@ logger = logging.getLogger(__name__)
 
 METHOD = "aggregate_v1"
 
-# 情感桶（固定三桶，输出键序）
+# 情感桶（固定四桶，输出键序）
 BUCKET_POS = "乐观"
-BUCKET_NEU = "中性"
 BUCKET_NEG = "悲观"
-BUCKETS = (BUCKET_POS, BUCKET_NEU, BUCKET_NEG)
+BUCKET_NEU = "中性"
+BUCKET_IRR = "无关"
+BUCKETS = (BUCKET_POS, BUCKET_NEG, BUCKET_NEU, BUCKET_IRR)
 
-# 标签归并表：词典体系 → LLM 体系
+# 标签归并表：词典体系 → LLM 四桶体系
 _LABEL_MAP = {
     "乐观": BUCKET_POS,
     "利好": BUCKET_POS,
-    "中性": BUCKET_NEU,
     "悲观": BUCKET_NEG,
     "利空": BUCKET_NEG,
+    "中性": BUCKET_NEU,
+    "无关": BUCKET_IRR,
 }
 
 # 置信度分档边界（全局契约）
@@ -109,7 +113,7 @@ def _to_int(value, default: int = 0) -> int:
 
 
 def _norm_label(value) -> Optional[str]:
-    """标签归并：返回 '乐观/中性/悲观'；未知标签返回 None（由调用方计入 unknown）。"""
+    """标签归并：返回 '乐观/悲观/中性/无关'；未知标签返回 None（由调用方计入 unknown）。"""
     label = _clean_str(value)
     if not label:
         return None
@@ -138,6 +142,19 @@ def _pct(part: float, total: float) -> float:
     return round(part / total * 100.0, 1)
 
 
+def _bull_bear(pos_count: int, neg_count: int) -> dict:
+    """多空比：仅在乐观+悲观子集上计算的相对占比（两者之和为 100）。
+
+    无关/中性条目不参与；乐观+悲观样本数为 0 → 两个占比均为 None 并附 note。
+    """
+    total = pos_count + neg_count
+    if total <= 0:
+        return {"乐观_pct": None, "悲观_pct": None,
+                "note": "样本中无明确多空观点"}
+    return {"乐观_pct": _pct(pos_count, total),
+            "悲观_pct": _pct(neg_count, total)}
+
+
 # ═══════════════════════════════════════════
 # 1. 情绪分布聚合
 # ═══════════════════════════════════════════
@@ -146,13 +163,15 @@ def aggregate_distribution(items, weight_likes_key: str = "likes") -> dict:
     """聚合已打分条目为整体情绪分布（纯函数，绝不抛异常）。
 
     入参 items：已打分条目列表（dict，含 sentiment 标签——兼容
-    「乐观/悲观/中性」与词典的「利好/利空」（利好→乐观、利空→悲观归并；
+    「乐观/悲观/中性/无关」与词典的「利好/利空」（利好→乐观、利空→悲观归并；
     未知/缺失标签归入中性并计入 unknown_count）；likes 取 metrics.likes
     或顶层 likes，缺省 0，权重 = likes + 1）。
 
     返回：
-        {n, dist:{乐观:{count,pct},中性:{...},悲观:{...}},
-         weighted_dist:{乐观:pct,中性:pct,悲观:pct},
+        {n, dist:{乐观:{count,pct},悲观:{...},中性:{...},无关:{...}},
+         weighted_dist:{乐观:pct,悲观:pct,中性:pct,无关:pct},
+         bull_bear:{乐观_pct,悲观_pct}（仅乐观+悲观子集相对占比，和为 100；
+           无多空样本时两者为 None 并附 note「样本中无明确多空观点」）,
          unknown_count,
          confidence:{level:'低/中/高', reason},
          method:'aggregate_v1'}
@@ -197,6 +216,7 @@ def aggregate_distribution(items, weight_likes_key: str = "likes") -> dict:
             "n": n,
             "dist": dist,
             "weighted_dist": weighted_dist,
+            "bull_bear": _bull_bear(counts[BUCKET_POS], counts[BUCKET_NEG]),
             "unknown_count": unknown_count,
             "confidence": {"level": level, "reason": reason},
             "method": METHOD,
@@ -225,13 +245,13 @@ def _slim_item(item: dict, likes_key: str = "likes") -> dict:
 
 def pick_representatives(items, per_bucket: int = 2,
                          weight_likes_key: str = "likes") -> dict:
-    """每个情感桶（乐观/悲观/中性）按 likes 降序取前 per_bucket 条代表性样本。
+    """每个情感桶（乐观/悲观/中性/无关）按 likes 降序取前 per_bucket 条代表性样本。
 
     标签归并与 aggregate_distribution 一致（利好→乐观、利空→悲观、
     未知→中性）。样本瘦身见 _slim_item。任何异常降级为空桶，绝不抛。
-    返回 {'乐观': [...], '悲观': [...], '中性': [...]}。
+    返回 {'乐观': [...], '悲观': [...], '中性': [...], '无关': [...]}。
     """
-    result: Dict[str, List[dict]] = {BUCKET_POS: [], BUCKET_NEG: [], BUCKET_NEU: []}
+    result: Dict[str, List[dict]] = {b: [] for b in BUCKETS}
     try:
         per = max(0, _to_int(per_bucket, 2))
         buckets: Dict[str, List[dict]] = {b: [] for b in BUCKETS}
@@ -240,7 +260,7 @@ def pick_representatives(items, per_bucket: int = 2,
                 continue
             bucket = _norm_label(item.get("sentiment")) or BUCKET_NEU
             buckets[bucket].append(item)
-        for bucket in (BUCKET_POS, BUCKET_NEG, BUCKET_NEU):
+        for bucket in BUCKETS:
             ranked = sorted(
                 buckets[bucket],
                 key=lambda it: _item_likes(it, weight_likes_key),
@@ -252,7 +272,7 @@ def pick_representatives(items, per_bucket: int = 2,
     except Exception as e:  # 铁律：绝不抛
         logger.warning("pick_representatives 异常（降级空桶）: %s", e,
                        exc_info=True)
-        return {BUCKET_POS: [], BUCKET_NEG: [], BUCKET_NEU: []}
+        return {b: [] for b in BUCKETS}
 
 
 # ═══════════════════════════════════════════

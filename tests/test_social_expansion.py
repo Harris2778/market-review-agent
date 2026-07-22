@@ -316,7 +316,8 @@ def test_keyword_samples_happy_merges_with_source_video(inject_bilibili):
         {"post_id": "v1", "title": "视频甲", "comments": 2},
         {"post_id": "v2", "title": "视频乙", "comments": 3},
     ]
-    assert out["notes"] == []
+    # 匿名降级透明化：环境无 BILI_SESSDATA 时仅有该说明，无其他降级 note
+    assert all("BILI_SESSDATA" in n for n in out["notes"]), out["notes"]
 
 
 def test_keyword_samples_partial_failure_keeps_others(inject_bilibili):
@@ -488,7 +489,8 @@ def test_guba_samples_passthrough(inject_guba):
                                   sleep=lambda s: None)
     assert out["code"] == "600519"
     assert out["posts"] == posts
-    assert out["notes"] == []
+    # 时间窗过滤：published_at 缺失的条目保留，但计入 notes 说明
+    assert all("缺少可解析时间" in n for n in out["notes"])
     assert ("fetch_bar_posts", "600519", 100) in calls
 
 

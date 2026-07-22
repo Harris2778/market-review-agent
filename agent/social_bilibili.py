@@ -13,7 +13,9 @@
    video 条目 title 含 <em class="keyword"> 高亮标签，必须清洗。
 4. 评论 reply（plain 版）：GET https://api.bilibili.com/x/v2/reply?type=1&oid={aid}&sort=1&ps=N
    → data.replies[] { content.message, member.uname, like, rcount, ctime }；
-   需 buvid3 预热；wbi 变体（reply/wbi/main）实测 code=-403 已判死刑，不实现。
+   需 buvid3 预热；wbi 变体（reply/wbi/main）匿名实测 code=-403，但登录态
+   （BILI_SESSDATA cookie + wbi 签名）可用——匿名每视频仅约 3 条热评，
+   登录态走签名路径拉全量，签名材料失败降级 plain 带 cookie 请求。
    post_id 接受 aid 纯数字或 bvid（bvid 先经 x/web-interface/view?bvid= 转 aid）。
 
 合规注记：仅采集无登录公开数据；低频访问（≤1 req/s + 随机抖动）；
@@ -21,15 +23,17 @@
 一律按 warning 日志观测并降级，绝不向调用方抛异常。
 """
 
+import hashlib
 import html
 import json
 import logging
+import os
 import random
 import re
 import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 try:
     import requests
@@ -44,6 +48,8 @@ HOT_SQUARE_URL = "https://api.bilibili.com/x/web-interface/search/square"
 POPULAR_URL = "https://api.bilibili.com/x/web-interface/popular"
 SEARCH_TYPE_URL = "https://api.bilibili.com/x/web-interface/search/type"
 REPLY_URL = "https://api.bilibili.com/x/v2/reply"
+REPLY_WBI_URL = "https://api.bilibili.com/x/v2/reply/wbi/main"
+NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 WARMUP_URL = "https://www.bilibili.com"
 REFERER = "https://www.bilibili.com/"
@@ -61,6 +67,14 @@ REPLY_PAGE_MAX = 25    # 翻页页数安全上限（25 页 × 20 条 = 最多 50
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _AID_RE = re.compile(r"^\d+$")
+
+# wbi 签名混淆表（标准 64 元素表，img_key+sub_key 重排后取前 32 位为 mixin key）
+_MIXIN_KEY_ENC_TAB = (
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+)
 
 
 # ── 基础工具 ──
@@ -215,6 +229,122 @@ def _put_metric(metrics: dict, key: str, value) -> None:
     num = _to_int(value)
     if num is not None:
         metrics[key] = num
+
+
+# ── 登录态（BILI_SESSDATA）与 wbi 签名 ──
+#
+# 实测（2026-07-23）：评论接口匿名状态每视频仅返回约 3 条热评且多为一年
+# 前旧评；配置 BILI_SESSDATA 环境变量（登录 cookie）后走 wbi 签名路径
+# （x/v2/reply/wbi/main）可拉全量评论。无 SESSDATA 时行为与既有完全一致。
+
+
+def _get_sessdata() -> str:
+    """读 BILI_SESSDATA 环境变量；未配置返回 ''。绝不抛。"""
+    try:
+        return (os.environ.get("BILI_SESSDATA") or "").strip()
+    except Exception:
+        return ""
+
+
+def _attach_sessdata(session, sessdata: str) -> bool:
+    """把 SESSDATA 挂载到会话：优先 cookie jar，退化 dict/headers。绝不抛。"""
+    try:
+        session.cookies.set("SESSDATA", sessdata, domain=".bilibili.com")
+        return True
+    except Exception:
+        pass
+    try:
+        session.cookies["SESSDATA"] = sessdata
+        return True
+    except Exception:
+        pass
+    try:
+        session.headers.update({"Cookie": f"SESSDATA={sessdata}"})
+        return True
+    except Exception as e:
+        logger.warning("bilibili SESSDATA 挂载失败: %s", e)
+        return False
+
+
+def _wbi_key_from_url(url) -> str:
+    """从 wbi_img 的 img_url/sub_url 提取文件名（去扩展名）作为 key。"""
+    try:
+        name = str(url or "").rsplit("/", 1)[-1]
+        return name.split(".", 1)[0]
+    except Exception:
+        return ""
+
+
+def _get_wbi_mixin_key(session, gate: "_RateGate") -> Optional[str]:
+    """经 x/web-interface/nav 取 wbi_img 推导 mixin key；失败返回 None，绝不抛。"""
+    payload = _get_json(session, NAV_URL, gate=gate, tag="bilibili_nav")
+    if payload is None:
+        return None
+    try:
+        data = payload.get("data")
+        wbi_img = data.get("wbi_img") if isinstance(data, dict) else None
+        if not isinstance(wbi_img, dict):
+            return None
+        img_key = _wbi_key_from_url(wbi_img.get("img_url"))
+        sub_key = _wbi_key_from_url(wbi_img.get("sub_url"))
+        if not img_key or not sub_key:
+            return None
+        raw = img_key + sub_key
+        return "".join(raw[i] for i in _MIXIN_KEY_ENC_TAB)[:32]
+    except Exception as e:
+        logger.warning("bilibili wbi mixin key 推导失败: %s", e)
+        return None
+
+
+def _sign_wbi_params(params: dict, mixin_key: str) -> dict:
+    """wbi 签名：参数加 wts → 按键排序 urlencode → md5(query+mixin_key)=w_rid。"""
+    signed = {k: v for k, v in params.items()}
+    signed["wts"] = int(time.time())
+    query = urlencode(sorted(signed.items()))
+    signed["w_rid"] = hashlib.md5(
+        (query + mixin_key).encode("utf-8")).hexdigest()
+    return signed
+
+
+def _fetch_comments_wbi(session, aid: str, limit: int, gate: "_RateGate",
+                        mixin_key: str) -> List[Dict]:
+    """登录态 wbi 签名评论路径（x/v2/reply/wbi/main，cursor 翻页）。
+
+    单页失败保留已抓部分即止损；绝不抛。返回评论列表（可能为空）。
+    """
+    comments: List[Dict] = []
+    next_cursor = 0
+    for page_no in range(1, REPLY_PAGE_MAX + 1):
+        if len(comments) >= limit:
+            break
+        params = _sign_wbi_params(
+            {"type": 1, "oid": aid, "mode": 3,
+             "ps": REPLY_PAGE_SIZE, "next": next_cursor},
+            mixin_key)
+        payload = _get_json(session, REPLY_WBI_URL, gate=gate,
+                            tag="bilibili_reply_wbi", params=params)
+        if payload is None:
+            logger.warning("bilibili_reply_wbi 第 %s 页抓取失败，保留已抓 %s 条",
+                           page_no, len(comments))
+            break
+        page = _parse_replies(payload, REPLY_PAGE_SIZE, aid)
+        if not page:
+            break  # 空页终止
+        comments.extend(page)
+        data = payload.get("data")
+        cursor = data.get("cursor") if isinstance(data, dict) else None
+        if isinstance(cursor, dict):
+            if cursor.get("is_end"):
+                break  # 游标到尾终止
+            nxt = _to_int(cursor.get("next"))
+            if nxt is None or nxt == next_cursor:
+                break  # 游标不前进，防死循环
+            next_cursor = nxt
+        else:
+            break  # 无游标信息，无法继续翻页
+        if len(page) < REPLY_PAGE_SIZE:
+            break  # 短页即末页
+    return comments[:limit]
 
 
 # ── 解析器（全部防御式）──
@@ -426,9 +556,11 @@ def fetch_hot(limit: int = 20, session=None, sleep: Optional[Callable[[float], N
 
 def search(keyword: str, limit: int = 20, session=None,
            sleep: Optional[Callable[[float], None]] = None,
-           search_type: str = "video") -> List[Dict]:
+           search_type: str = "video", order: Optional[str] = None) -> List[Dict]:
     """B 站关键词搜索（search/type，search_type=video|article）。
 
+    order=None（缺省）时行为与既有完全一致（综合排序）；传 order="pubdate"
+    时请求参数带 order=pubdate（按发布时间倒序），仅用于采样路径。
     裸请求可能 412（缺 buvid3），自动热身重试一次。失败记 warning 返回 []，绝不抛。
     """
     keyword = str(keyword or "").strip()
@@ -441,8 +573,11 @@ def search(keyword: str, limit: int = 20, session=None,
     if sess is None:
         return []
     gate = _RateGate(sleep or time.sleep)
+    params = {"search_type": search_type, "keyword": keyword, "page": 1}
+    if order is not None:
+        params["order"] = str(order)
     payload = _get_json(sess, SEARCH_TYPE_URL, gate=gate, tag="bilibili_search",
-                        params={"search_type": search_type, "keyword": keyword, "page": 1})
+                        params=params)
     if payload is None:
         return []
     return _parse_search_result(payload, limit, search_type)
@@ -450,10 +585,16 @@ def search(keyword: str, limit: int = 20, session=None,
 
 def fetch_comments(post_id, limit: int = 20, session=None,
                    sleep: Optional[Callable[[float], None]] = None) -> List[Dict]:
-    """B 站评论（x/v2/reply plain 版；wbi 变体实测 -403 不实现）。
+    """B 站评论（默认 x/v2/reply plain 版；登录态走 wbi 签名路径）。
 
     post_id 接受 aid 纯数字或 bvid（bvid 先经 view 接口转 aid）。
     失败记 warning 返回 []，绝不抛。
+
+    登录态增强：配置 BILI_SESSDATA 环境变量时，会话挂载 SESSDATA cookie
+    并走 wbi 签名路径（x/v2/reply/wbi/main，mode=3，cursor 翻页）拉全量
+    评论——匿名状态每视频仅返回约 3 条热评。wbi 签名材料（nav wbi_img）
+    获取失败时降级为不带签名的带 cookie 请求（plain 路径）。无 SESSDATA
+    时行为与既有完全一致。
 
     翻页：plain 版响应带 data.page 分页元信息，确认支持 pn 翻页。
     limit<=20 维持单页直取（ps=limit，与既有行为一致）；limit>20 进入
@@ -482,6 +623,15 @@ def fetch_comments(post_id, limit: int = 20, session=None,
             logger.warning("bilibili_view 响应缺少 aid：bvid=%s", pid)
             return []
         aid = str(aid_val)
+    # 登录态路径：SESSDATA + wbi 签名（签名材料失败降级 plain 带 cookie）
+    sessdata = _get_sessdata()
+    if sessdata:
+        _attach_sessdata(sess, sessdata)
+        mixin_key = _get_wbi_mixin_key(sess, gate)
+        if mixin_key is not None:
+            return _fetch_comments_wbi(sess, aid, limit, gate, mixin_key)
+        logger.warning("bilibili wbi 签名材料获取失败，"
+                       "降级为不带签名的带 cookie 请求（plain 路径）")
     if limit <= REPLY_PAGE_SIZE:
         payload = _get_json(sess, REPLY_URL, gate=gate, tag="bilibili_reply",
                             params={"type": 1, "oid": aid, "sort": 1, "ps": limit})

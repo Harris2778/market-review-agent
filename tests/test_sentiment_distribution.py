@@ -118,7 +118,7 @@ def fake_agg(monkeypatch):
         items = list(items)
         mod.calls["aggregate"].append(items)
         n = len(items)
-        counts = {b: 0 for b in ("乐观", "中性", "悲观")}
+        counts = {b: 0 for b in ("乐观", "悲观", "中性", "无关")}
         for it in items:
             label = it.get("sentiment")
             bucket = label if label in counts else _LABEL_MAP.get(label, "中性")
@@ -137,8 +137,15 @@ def fake_agg(monkeypatch):
             wtot += w
         weighted = {b: round(wsum[b] / wtot * 100, 1) if wtot else 0.0
                     for b in counts}
+        pos_neg = counts["乐观"] + counts["悲观"]
+        bull_bear = ({"乐观_pct": round(counts["乐观"] / pos_neg * 100, 1),
+                      "悲观_pct": round(counts["悲观"] / pos_neg * 100, 1)}
+                     if pos_neg else
+                     {"乐观_pct": None, "悲观_pct": None,
+                      "note": "样本中无明确多空观点"})
         level = "低" if n < 30 else ("中" if n < 100 else "高")
         return {"n": n, "dist": dist, "weighted_dist": weighted,
+                "bull_bear": bull_bear,
                 "confidence": {"level": level, "reason": f"n={n}"},
                 "method": "fake"}
 
@@ -192,7 +199,7 @@ class TestDistributionMainFlow:
         result = sm.get_sentiment_distribution(code="600519")
         assert result["target"] == {"code": "600519"}
         assert result["samples_total"] == 3
-        assert set(result["dist"]) == {"乐观", "中性", "悲观"}
+        assert set(result["dist"]) == {"乐观", "悲观", "中性", "无关"}
         total = sum(b["count"] for b in result["dist"].values())
         assert total == 3
         assert result["method"] == "llm"
