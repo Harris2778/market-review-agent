@@ -583,3 +583,41 @@ Kimi Work 每日抓取 Automation 已删除；以下两端代码**休眠保留**
   未配置时匿名每视频仅约 3 条热评）
 推送：`PUSH_WEBHOOK_URL`（未配置只生成不发送）、`PUSH_TIME`（默认 15:40 上海，工作日）
 配额：`RATE_LIMIT_PER_MIN`（默认 30）、`QUOTA_DAILY`（默认 500，上海时区自然日）
+
+## 清华经管校园知识库（2026-07-23 凌晨）
+
+### 数据来源与规模（44,332 条）
+- 经管手册 PDF 结构化切块 367 块（scripts/sem_handbook_ingest.py）
+- thubook 清华百科词条 133 块（scripts/thubook_ingest.py）
+- thucourse 课程 38,848 条（scripts/thucourse_crawler.py，2026-07 全量快照）
+- thucourse 课程点评 3,661 条 + 点评综合总结 1,323 条
+- 存储：SQLite `data/campus_kb.db`（约 93MB，gitignore 不入库），
+  中文检索（FTS/like 混合，见 agent/campus_kb.py）
+
+### 功能面
+- 2 个新工具：`search_campus_kb`（校园知识库检索）、
+  `get_course_review_summary`（课程点评综合总结：评分分布+代表性观点），
+  工具总数 30→32
+- 新意图 `campus_kb`：选课/课程评价/保研交换/校园生活类强信号单独命中即判，
+  与金融语境正交（agent/orchestrator.py）
+- 引用规范已写入 system_prompts（课程数据注明 thucourse 快照时间等）
+- 合并：与 B站登录态/舆情分布/快照同步线三方合并，两线功能全保留，
+  合并后全量 2264 → 2268 passed（本线 204 新测试 + 落位 4 测试）
+
+### 本地数据落位
+`cp campus_kb-v1-44332条.db data/campus_kb.db`（data/ 已 gitignore）
+
+### 生产端数据方案（快照随镜像，已落地）
+- railway CLI 不可用 → 采用"快照随镜像"：`assets/campus_kb.db.gz`
+  （gzip -9 约 30MB）随仓库提交进镜像
+- `scripts/docker-entrypoint.sh` 启动期调用 `scripts/ensure_campus_kb.py`（幂等）：
+  `$DATA_DIR/campus_kb.db` 缺失则从快照解压落位；已存在则保留（不覆盖用户数据）；
+  失败仅告警不阻塞主服务。环境变量 `CAMPUS_KB_ASSET` 可覆盖快照路径
+- 首次部署后生产端校园知识库即全量可用；已挂卷实例若卷上已有 db 则不会被覆盖
+
+### 已知限制
+- 点评总结为 fallback 确定性路径（按课程聚合评分分布+代表性观点），非 LLM 生成
+- thucourse 为 2026-07 快照，新学期课程/点评需重跑爬虫刷新
+  （scripts/thucourse_crawler.py + generate_course_summaries.py）
+- 快照更新流程：本地刷新 db → gzip -9 → 替换 assets/campus_kb.db.gz → push，
+  生产端需先删除卷上旧 db 才会重新落位

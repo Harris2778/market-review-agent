@@ -10,6 +10,10 @@ set -e
 
 chown -R agent:agent /data 2>/dev/null || true
 
+# 校园知识库落位（幂等）：卷上 db 缺失时从镜像内 gzip 快照解压，
+# 已存在则保留；失败不阻塞主服务（详见 scripts/ensure_campus_kb.py）。
+python scripts/ensure_campus_kb.py || true
+
 if command -v setpriv >/dev/null 2>&1; then
   exec setpriv --reuid=agent --regid=agent --clear-groups python main.py
 fi
