@@ -288,7 +288,8 @@ def test_search_english_case_insensitive(seeded_db):
 
 def test_search_multi_keyword_and_semantics(seeded_db):
     hits = kb.search_kb("选课 绩点", db_path=seeded_db)
-    assert {h["source_id"] for h in hits} == {"thucourse:review:9"}
+    # 严格 AND 命中排最前；宽松兜底可在其后补全部分命中条目
+    assert hits[0]["source_id"] == "thucourse:review:9"
 
 
 def test_search_source_filter(seeded_db):
@@ -449,3 +450,106 @@ def test_stats_missing_db_is_zero_without_error(tmp_path):
 def test_stats_uses_env_lazy_resolution(seeded_db):
     s = kb.stats()  # 不传 db_path，走 env 惰性解析
     assert s["total"] == 5
+
+
+# ── 检索质量：停用词规范化 + 宽松兜底 + 粘连长词扩词（2026-07-23 生产反馈修复）──
+
+
+def _seed_dorm_corpus(db):
+    """宿舍场景语料：快递页（含校名+宿舍楼字样）与宿舍介绍页（无校名字样）。"""
+    kb.upsert_entries([
+        make_entry(
+            source="thubook", source_id="thubook:express",
+            title="快递 - 大件物品采买与快递信息",
+            content="清华大学学生公寓快递地址：南区宿舍楼填清华大学学生公寓xx楼，紫荆公寓填清华大学紫荆公寓xx楼。",
+        ),
+        make_entry(
+            source="thubook", source_id="thubook:dorm",
+            title="宿舍介绍 - 南区",
+            content="南区宿舍为4人间上床下桌，无中厅，楼内有淋浴间与公共洗衣房。",
+        ),
+    ])
+
+
+def test_keywords_stopword_substring_strip():
+    """粘连问句的停用词子串剥离：『清华大学宿舍怎么样』→『宿舍』。"""
+    assert kb._keywords("清华大学宿舍怎么样") == ["宿舍"]
+    assert kb._keywords("保研怎么办？") == ["保研"]
+    assert kb._keywords("清华大学 宿舍") == ["宿舍"]
+
+
+def test_keywords_all_stopwords_fallback():
+    """查询全是停用词时回退未过滤词表，避免空查询。"""
+    assert kb._keywords("清华大学") == ["清华大学"]
+
+
+def test_keywords_punctuation_stripped():
+    assert kb._keywords("宿舍，食堂？") == ["宿舍", "食堂"]
+
+
+def test_search_noise_school_name_still_finds_dorm_page(db):
+    """生产事故复现：『清华大学 宿舍』曾只命中快递页，
+    宿舍介绍页因不含校名被严格 AND 误杀；修复后应排第一。"""
+    _seed_dorm_corpus(db)
+    rs = kb.search_kb("清华大学 宿舍", limit=5)
+    ids = [r["source_id"] for r in rs]
+    assert "thubook:dorm" in ids
+    assert ids[0] == "thubook:dorm"
+
+
+def test_search_fused_question_finds_dorm_page(db):
+    """无空格自然问句整串检索：『清华大学宿舍怎么样』。"""
+    _seed_dorm_corpus(db)
+    rs = kb.search_kb("清华大学宿舍怎么样", limit=5)
+    assert rs and rs[0]["source_id"] == "thubook:dorm"
+
+
+def test_relaxed_partial_match_fills_results(db):
+    """严格 AND 不足额时宽松 OR 补全，且多命中词文档排前。"""
+    kb.upsert_entries([
+        make_entry(
+            source="sem_handbook", source_id="h:both",
+            title="保研加分细则",
+            content="科研竞赛保研加分政策说明。",
+        ),
+        make_entry(
+            source="sem_handbook", source_id="h:one",
+            title="保研流程",
+            content="推免流程与时间安排。",
+        ),
+    ])
+    rs = kb.search_kb("保研 加分 不存在词xyz", limit=5)
+    ids = [r["source_id"] for r in rs]
+    assert ids[:2] == ["h:both", "h:one"]  # 命中 2 词的排前，1 词的兜底入选
+
+
+def test_relaxed_fused_long_word_bigram_expansion(db):
+    """粘连长词（≥5字纯中文）在宽松兜底中按二字组扩词召回。"""
+    kb.upsert_entries([
+        make_entry(
+            source="sem_handbook", source_id="h:baoyan",
+            title="保研手册 - 申请资格",
+            content="总评成绩排名与加分政策：科研竞赛加分计入综合成绩。",
+        ),
+    ])
+    rs = kb.search_kb("经管保研加分政策", limit=5)
+    assert any(r["source_id"] == "h:baoyan" for r in rs)
+
+
+def test_expand_relaxed_keywords_only_long_cjk():
+    assert "经管" in kb._expand_relaxed_keywords(["经管保研加分政策"])
+    # 短词与非纯中文词不扩
+    assert kb._expand_relaxed_keywords(["宿舍"]) == ["宿舍"]
+    assert kb._expand_relaxed_keywords(["GPA计算"]) == ["GPA计算"]
+
+
+def test_strict_and_still_preferred_over_partial(db):
+    """严格 AND 命中足够时不触发兜底排序变化。"""
+    kb.upsert_entries([
+        make_entry(source="thubook", source_id="t:both",
+                   title="选课与绩点", content="选课规则与绩点计算方式。"),
+        make_entry(source="thubook", source_id="t:one",
+                   title="选课简介", content="本科生选课阶段安排。"),
+    ])
+    rs = kb.search_kb("选课 绩点", limit=5)
+    assert rs[0]["source_id"] == "t:both"

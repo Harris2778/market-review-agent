@@ -248,13 +248,48 @@ def _clamp_limit(limit: Any) -> int:
     return max(LIMIT_MIN, min(LIMIT_MAX, n))
 
 
+# 查询停用词：对校园知识库零区分度的通用词与疑问词。
+# 整词命中剔除，长词子串剥离（如『清华大学宿舍怎么样』→『宿舍』）。
+_QUERY_STOPWORDS = {
+    "清华大学", "清华", "大学", "学校",
+    "怎么样", "如何", "吗", "呢", "好不好", "好吗", "请问",
+    "告诉我", "介绍一下", "是什么", "有没有", "哪里", "哪些", "怎么办", "咋样",
+}
+
+_TOKEN_PUNCT = "？?！!。，,．.、；;：:（）()【】[]「」\"'“”‘’"
+
+
 def _keywords(query: Any) -> List[str]:
-    """查询分词：按空白切多关键词（AND 语义），去空去重保序。"""
+    """查询分词：按空白切多关键词（AND 语义），去空去重保序。
+
+    规范化两步：① 标点剥离；② 停用词处理——整词即停用词的剔除，
+    长词内的停用词子串按长度降序剥离（中文自然问句常无空格，
+    如『清华大学宿舍怎么样』剥离后得『宿舍』）。全部剥光时回退
+    未过滤词表，避免空查询。
+    """
     text = _to_text(query)
     if not text:
         return []
+    raw: List[str] = []
+    for tok in re.split(r"\s+", text):
+        # 标点统一替换为空格（句中标点也能切词，如『宿舍，食堂？』）
+        tok = re.sub("[" + re.escape(_TOKEN_PUNCT) + "]", " ", tok)
+        for piece in tok.split():
+            if not piece:
+                continue
+            if piece in _QUERY_STOPWORDS:
+                raw.append(piece)
+                continue
+            for sw in sorted(_QUERY_STOPWORDS, key=len, reverse=True):
+                if sw in piece:
+                    piece = piece.replace(sw, " ")
+            for sub in piece.split():
+                if sub:
+                    raw.append(sub)
+    filtered = [p for p in raw if p not in _QUERY_STOPWORDS]
+    chosen = filtered or raw
     seen, out = set(), []
-    for kw in re.split(r"\s+", text):
+    for kw in chosen:
         if kw and kw not in seen:
             seen.add(kw)
             out.append(kw)
@@ -348,6 +383,78 @@ def _search_like(
     return [_row_to_entry(r, s) for s, r in scored[:limit]]
 
 
+def _expand_relaxed_keywords(keywords: List[str]) -> List[str]:
+    """宽松检索专用扩词：≥5 字符的纯中文长词追加非重叠二字组。
+
+    中文自然问句常无空格，停用词剥离后仍可能是粘连长词
+    （如『经管保研加分政策』），整词子串必然零命中；拆成
+    经管/保研/加分/政策 后 OR 语义即可召回。仅用于宽松兜底，
+    不影响严格 AND 路径的精确性。
+    """
+    out = list(keywords)
+    for kw in keywords:
+        if len(kw) >= 5 and all("一" <= ch <= "鿿" for ch in kw):
+            for i in range(0, len(kw) - 1, 2):
+                bigram = kw[i : i + 2]
+                if bigram not in out:
+                    out.append(bigram)
+    return out
+
+
+def _search_like_relaxed(
+    conn: sqlite3.Connection,
+    keywords: List[str],
+    source: str,
+    limit: int,
+    exclude_keys: set,
+) -> List[dict]:
+    """宽松兜底检索：任一关键词命中（OR 语义）即可入选，
+    按 (命中关键词数, 命中次数启发式分) 降序，剔除 exclude_keys 中已返回条目。
+
+    用于严格 AND 结果不足 limit 时补全——自然问句常带噪声词
+    （如『清华大学 宿舍』中的校名），严格 AND 会把最相关的文档误杀。
+    长中文粘连词先经 _expand_relaxed_keywords 扩成二字组再匹配。
+    """
+    keywords = _expand_relaxed_keywords(keywords)
+    where_parts: List[str] = []
+    params: list = []
+    if source:
+        where_parts.append("source = ?")
+        params.append(source)
+    or_parts: List[str] = []
+    for kw in keywords:
+        like = f"%{_escape_like(kw)}%"
+        or_parts.append("(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')")
+        params.extend([like, like])
+    if or_parts:
+        where_parts.append("(" + " OR ".join(or_parts) + ")")
+    where = " AND ".join(where_parts) if where_parts else "1=1"
+    rows = conn.execute(
+        f"SELECT * FROM {TABLE_NAME} WHERE {where}", params
+    ).fetchall()
+    scored = []
+    for r in rows:
+        title_l = (r["title"] or "").lower()
+        content_l = (r["content"] or "").lower()
+        hits = sum(
+            1 for kw in keywords if kw.lower() in title_l or kw.lower() in content_l
+        )
+        if hits == 0:
+            continue
+        s = _like_score(r["title"] or "", r["content"] or "", keywords)
+        scored.append((hits, s, r))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    out: List[dict] = []
+    for _, s, r in scored:
+        key = (r["source"], r["source_id"])
+        if key in exclude_keys:
+            continue
+        out.append(_row_to_entry(r, s))
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ── 公开 API ──
 
 
@@ -410,7 +517,11 @@ def search_kb(
 ) -> List[dict]:
     """检索知识条目：返回按相关度降序的条目字典列表（含 score 字段）。
 
-    - 多关键词空白分隔，AND 语义；中文子串匹配。
+    - 多关键词空白分隔，AND 语义；中文子串匹配。分词前做规范化：
+      标点剥离 + 校园通用词/疑问词停用词剔除（长词子串剥离，
+      如『清华大学宿舍怎么样』按『宿舍』检索）。
+    - 严格 AND 结果不足 limit 时，宽松 OR 兜底补全
+      （按命中关键词数排序），避免噪声词误杀相关文档。
     - FTS5+trigram 可用且关键词均 ≥3 字符时走 bm25 排序；
       否则自动降级 LIKE 命中次数启发式排序（对调用方透明）。
     - source 非空时精确过滤来源；limit 夹取 1-100。
@@ -431,12 +542,21 @@ def search_kb(
                 and _fts_table_exists(conn)
                 and all(len(kw) >= FTS_MIN_KEYWORD_CHARS for kw in keywords)
             )
+            results: Optional[List[dict]] = None
             if use_fts:
                 try:
-                    return _search_fts(conn, keywords, src, _clamp_limit(limit))
+                    results = _search_fts(conn, keywords, src, _clamp_limit(limit))
                 except sqlite3.Error as e:
                     logger.warning("FTS 检索失败（降级 LIKE）: %s", e)
-            return _search_like(conn, keywords, src, _clamp_limit(limit))
+            if results is None:
+                results = _search_like(conn, keywords, src, _clamp_limit(limit))
+            if len(results) < _clamp_limit(limit):
+                # 严格 AND 不足额：宽松 OR 兜底补全（已返回条目去重）
+                exclude = {(r["source"], r["source_id"]) for r in results}
+                results = results + _search_like_relaxed(
+                    conn, keywords, src, _clamp_limit(limit) - len(results), exclude
+                )
+            return results
         finally:
             conn.close()
     except sqlite3.Error as e:
