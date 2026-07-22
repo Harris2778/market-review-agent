@@ -26,10 +26,16 @@
 环境变量（可选 · 限流与每日配额）：
   RATE_LIMIT_PER_MIN  每分钟限流（默认 30，仅统计鉴权通过的 /v1/chat/completions 请求）
   QUOTA_DAILY         每日配额（默认 500，按 Asia/Shanghai 自然日重置）
+
+环境变量（可选 · 舆情快照同步）：
+  SOCIAL_DB_PATH      舆情快照库路径（默认 ${DATA_DIR:-data}/social.db，
+                      /v1/admin/sentiment/snapshots 的落库位置）
+  SNAPSHOT_BATCH_MAX  单次快照推送条数上限（默认 500，防爆）
 """
 
 import os
 import json
+import math
 import time
 import uuid
 import asyncio
@@ -71,6 +77,17 @@ except Exception:
     push_tasks = None
     _push_loaded = False
     logger.error("推送模块 agent.push 加载失败，定时推送将不可用", exc_info=True)
+
+# 舆情快照模块（agent.sentiment_aggregate）：import 失败只降级，
+# 快照接收端点照常可用（所有条目记入 failed），不影响主服务
+try:
+    from agent.sentiment_aggregate import save_snapshot as _save_snapshot
+except Exception:
+    _save_snapshot = None
+    logger.error(
+        "舆情快照模块 agent.sentiment_aggregate 加载失败，快照接收端点将全量记 failed",
+        exc_info=True,
+    )
 
 # ── 配置 ──
 
@@ -395,6 +412,108 @@ async def upload_reports_db(request: Request):
         raise HTTPException(status_code=500, detail=f"研报库写入失败：{e}")
     logger.info("研报库已更新 path=%s size=%d", path, len(body))
     return {"ok": True, "path": path, "size_bytes": len(body)}
+
+
+# ── 舆情快照接收端点（本地 Mac 每日抓取 → 推送生产实例落库）──
+
+_SNAPSHOT_BATCH_MAX = _env_int("SNAPSHOT_BATCH_MAX", 500)  # 单次推送快照条数上限
+
+# 快照中可强制转 float 的数值字段（缺省字段交给 save_snapshot 的默认值/映射逻辑）
+_SNAPSHOT_FLOAT_FIELDS = ("n", "pos", "neu", "neg", "w_pos", "w_neu", "w_neg")
+
+
+def _validate_snapshot(item) -> tuple:
+    """
+    校验并清洗单条快照。返回 (clean, reason)：
+    - 通过：clean 为可直接传给 save_snapshot 的 dict，reason 为 None；
+    - 失败：clean 为 None，reason 为失败原因字符串。
+
+    规则：platform/target/date 必填且为非空字符串；n/pos/neu/neg/w_pos/w_neu/w_neg
+    若提供必须可强制转为有限 float（bool/None/NaN/Inf/非数值字符串均判非法）。
+    """
+    if not isinstance(item, dict):
+        return None, "条目不是 JSON 对象"
+    missing = [
+        k for k in ("platform", "target", "date")
+        if not isinstance(item.get(k), str) or not item.get(k).strip()
+    ]
+    if missing:
+        return None, f"platform/target/date 必填且须为非空字符串（缺失/非法: {','.join(missing)}）"
+    clean = {k: item[k].strip() for k in ("platform", "target", "date")}
+    for k in _SNAPSHOT_FLOAT_FIELDS:
+        value = item.get(k)
+        if value is None:
+            continue  # 未提供：交给 save_snapshot 的默认/映射逻辑
+        if isinstance(value, bool):
+            return None, f"字段 {k} 须为数值，收到 bool"
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None, f"字段 {k} 无法强制转为数值: {value!r}"
+        if not math.isfinite(num):
+            return None, f"字段 {k} 不是有限数值: {value!r}"
+        clean[k] = num
+    return clean, None
+
+
+@app.post("/v1/admin/sentiment/snapshots", dependencies=[Depends(verify_api_key)])
+async def ingest_sentiment_snapshots(request: Request):
+    """
+    批量接收舆情快照并落库（需 Bearer 鉴权；与研报库管理端点一致，
+    不消耗限流与每日配额计数）。
+
+    请求体 {"snapshots": [快照dict, ...]}，每条经 _validate_snapshot 校验后调
+    agent.sentiment_aggregate.save_snapshot（幂等 INSERT OR REPLACE，
+    主键 platform+target+date，路径解析 db_path > env SOCIAL_DB_PATH >
+    ${DATA_DIR:-data}/social.db）。用途：舆情在本地 Mac 抓取打分，每日推送快照
+    到 Railway 生产实例供趋势查询。
+
+    - 逐条校验，非法条目记入 failed 不中断整批；
+    - 空列表合法（saved=0）；条数超过 SNAPSHOT_BATCH_MAX 整批 400 拒绝；
+    - 绝不抛 500：未预期异常兜底为 200 + failed 说明。
+    """
+    saved = 0
+    failed: list = []
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+        snapshots = body.get("snapshots") if isinstance(body, dict) else None
+        if not isinstance(snapshots, list):
+            raise HTTPException(
+                status_code=400,
+                detail='请求体须为 {"snapshots": [快照dict, ...]}，snapshots 为数组',
+            )
+        if len(snapshots) > _SNAPSHOT_BATCH_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"快照条数 {len(snapshots)} 超过上限 {_SNAPSHOT_BATCH_MAX}",
+            )
+        for i, item in enumerate(snapshots):
+            try:
+                clean, reason = _validate_snapshot(item)
+                if clean is None:
+                    failed.append({"index": i, "reason": reason})
+                    continue
+                if _save_snapshot is None:
+                    failed.append({"index": i, "reason": "快照模块未加载，无法落盘"})
+                    continue
+                if _save_snapshot(clean):
+                    saved += 1
+                else:
+                    failed.append({"index": i, "reason": "save_snapshot 落盘失败（返回 False）"})
+            except Exception as e:  # noqa: BLE001 - 单条未预期异常不中断整批
+                logger.error("快照条目处理异常 index=%d: %s", i, e, exc_info=True)
+                failed.append({"index": i, "reason": f"未预期异常: {e}"})
+        logger.info("舆情快照批量落库：saved=%d failed=%d", saved, len(failed))
+        return {"ok": True, "saved": saved, "failed": failed}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - 铁律：兜底为 200 + failed，绝不 500
+        logger.error("快照接收端点未预期异常（兜底 200）: %s", e, exc_info=True)
+        failed.append({"index": -1, "reason": f"服务端未预期异常: {e}"})
+        return {"ok": True, "saved": saved, "failed": failed}
 
 
 @app.post("/v1/chat/completions")
