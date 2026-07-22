@@ -243,3 +243,36 @@ class TestExistingKeysRegression:
         ):
             for w in BANNED_WORD_SAMPLE:
                 assert w in prompt, f"{name} 缺少禁用词 {w!r}"
+
+
+# ─────────────────────────────────────────────
+# 7. 拒答例外：研报观点整理转述不得套用拒答话术
+# ─────────────────────────────────────────────
+
+class TestReportQACarveOut:
+    """合规头「直接拒答」段必须含研报例外条款（2026-07-22 过度拒答修复）。
+
+    背景：用户问「白酒行业研报正文里券商对下半年需求怎么看」被误判为
+    「预测走势」触发拒答。例外条款明确：整理转述研报观点（含券商展望）
+    属于信息汇总，必须调用研报工具回答。
+    """
+
+    CARVE_OUT_PARTS = ("例外", "研报", "整理转述", "不得套用拒答话术")
+
+    def test_carve_out_in_compliance_prompt(self):
+        for part in self.CARVE_OUT_PARTS:
+            assert part in COMPLIANCE_PROMPT, f"合规头缺少拒答例外片段 {part!r}"
+
+    def test_carve_out_effective_in_all_intents(self):
+        """例外条款随合规头拼进所有 intent 的最终提示词。"""
+        for intent in (
+            "stock_query", "sector_deep_dive", "news_analysis",
+            "general_chat", "watchlist", "market_review", "news_only",
+        ):
+            p = get_system_prompt(intent)
+            for part in self.CARVE_OUT_PARTS:
+                assert part in p, f"intent={intent} 缺少拒答例外片段 {part!r}"
+
+    def test_refusal_wording_itself_intact(self):
+        """拒答话术本体不漂移（例外是新增条款，不改话术）。"""
+        assert "我无法提供投资操作建议、股价预测及标的推荐" in COMPLIANCE_PROMPT
