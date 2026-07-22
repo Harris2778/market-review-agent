@@ -287,11 +287,55 @@ SECTOR_NAME_MAP = {
 }
 
 
+# ── 社媒舆情 / 投资人格 意图关键词（高优先级，判定逻辑见 detect_intent）──
+
+# 强信号：单独命中即判 social_sentiment，无需市场语境
+_SOCIAL_STRONG_KEYWORDS = [
+    "股吧", "微博", "知乎", "抖音", "B站", "b站", "哔哩", "小红书",
+    "热搜", "热榜", "舆情", "舆论",
+]
+
+# 弱信号：需同时带市场语境（市场语境词或个股/行业实体）才判 social_sentiment
+_SOCIAL_WEAK_KEYWORDS = [
+    "情绪", "人气", "热度", "关注", "讨论", "评论",
+    "涨停", "跌停", "炸板", "打板", "连板",
+]
+
+# 投资人格/框架：需市场语境才判 persona
+_PERSONA_KEYWORDS = [
+    "价值投资", "成长投资", "趋势交易", "逆向投资",
+    "巴菲特", "格雷厄姆", "投资框架", "投资风格",
+]
+
+# 显式数据查询指令词：命中时保持旧 mcp_query 路由，不判 social_sentiment/persona
+# （防止抢走『今天涨停家数查询』等既有简单数据查询——宁可漏判，不可误判）
+_DATA_QUERY_COMMANDS = ("查询", "查一下", "帮我查", "列出", "列表", "排名")
+
+# 两意图的路由提示：process_message 接线时作为 hint 透传给 _agent_query，
+# 非空时以『【本问题路由提示】...』追加到 AGENT_QUERY_PROMPT 系统消息尾部
+_AGENT_ROUTE_HINTS = {
+    "social_sentiment": (
+        "【本问题路由提示】用户在问市场/个股的社媒舆情与情绪面，请优先使用舆情情绪类"
+        "工具取数：全市场或板块层面的情绪温度与涨跌停/连板结构用 get_market_sentiment；"
+        "个股人气与舆情用 get_stock_sentiment；社媒热榜/热搜用 get_social_hot；"
+        "指定平台（股吧/微博/知乎/抖音/B站）的内容搜索用 search_social_media。"
+        "按问题涉及的范围（全市场/板块/个股/指定平台）选择合适工具组合，"
+        "拿到数据后再组织回答，不要凭空描述舆情。"
+    ),
+    "persona": (
+        "【本问题路由提示】用户希望以特定投资人格/框架分析，请先调用 analyze_with_persona "
+        "获取对应投资框架，再按框架逐项调用数据工具取数分析，最后以该人格的视角成文。"
+    ),
+}
+
+
 def detect_intent(message: str) -> tuple[str, Optional[str]]:
     """
     意图识别。
     返回 (intent_type, sector_name_or_None)
-    intent_type: "market_review" | "sector_deep_dive" | "general_chat"
+    intent_type: "market_review" | "sector_deep_dive" | "social_sentiment"
+                 | "persona" | "watchlist" | "news_only" | "stock_query"
+                 | "futures_query" | "fund_query" | "mcp_query" | "general_chat"
     """
     msg = message.strip()
 
@@ -303,6 +347,24 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
         )
         if msg in ("自选", "自选股") or any(w in msg for w in wl_action_words):
             return ("watchlist", None)
+
+    # 社媒舆情 / 投资人格 高优先级意图（插在自选股判定之后、行业提取与复盘
+    # 关键词判定之前）。防误判红线：
+    #   1. 不含任何上述关键词的消息零影响（直接跳过本块，旧判定顺序语义不变）；
+    #   2. 含『复盘』二字的消息优先复盘，跳过本块（『今日复盘』必须仍走 market_review）；
+    #   3. 含显式数据查询指令词的消息保持旧 mcp_query 路由（『今天涨停家数查询』不被抢）；
+    #   4. 弱信号与 persona 关键词必须同时带市场语境（市场语境词或个股/行业实体）才判。
+    if "复盘" not in msg and not any(w in msg for w in _DATA_QUERY_COMMANDS):
+        if any(kw in msg for kw in _SOCIAL_STRONG_KEYWORDS):
+            return ("social_sentiment", None)
+        has_market_context = _count_entities(msg) >= 1 or any(
+            kw in msg for kw in _MARKET_CONTEXT_KEYWORDS
+        )
+        if has_market_context:
+            if any(kw in msg for kw in _SOCIAL_WEAK_KEYWORDS):
+                return ("social_sentiment", None)
+            if any(kw in msg for kw in _PERSONA_KEYWORDS):
+                return ("persona", None)
 
     # 先提取行业名（如果有的话，优先判定为板块聚焦）
     sector = _extract_sector(msg)
@@ -598,6 +660,38 @@ def _strip_md_symbols(text: str) -> str:
     if not text:
         return text or ""
     return text.translate(_MD_SYMBOLS_TRANSLATE)
+
+
+# ── [UNSOURCED] 泄漏双保险（复盘出口专属，_clean_markdown 被多处复用不动它）──
+
+_UNSOURCED_TOKEN = "[UNSOURCED]"
+_UNSOURCED_REPLACEMENT = "（数据未覆盖）"
+
+
+def _replace_unsourced(text: str) -> str:
+    """把残留的 [UNSOURCED] 标记替换为「（数据未覆盖）」。无标记时原样返回。"""
+    if not text:
+        return text or ""
+    return text.replace(_UNSOURCED_TOKEN, _UNSOURCED_REPLACEMENT)
+
+
+async def _replace_unsourced_stream(agen):
+    """流式 chunk 跨边界安全替换 [UNSOURCED]：每段与上一段保留的尾部拼接后替换，
+    并保留末尾 (len(token)-1) 个字符以防标记被拆到两个 chunk；流结束时冲刷尾部。
+    仅包在全市场复盘流式出口，其他流式路径不受影响。
+    """
+    hold = len(_UNSOURCED_TOKEN) - 1
+    tail = ""
+    async for piece in agen:
+        buf = _replace_unsourced(tail + piece)
+        if len(buf) > hold:
+            emit, tail = buf[:-hold], buf[-hold:]
+        else:
+            emit, tail = "", buf
+        if emit:
+            yield emit
+    if tail:
+        yield _replace_unsourced(tail)
 
 
 def _clean_markdown(text: str) -> str:
@@ -1043,6 +1137,15 @@ class MarketReviewAgent:
         if intent in ("general_chat", "sector_deep_dive") and _should_use_agent_query(user_message):
             return await self._agent_query(user_message, stream, history=history)
 
+        # 社媒舆情 / 投资人格高优先级意图：直接走 Agent 工具循环，并透传路由提示
+        # hint（追加到 AGENT_QUERY_PROMPT 系统消息尾部）。工具注册表未就绪或循环
+        # 异常时 _agent_query 内部仍降级 _chat，兜底链不变。
+        if intent in _AGENT_ROUTE_HINTS:
+            return await self._agent_query(
+                user_message, stream, history=history,
+                hint=_AGENT_ROUTE_HINTS[intent],
+            )
+
         if intent == "general_chat":
             return await self._chat(user_message, stream, history=history)
         elif intent == "market_review":
@@ -1277,18 +1380,22 @@ class MarketReviewAgent:
 
 {market_data}
 
-生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失标[UNSOURCED]。{history_note}"""
+生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失写「数据未覆盖」。{history_note}"""
 
         # 第四波：存档接入——流式走 _stream_response 结束回调，非流式在最终 content 产出后落档
         if stream:
-            return await self._call_llm(
+            gen = await self._call_llm(
                 system, user_prompt, stream,
                 archive_callback=self._stream_archive_callback(
                     "market_review", None, user_prompt, date_str
                 ),
             )
+            # 双保险：复盘出口专属的 [UNSOURCED] 残留清洗（流式跨 chunk 安全）
+            return _replace_unsourced_stream(gen)
         result = await self._call_llm(system, user_prompt, stream)
         if isinstance(result, dict):
+            # 双保险：复盘出口专属的 [UNSOURCED] 残留清洗（非流式）
+            result["content"] = _replace_unsourced(result.get("content", ""))
             self._archive_safe(
                 "market_review", None, result.get("content", ""), user_prompt, date_str
             )
@@ -1940,10 +2047,13 @@ class MarketReviewAgent:
     _TOOL_RESULT_MAX_CHARS = 3000  # 单条工具结果截断长度，防 context 膨胀
     _CRITIQUE_MIN_CHARS = 500    # 草稿不长于此长度时不做自我审查（成本护栏）
 
-    async def _agent_query(self, user_message: str, stream: bool, history: list = None):
+    async def _agent_query(self, user_message: str, stream: bool, history: list = None, hint: str = None):
         """
         Agent 工具调用循环（第二波）：模型自主决定调用哪些数据工具，多轮拿数后再成文。
         仅由 process_message 在复杂分析场景路由进入。
+        hint：可选路由提示（社媒舆情/投资人格等高优先级意图传入），非空时以
+        『【本问题路由提示】...』追加到 AGENT_QUERY_PROMPT 系统消息尾部，
+        引导模型优先选用对应工具；None 时系统消息与原来完全一致。
         兜底原则：工具注册表未就绪 / 任一轮异常 / 循环超轮 → 降级 _chat，绝不向上抛异常。
         """
         if not TOOL_REGISTRY or execute_tool is None or AGENT_QUERY_PROMPT is None:
@@ -1953,6 +2063,8 @@ class MarketReviewAgent:
         date_display = datetime.now().strftime("%Y年%m月%d日")
         date_str = datetime.now().strftime("%Y%m%d")  # 第四波存档用：agent_query 的 trade_date 取当前日期
         system = AGENT_QUERY_PROMPT + f"\n\n当前日期：{date_display}。"
+        if hint:
+            system = f"{system}\n\n{hint}"
         messages = [{"role": "system", "content": system}]
         messages.extend(_trim_history(history))  # 最多保留最近 10 轮（20 条）
         messages.append({"role": "user", "content": user_message})
