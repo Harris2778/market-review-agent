@@ -304,14 +304,14 @@ class TestReportContentPrompt:
 # 8. get_tool_catalog() 30 行 + 既有工具回归
 # ════════════════════════════════════════════════
 
-class TestToolCatalog30:
-    def test_catalog_30_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 30
+class TestToolCatalog32:
+    def test_catalog_32_lines(self):
+        assert len(tools_mod.TOOL_REGISTRY) == 32
         catalog = tools_mod.get_tool_catalog()
-        assert "共 30 个" in catalog
+        assert "共 32 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 30, (
-            f"目录应有 30 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 32, (
+            f"目录应有 32 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tool_in_short_desc_and_catalog(self):
@@ -337,11 +337,13 @@ class TestToolCatalog30:
             f"既有工具丢失：{existing - registered}"
         )
         # 新增工具：研报全文（v2）+ 第十二波开源灵感模块 4 个 + 社媒舆情 2 个
+        # + 校园知识库 2 个
         assert registered - existing == {
             "search_report_content",
             "get_market_sentiment", "get_stock_sentiment",
             "get_technical_analysis", "analyze_with_persona",
             "get_social_hot", "search_social_media",
+            "search_campus_knowledge", "get_course_review_summary",
         }
 
         # v1 研报工具分发路径不变（仍走 report_library）

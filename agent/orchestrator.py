@@ -307,6 +307,16 @@ _PERSONA_KEYWORDS = [
     "巴菲特", "格雷厄姆", "投资框架", "投资风格",
 ]
 
+# 校园知识库：选课/课程评价/保研交换/校园生活类，单独命中即判 campus_kb
+# （与金融语境正交，无需市场语境；插入位置与 social_sentiment 同块，
+#  含『复盘』或显式数据查询指令的消息保持旧路由——宁可漏判，不可误判）
+_CAMPUS_KB_KEYWORDS = [
+    "选课", "课程", "点评", "老师", "给分", "绩点",
+    "保研", "交换", "留学",
+    "转专业", "辅修", "奖学金",
+    "宿舍", "食堂", "校医院", "军训", "校园",
+]
+
 # 显式数据查询指令词：命中时保持旧 mcp_query 路由，不判 social_sentiment/persona
 # （防止抢走『今天涨停家数查询』等既有简单数据查询——宁可漏判，不可误判）
 _DATA_QUERY_COMMANDS = ("查询", "查一下", "帮我查", "列出", "列表", "排名")
@@ -326,6 +336,14 @@ _AGENT_ROUTE_HINTS = {
         "【本问题路由提示】用户希望以特定投资人格/框架分析，请先调用 analyze_with_persona "
         "获取对应投资框架，再按框架逐项调用数据工具取数分析，最后以该人格的视角成文。"
     ),
+    "campus_kb": (
+        "【本问题路由提示】用户在问清华校园相关问题（选课/课程评价/保研交换/校园生活等），"
+        "请优先使用校园知识库工具取数：选课手册、课程信息、书籍笔记等泛检索用 "
+        "search_campus_knowledge；某门课程的点评综合总结（评分分布/代表性观点）用 "
+        "get_course_review_summary。引用时遵守「校园知识库引用规范」：标注来源，"
+        "点评总结注明基于 N 条学生点评的自动摘要并提示信息时效，"
+        "不得把学生点评个例当作官方政策陈述。拿到数据后再组织回答，不要凭空描述校园信息。"
+    ),
 }
 
 
@@ -334,7 +352,7 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     意图识别。
     返回 (intent_type, sector_name_or_None)
     intent_type: "market_review" | "sector_deep_dive" | "social_sentiment"
-                 | "persona" | "watchlist" | "news_only" | "stock_query"
+                 | "persona" | "campus_kb" | "watchlist" | "news_only" | "stock_query"
                  | "futures_query" | "fund_query" | "mcp_query" | "general_chat"
     """
     msg = message.strip()
@@ -355,6 +373,10 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     #   3. 含显式数据查询指令词的消息保持旧 mcp_query 路由（『今天涨停家数查询』不被抢）；
     #   4. 弱信号与 persona 关键词必须同时带市场语境（市场语境词或个股/行业实体）才判。
     if "复盘" not in msg and not any(w in msg for w in _DATA_QUERY_COMMANDS):
+        # 校园知识库强信号：单独命中即判 campus_kb（校园语境与金融语境正交，
+        # 无需市场语境；同受复盘/数据查询指令护栏约束）
+        if any(kw in msg for kw in _CAMPUS_KB_KEYWORDS):
+            return ("campus_kb", None)
         if any(kw in msg for kw in _SOCIAL_STRONG_KEYWORDS):
             return ("social_sentiment", None)
         has_market_context = _count_entities(msg) >= 1 or any(

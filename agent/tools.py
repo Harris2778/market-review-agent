@@ -629,6 +629,67 @@ TOOL_REGISTRY: list = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_campus_knowledge",
+            "description": "检索清华校园知识库：选课手册、课程信息、学生课程点评/总结、"
+                           "thubook 书籍笔记的中文全文检索，返回带来源/标题/正文片段/"
+                           "链接/相关度的条目列表。用户问选课建议、课程信息、保研交换、"
+                           "转专业辅修、奖学金、宿舍食堂、校医院军训等校园问题时使用。"
+                           "某门课程的点评综合总结请用 get_course_review_summary。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索关键词（必填），如 选课、保研、转专业、"
+                                       "数据结构、宿舍。多关键词用空格分隔（AND 语义）。",
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["sem_handbook", "thucourse_course",
+                                 "thucourse_review", "thucourse_summary", "thubook"],
+                        "description": "来源过滤：sem_handbook=选课手册，"
+                                       "thucourse_course=课程信息，"
+                                       "thucourse_review=学生课程点评，"
+                                       "thucourse_summary=课程点评综合总结，"
+                                       "thubook=书籍笔记。缺省为全部来源。",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                        "description": "返回条目数，默认 5，最多 20。",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_course_review_summary",
+            "description": "获取指定课程的学生点评综合总结：平均评分、评分分布、点评条数、"
+                           "代表性观点与总结文本。优先取库内现成总结；没有时按课程聚合"
+                           "最多点评现场生成并回写知识库。用户问某门课怎么样、给分如何、"
+                           "老师教得好不好、值不值得选时使用。总结是往届学生经验的自动"
+                           "摘要，引用时须标注点评条数并提示时效。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "course_query": {
+                        "type": "string",
+                        "description": "课程名或课程关键词（必填），如 数据结构、"
+                                       "高等微积分、某教师姓名。",
+                    },
+                },
+                "required": ["course_query"],
+            },
+        },
+    },
 ]
 
 
@@ -1397,9 +1458,239 @@ _SOCIAL_IMPL = {
     "search_social_media": _handle_search_social_media,
 }
 
+
+# ── 校园知识库工具分发（campus_kb 检索层 / review_summary 总结层）──
+# 与 _SENTIMENT_IMPL 等查表模式一致：惰性解析、绝不抛异常、ok=False 中文降级。
+
+def _get_campus_kb_module():
+    """惰性解析 agent/campus_kb.py（校园知识库存储/检索层），失败返回 None。"""
+    return _lazy_import_module("campus_kb")
+
+
+def _get_review_summary_module():
+    """惰性解析 agent/review_summary.py（课程点评综合总结层），失败返回 None。"""
+    return _lazy_import_module("review_summary")
+
+
+# 知识库合法来源枚举（与 agent/campus_kb.py 全局契约一致）；
+# 非法 source 参数按 None 处理（不过滤来源），绝不报错
+_CAMPUS_KB_SOURCES = (
+    "sem_handbook", "thucourse_course", "thucourse_review",
+    "thucourse_summary", "thubook",
+)
+
+# 检索结果正文截断长度（防上下文爆炸）
+_CAMPUS_CONTENT_MAX = 500
+
+# 库为空/未建库时的中文指引（提示先运行回填脚本）
+_CAMPUS_EMPTY_GUIDANCE = (
+    "校园知识库为空或尚未建库：请先运行数据回填脚本——"
+    "scripts/sem_handbook_ingest.py（选课手册）、"
+    "scripts/thucourse_crawler.py（课程信息与学生点评）、"
+    "scripts/thubook_ingest.py（书籍笔记），"
+    "再运行 scripts/generate_course_summaries.py 生成课程点评总结，完成后重试。"
+)
+
+
+def _normalize_campus_source(value):
+    """source 参数归一：命中枚举原样返回，非法值/空值按 None（不限来源）处理。"""
+    src = _clean_str(value)
+    return src if src in _CAMPUS_KB_SOURCES else None
+
+
+def _parse_kb_metadata(entry) -> dict:
+    """条目 metadata_json 容错解析；任何失败返回 {}。绝不抛。"""
+    raw = entry.get("metadata_json") if isinstance(entry, dict) else None
+    if isinstance(raw, dict):  # 容忍直接给 dict 的调用方
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _campus_db_empty(kb) -> bool:
+    """库为空/未建库判定：stats().total == 0。stats 不可用或异常按非空处理
+    （空检索结果另行提示），绝不抛。"""
+    stats_fn = getattr(kb, "stats", None)
+    if not callable(stats_fn):
+        return False
+    try:
+        st = stats_fn()
+    except Exception:  # noqa: BLE001 - 探测失败绝不抛出
+        return False
+    return isinstance(st, dict) and st.get("total") == 0
+
+
+def _handle_search_campus_knowledge(args: dict) -> dict:
+    """search_campus_knowledge 处理器：关键词检索 + 正文截断 + 空库指引。"""
+    query = _clean_str(args.get("query"))
+    if not query:
+        raise _ParamError("query 不能为空：请输入要检索的校园知识关键词")
+    kb = _get_campus_kb_module()
+    if kb is None:
+        return {"ok": False, "query": query,
+                "note": "校园知识库模块不可用（agent/campus_kb.py 未就绪）"}
+    search_fn = getattr(kb, "search_kb", None)
+    if not callable(search_fn):
+        return {"ok": False, "query": query,
+                "note": "校园知识库检索接口不可用（search_kb 未实现）"}
+    source = _normalize_campus_source(args.get("source"))
+    limit = _clamp_int(args.get("limit"), 5, 1, 20)
+    results = search_fn(query, source=source, limit=limit)
+    if not isinstance(results, list):
+        results = []
+    if not results:
+        if _campus_db_empty(kb):
+            return {"ok": False, "query": query, "source": source,
+                    "note": _CAMPUS_EMPTY_GUIDANCE}
+        return {"ok": True, "query": query, "source": source, "results": [],
+                "note": "校园知识库中未检索到相关条目，可换关键词或去掉来源过滤重试"}
+    slim = []
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        slim.append({
+            "source": str(entry.get("source") or ""),
+            "title": str(entry.get("title") or ""),
+            "content": str(entry.get("content") or "")[:_CAMPUS_CONTENT_MAX],
+            "url": str(entry.get("url") or ""),
+            "score": entry.get("score"),
+        })
+    return {
+        "ok": True,
+        "query": query,
+        "source": source,
+        "results": slim,
+        "note": "正文为检索片段（截断至 500 字），引用时请按来源规范标注出处",
+    }
+
+
+def _summary_from_cached_entry(entry) -> dict:
+    """现成 thucourse_summary 条目 → 工具返回结构（结构化字段取 metadata_json）。"""
+    meta = _parse_kb_metadata(entry)
+    return {
+        "ok": True,
+        "course_title": str(meta.get("course_title") or entry.get("title") or ""),
+        "sqid": str(meta.get("course_sqid") or ""),
+        "summary_text": str(entry.get("content") or ""),
+        "rating_avg": meta.get("rating_avg"),
+        "rating_dist": meta.get("rating_dist")
+                       if isinstance(meta.get("rating_dist"), dict) else {},
+        "review_count": meta.get("review_count", 0),
+        "highlights": meta.get("highlights")
+                      if isinstance(meta.get("highlights"), list) else [],
+        "method": meta.get("method") or "cached",
+        "note": "命中库内现成的点评综合总结",
+    }
+
+
+def _handle_get_course_review_summary(args: dict) -> dict:
+    """get_course_review_summary 处理器：现成总结优先，miss 时按课程聚合
+    最多点评现场生成并回写知识库，双 miss 给中文提示。"""
+    course_query = _clean_str(args.get("course_query"))
+    if not course_query:
+        raise _ParamError("course_query 不能为空：请输入课程名或课程关键词")
+    kb = _get_campus_kb_module()
+    if kb is None:
+        return {"ok": False, "course_query": course_query,
+                "note": "校园知识库模块不可用（agent/campus_kb.py 未就绪）"}
+    search_fn = getattr(kb, "search_kb", None)
+    if not callable(search_fn):
+        return {"ok": False, "course_query": course_query,
+                "note": "校园知识库检索接口不可用（search_kb 未实现）"}
+
+    # 1) 现成总结优先
+    summaries = search_fn(course_query, source="thucourse_summary", limit=3)
+    if isinstance(summaries, list) and summaries:
+        top = summaries[0]
+        if isinstance(top, dict):
+            return _summary_from_cached_entry(top)
+
+    # 2) 无现成总结：取点评按 course_sqid 分组，现场生成
+    reviews = search_fn(course_query, source="thucourse_review", limit=50)
+    reviews = ([r for r in reviews if isinstance(r, dict)]
+               if isinstance(reviews, list) else [])
+    if not reviews:
+        if _campus_db_empty(kb):
+            return {"ok": False, "course_query": course_query,
+                    "note": _CAMPUS_EMPTY_GUIDANCE}
+        return {
+            "ok": False,
+            "course_query": course_query,
+            "note": f"校园知识库中未找到「{course_query}」相关的课程点评或总结，"
+                    "可换课程名/教师名重试；若库尚未回填课程数据，"
+                    "请先运行 scripts/thucourse_crawler.py 与 "
+                    "scripts/generate_course_summaries.py。",
+        }
+    groups: dict = {}
+    for r in reviews:
+        sqid = str(_parse_kb_metadata(r).get("course_sqid") or "").strip() or "unknown"
+        groups.setdefault(sqid, []).append(r)
+    sqid, group = max(groups.items(), key=lambda kv: len(kv[1]))
+    meta0 = _parse_kb_metadata(group[0])
+    course_title = str(meta0.get("course_title")
+                       or group[0].get("title") or course_query)
+
+    rs = _get_review_summary_module()
+    summarize = getattr(rs, "summarize_course_reviews", None) if rs is not None else None
+    if not callable(summarize):
+        return {"ok": False, "course_title": course_title, "sqid": sqid,
+                "note": "点评总结模块不可用（agent/review_summary.py 未就绪）；"
+                        f"库内共有 {len(group)} 条该课程原始点评，"
+                        "可改用 search_campus_knowledge 检索原文"}
+    summary = summarize(course_title, group)
+    if not isinstance(summary, dict):
+        return {"ok": False, "course_title": course_title, "sqid": sqid,
+                "note": "点评总结生成失败（返回结构异常）"}
+
+    # 回写知识库（best-effort：失败不影响本次返回，仅记 note）
+    notes = [f"库内无现成总结，基于 {len(group)} 条点评现场生成"]
+    build_entry = getattr(rs, "build_summary_entry", None)
+    upsert_fn = getattr(kb, "upsert_entries", None)
+    if callable(build_entry) and callable(upsert_fn):
+        try:
+            entry = build_entry(sqid, course_title, summary)
+            written = upsert_fn([entry])
+            if isinstance(written, int) and written > 0:
+                notes[0] += "并已回写知识库"
+            else:
+                notes.append("总结回写知识库未生效（不影响本次返回）")
+        except Exception as e:  # noqa: BLE001 - 回写失败绝不影响返回
+            logger.warning("课程总结回写知识库失败: %s", e)
+            notes.append(f"总结回写知识库失败（不影响本次返回）: {e}")
+    else:
+        notes.append("回写接口不可用，总结未落库（不影响本次返回）")
+
+    return {
+        "ok": True,
+        "course_title": course_title,
+        "sqid": sqid,
+        "summary_text": str(summary.get("summary_text") or ""),
+        "rating_avg": summary.get("rating_avg"),
+        "rating_dist": summary.get("rating_dist")
+                       if isinstance(summary.get("rating_dist"), dict) else {},
+        "review_count": summary.get("review_count", len(group)),
+        "highlights": summary.get("highlights")
+                      if isinstance(summary.get("highlights"), list) else [],
+        "method": summary.get("method") or "fallback",
+        "notes": notes,
+    }
+
+
+# 校园知识库工具名 → 处理器（agent/campus_kb.py 检索层 + agent/review_summary.py 总结层）
+_CAMPUS_KB_IMPL = {
+    "search_campus_knowledge": _handle_search_campus_knowledge,
+    "get_course_review_summary": _handle_get_course_review_summary,
+}
+
 # 开源灵感模块工具汇总表：execute_tool 查表顺序追加在最后
 # （_REPORT_VEC_IMPL → _REPORT_IMPL → _IMPL → _ANALYSIS_IMPL），不改旧条目
-_ANALYSIS_IMPL = {**_SENTIMENT_IMPL, **_TECH_IMPL, **_PERSONA_IMPL, **_SOCIAL_IMPL}
+_ANALYSIS_IMPL = {**_SENTIMENT_IMPL, **_TECH_IMPL, **_PERSONA_IMPL, **_SOCIAL_IMPL,
+                  **_CAMPUS_KB_IMPL}
 
 
 def _clamp_int(value, default: int, lo: int, hi: int) -> int:
@@ -1554,6 +1845,8 @@ _SHORT_DESC = {
     "analyze_with_persona": "投资人格方法论框架（价值/成长/趋势/逆向）",
     "get_social_hot": "社媒热榜舆情（微博/知乎/抖音/B站+情感分布+股票关联）",
     "search_social_media": "社媒关键词搜索（B站+可选评论+情感分布+股票关联）",
+    "search_campus_knowledge": "清华校园知识库检索（手册/课程/点评/书籍笔记）",
+    "get_course_review_summary": "课程点评综合总结（评分分布+代表性观点）",
 }
 
 
