@@ -1,0 +1,7 @@
+# 研报库 v2 向量检索轻量后端（生产容器用）
+# fastembed = onnxruntime 版嵌入推理，无 torch 依赖（约百 MB vs torch 2GB+），
+# 与 requirements-rag.txt 的 sentence-transformers 同模型（BAAI/bge-small-zh-v1.5
+# ONNX 转换版），输出 512 维 L2 归一向量，跨后端余弦检索兼容（实测 2026-07-22）。
+# 职责划分：本地 Mac 用 sentence-transformers 建索引；生产容器只需查询时嵌入
+# 用户 query，装本文件即可。代码均为构造时惰性导入，主服务与全部测试不依赖。
+fastembed>=0.8,<1

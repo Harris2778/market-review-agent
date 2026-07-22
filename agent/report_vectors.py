@@ -248,15 +248,60 @@ class BgeEmbedder:
         return [[float(x) for x in row] for row in np.asarray(arr, dtype=np.float32)]
 
 
-def _default_embedder() -> Optional[Any]:
-    """惰性构造生产 Embedder；依赖缺失/模型不可下载等任何异常返回 None。"""
-    try:
-        return BgeEmbedder()
-    except Exception as e:
-        logger.warning(
-            "BgeEmbedder 构造失败（缺依赖或模型不可下载，按不可用降级）: %s", e
+class FastembedEmbedder:
+    """轻量生产 Embedder：fastembed/onnxruntime 版 BAAI/bge-small-zh-v1.5。
+
+    与 BgeEmbedder 同模型（ONNX 转换），512 维 L2 归一输出，与
+    sentence-transformers 构建的索引余弦兼容（实测 2026-07-22：跨后端检索
+    score 正常、命中一致）。无 torch 依赖（onnxruntime 约百 MB vs torch 2GB+），
+    适合生产容器（Railway/Render）。fastembed 只在构造时惰性导入。
+
+    环境变量：
+    - REPORT_FASTEMBED_MODEL：模型 ID 覆盖（默认 BAAI/bge-small-zh-v1.5）；
+    - REPORT_FASTEMBED_CACHE：模型缓存目录（生产镜像构建期预下载到该目录，
+      运行期零网络；不设则 fastembed 用默认 ~/.cache）。
+    """
+
+    def __init__(self, model: str = "", dim: int = 512):
+        from fastembed import TextEmbedding  # 惰性导入：仅构造时
+
+        model = (
+            model
+            or os.environ.get("REPORT_FASTEMBED_MODEL")
+            or "BAAI/bge-small-zh-v1.5"
         )
-        return None
+        cache_dir = os.environ.get("REPORT_FASTEMBED_CACHE") or None
+        kwargs = {"cache_dir": cache_dir} if cache_dir else {}
+        self.name = f"fastembed:{model}"
+        self.dim = int(dim)
+        self._model = TextEmbedding(model, **kwargs)
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        vecs = self._model.embed(list(texts or []))
+        return [
+            [float(x) for x in np.asarray(v, dtype=np.float32)] for v in vecs
+        ]
+
+
+def _default_embedder() -> Optional[Any]:
+    """惰性构造生产 Embedder；所有后端均不可用时返回 None（降级检索）。
+
+    后端选择：REPORT_EMBED_BACKEND=st|fastembed|auto（默认 auto）。
+    auto 顺序：sentence-transformers（本地索引构建机全量后端）
+    → fastembed（生产容器轻量后端）。未知值按 auto 处理。
+    """
+    backend = (os.environ.get("REPORT_EMBED_BACKEND") or "auto").strip().lower()
+    chain = {
+        "st": (BgeEmbedder,),
+        "fastembed": (FastembedEmbedder,),
+    }.get(backend, (BgeEmbedder, FastembedEmbedder))
+    for cls in chain:
+        try:
+            return cls()
+        except Exception as e:  # noqa: BLE001 - 逐后端降级
+            logger.info("Embedder 后端不可用（%s）: %s", cls.__name__, e)
+    logger.warning("所有 Embedder 后端均不可用，向量检索按不可用降级")
+    return None
 
 
 def _degraded(note: str) -> Dict[str, Any]:
@@ -470,7 +515,7 @@ def search_vectors(
             embedder = _default_embedder()
             if embedder is None:
                 return _degraded(
-                    "向量模型不可用：请安装 sentence-transformers，"
+                    "向量模型不可用：请安装 sentence-transformers 或 fastembed，"
                     "或显式传入 embedder（如 FakeEmbedder）"
                 )
 
