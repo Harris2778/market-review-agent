@@ -18,3 +18,7 @@ yfinance>=0.2.50
 # Data Processing
 pandas>=2.2.0
 python-dotenv>=1.0.0
+beautifulsoup4>=4.12.0
+
+# Report PDF Parsing (研报库 v2 全文层；实测 1.28.0 在 Python 3.14 可装可用)
+pymupdf>=1.24

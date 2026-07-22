@@ -1,0 +1,13 @@
+# 研报库 v2 RAG 向量检索可选依赖
+# 注意：sentence-transformers 会连带安装 torch（体积大，约 2GB+），
+# 仅 v2 向量检索（agent/report_vectors.py 的 BgeEmbedder）需要；
+# 代码均为构造时惰性导入，未安装时自动降级 FakeEmbedder/返回中文指引，
+# 主服务与全部测试不依赖本文件。生产环境按需选装：
+#   pip install -r requirements-rag.txt
+# 若默认 pip 索引（镜像）找不到包，改用官方源（实测 2026-07-22 必要）：
+#   pip install -i https://pypi.org/simple -r requirements-rag.txt
+sentence-transformers>=3.0
+# 国内环境 huggingface.co 不可达时的模型下载通道：
+#   python -c "from modelscope import snapshot_download; snapshot_download('BAAI/bge-small-zh-v1.5')"
+# 然后把 REPORT_EMBED_MODEL 环境变量设为打印出的本地路径（BgeEmbedder 自动读取）。
+modelscope>=1.25

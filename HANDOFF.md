@@ -1,4 +1,4 @@
-# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复，路线图全部完成）
+# 项目交接文档（2026-07-22 更新，第六/七波 + 新闻模式三问题修复 + 输出卫生/MCP兜底修复 + 研报库v1/v2全文RAG/每日自动化落地，路线图全部完成）
 
 > 本文档记录当前开发状态，新会话/新协作者从这里开始读。
 
@@ -102,7 +102,7 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
 🔧 输出卫生 + MCP 兜底修复（计划外插入，已完成）
 ```
 
-路线图七波全部完成。后续方向：研报库工作线（另线进行）/ 生产挂卷后问责数据积累 / LLM judge 实现。
+路线图七波全部完成。研报库 v1 + v2 全文 RAG + 每日自动化均已落地（见下文专项记录）。后续方向：全量全文回填 / 生产挂卷后问责数据积累 / LLM judge 实现。
 
 **新闻模式三问题修复（2026-07-22，后续记录）**
 
@@ -231,9 +231,87 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
   与数字保真约束（逐项抄 item_value，宁少勿假）。
 - 实测：回答数字与智研真实值逐项吻合（2024 营收 7.119亿+12.15%、
   2025 EPS 4.484 等）。测试 902 passed 全绿。
+**研报库 v1（2026-07-22，新工作线落地）**
+
+能力：用户问行业/个股时，Agent 循环自主调用研报工具回答券商观点——观点聚合
+（评级分布+目标价区间+EPS 均值）、共识与分歧、逐篇「券商+日期+评级」溯源。
+施工图纸：docs/RESEARCH_LIB_DESIGN.md（含全部数据源实测规格，v2/v3 分期见原文）。
+
+- scripts/report_crawler.py 多源爬虫：ReportSource 抽象 + 东财 reportapi(主)/
+  慧博列表/证券之星/洞见 四源；限速 ≤1req/s+随机抖动（可注入）、GBK/GB2312
+  显式编码、单源失败记 warning 不拖垮整体；http_get/upsert/sleep 均可注入；
+  CLI：--days N（默认 1）/--sources/--rate/--db-path/--verbose
+- agent/report_library.py 存储+检索层：init_db/upsert_reports/search_reports/
+  rating_summary；SQLite schema=图纸+source 列（老库自动 ALTER 补列）；
+  upsert 按 info_code 去重（东财用 infoCode 原值，他源 sha1(title+org+date)[:16]），
+  冲突合并=空缺回填+源优先级（eastmoney>stockstar>djyanbao>sina>hibor）；
+  空库/无库返回 total=0 合法结构绝不抛出
+- agent/tools.py 新增 search_research_reports / get_rating_summary：经
+  _REPORT_IMPL 映射 + _get_report_library() 惰性解析接入 execute_tool，
+  既有 21 工具零改动；stock_code 兼容 sh600519/600519（去前缀归一）
+- agent/system_prompts.py AGENT_QUERY_PROMPT 插入「## 研报引用规范」一节
+  （标注券商+日期+评级 / 评级目标价EPS只用工具返回 / 先共识后分歧 /
+  未覆盖明说「研报库暂未覆盖」不得编造）
+- 测试：新增 67 用例（library 21 + crawler 25 + tools 21），全 mock 零网络，
+  全量 969 passed 全绿
+- 回填实测（2026-07-22，90 天）：总量 9961 篇——东财 9182 / 慧博 946(去重后 237)/
+  证券之星 364 / 洞见 198；评级非空 5401、个股研报 3055、目标价非空 236
+- E2E 实测：工具层查询约 3ms（≪3s）；真实 LLM 问「券商最近怎么看贵州茅台」
+  30s 出稿——评级分布+目标价+逐篇溯源+局限说明齐备
+- v2 已落地（见下节）；encode_url 仍入库备用
+
+**研报库 v2 全文 RAG + 每日自动化（2026-07-22，同日落地）**
+
+能力：search_report_content(query, stock_code, industry, days, top_k) 语义检索
+研报正文段落（bge-small-zh-v1.5 中文向量，512 维本地模型），回答可引用原文观点。
+
+- scripts/report_fulltext.py 全文层：东财 PDF（infoCode 直链
+  H3_{infoCode}_1.pdf——⚠️ 不是 encodeUrl：encodeUrl 含 / 时原样拼 404、
+  quote 后 Tomcat 400 双死路，2026-07-22 实测定案）+ 新浪网页全文
+  （vReport_Show 详情页分节正文，GB2312；标题匹配含短标题三约束）；
+  EO_Bot 挑战求解留作兜底；表 report_fulltext(info_code PK, source,
+  fulltext, sections_json, fetched_at)；PDF 内存解析用完即弃；
+  CLI --days/--limit/--db-path/--verbose
+- agent/report_vectors.py：chunk_report(≤500字/块重叠50) + Embedder 协议
+  （FakeEmbedder 测试零网络 / BgeEmbedder 构造时惰性导入 sentence_transformers）
+  + numpy 暴力余弦（表 report_chunks/report_embeddings/vector_meta，与
+  reports 同库）+ build_index（幂等跳过/force 重建）+ search_vectors
+  （JOIN reports 过滤，异常降级返 note 绝不抛）
+- 模型获取：huggingface.co 与 hf-mirror 本机实测均不可达 → 走 ModelScope：
+  snapshot_download('BAAI/bge-small-zh-v1.5')，REPORT_EMBED_MODEL 环境变量
+  指向本地路径（BgeEmbedder 解析序：显式参数 > 该 env > HF 默认 ID）；
+  依赖安装：pip install -i https://pypi.org/simple -r requirements-rag.txt
+  （默认镜像源实测缺 sentence-transformers；含 torch 约 2GB + modelscope）
+- agent/tools.py：search_report_content 经 _REPORT_VEC_IMPL 接入（查表序
+  _REPORT_VEC_IMPL → _REPORT_IMPL → _IMPL）；AGENT_QUERY_PROMPT 研报引用
+  规范追加第 5/6 条（正文引用标注券商+日期+标题；只用工具返回段落）
+- scripts/daily_report_update.sh 每日增量统一入口（PYTHON_BIN/天数参数/
+  REPORTS_DB_PATH/WITH_FULLTEXT=1 可选全文链；macOS bash 3.2 兼容）
+- .github/workflows/report_crawler.yml：cron "23 13 * * *"（北京 21:23）+
+  workflow_dispatch + concurrency 防重叠；年周 cache 滚动 reports.db +
+  artifact 保留 7 天 + schedule 失败自动建 issue（label report-crawler）；
+  零 secret（数据源全免费）
+- 测试：+89 用例（fulltext 38 + vectors 21 + content_tool 20 + workflow 10，
+  含 test_report_tools 连锁改 23→24），全量 1058 passed 全绿
+- 真实 E2E（2026-07-22）：全文抓取 8 候选 7 入库（东财 PDF 7 篇，1 篇新浪
+  未收录正确跳过）；bge 建索引 7 篇 160 块；工具层语义检索「AI 算力产业链
+  观点」命中算力过剩/资本开支相关段落（score 0.62+）排序合理
 
 ## 已知问题
 
+- 东财 PDF 的 EO_Bot 挑战兜底求解未端到端复验（infoCode 直链实测直 200 未触发）；
+  若未来直链也触发挑战且 cookie 重载失效，东财全文通道退化（warning 可观测，新浪兜底）
+- pdf.dfcfw.com 调试期间对该 IP 触发过 400 级限流（约 10 分钟自愈）；每日低频无碍
+- 部分 PDF 分节退化为单节「正文」（券商模板节名未覆盖），只影响分块粒度不影响检索
+- 向量检索为 numpy 暴力余弦，万块级毫秒；10 万+ 块再考虑 sqlite-vec/分桶
+- 全量 90 天全文回填未跑（限速下载约 1~3 小时）；当前索引为近 3 天小批量验证
+- GH Actions 工作流未经真实 GitHub 环境验证（YAML 结构已断言）；首次触发后核对
+  issue 告警链路与 cache 命中日志；年周缓存键存在周内回滚窗口（upsert 幂等可控）
+- 研报跨源同报告可能各存一条（东财 infoCode vs 他源 sha1 合成码，标题实测一致）；
+  v2 可加标题+日期指纹辅助索引做跨源合并
+- 洞见 API 匿名单查询上限约 250 条且列表非日期序，增量出货率低（定位=个股索引补源）
+- 东财 qType=3（宏观）实测近 30 天恒 hits=0 疑似下线，保留遍历每轮多 1 次请求
+- 慧博/证券之星列表记录 industry 留空（页面无结构化行业字段），避免污染行业检索
 - Tushare news 接口无权限（积分不足），新闻池 tushare 源恒为空，已安全降级
   （进程级 denied 标记短路：首次命中权限错误后本进程不再调用，不白耗配额）
 - 新浪智研 3 个接口权限不足 + swSymbolList 服务端 bug（新浪侧，不可修）
@@ -254,6 +332,9 @@ tests/                     895 个测试，全 mock 零网络（ARCHIVE_DIR/CHAR
 必填：`DEEPSEEK_API_KEY`、`AGENT_API_KEY`
 推荐：`TUSHARE_TOKEN`、`FINNHUB_API_KEY`、`FRED_API_KEY`、`SINA_MCP_TOKEN`
 持久化：`DATA_DIR`（根目录，缺省 data；Railway 挂卷设 /data）、
-  `ARCHIVE_DIR`/`CHART_DIR`/`WATCHLIST_PATH`（显式设置优先于 DATA_DIR 推导）
+  `ARCHIVE_DIR`/`CHART_DIR`/`WATCHLIST_PATH`/`REPORTS_DB_PATH`（显式设置优先于
+  DATA_DIR 推导；研报库缺省 ${DATA_DIR:-data}/reports.db）
+研报库v2：`REPORT_EMBED_MODEL`（bge 模型本地路径或 HF ID，缺省 HF 默认；
+  国内 huggingface.co 不可达时用 ModelScope 下载后设本地路径）
 推送：`PUSH_WEBHOOK_URL`（未配置只生成不发送）、`PUSH_TIME`（默认 15:40 上海，工作日）
 配额：`RATE_LIMIT_PER_MIN`（默认 30）、`QUOTA_DAILY`（默认 500，上海时区自然日）

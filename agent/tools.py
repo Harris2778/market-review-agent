@@ -6,7 +6,9 @@
   供 DeepSeek function calling 自主选择调用
 - execute_tool 统一分发执行，绝不抛异常：
   成功返回 {"ok": True, "data": ...}，失败返回 {"ok": False, "error": "中文错误说明"}
-- 数据层函数缺失（改名/未实现）时返回 ok=False，而不是 ImportError
+- 分发三映射表：研报全文向量检索工具先查 _REPORT_VEC_IMPL（report_vectors 向量检索层），
+  研报库工具查 _REPORT_IMPL（report_library 存储/检索层），其余数据工具查 _IMPL（data_fetcher 数据层）
+- 数据层/研报库函数缺失（改名/未实现）时返回 ok=False，而不是 ImportError
 - 内部同步调用，编排层负责放线程池
 """
 
@@ -41,6 +43,45 @@ _SYMBOL_PARAM = {
     "type": "string",
     "description": "股票代码，A股需带交易所前缀小写（如 sh600519、sz000002），"
                    "港股如 hk00700，美股小写如 aapl。",
+}
+
+# ── 研报库工具共享片段 ──
+
+_REPORT_STOCK_CODE_PARAM = {
+    "type": "string",
+    "description": "A 股股票代码，支持带交易所前缀（如 sh600519、sz000002）"
+                   "或纯 6 位代码（如 600519），系统会自动去前缀归一。",
+}
+
+_REPORT_INDUSTRY_PARAM = {
+    "type": "string",
+    "description": "行业名（如 食品饮料、电子、半导体），按行业检索/聚合研报时使用。",
+}
+
+_REPORT_DAYS_PARAM = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 365,
+    "default": 30,
+    "description": "回溯最近多少天的研报，默认 30，最大 365。",
+}
+
+# ── 研报全文向量检索工具共享片段（研报库 v2）──
+
+_REPORT_VEC_DAYS_PARAM = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 365,
+    "default": 90,
+    "description": "回溯最近多少天的研报正文，默认 90，最大 365。",
+}
+
+_REPORT_VEC_TOP_K_PARAM = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 10,
+    "default": 5,
+    "description": "返回最相关的正文段落条数，默认 5，最多 10。",
 }
 
 
@@ -332,6 +373,82 @@ TOOL_REGISTRY: list = [
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_research_reports",
+            "description": "检索券商研报库：按关键词、个股或行业查询近期券商研究报告，"
+                           "返回研报标题、券商、日期、评级、目标价、盈利预测（EPS）等。"
+                           "用户询问券商研报观点、目标价、盈利预测、某只股票/某个行业有哪些研报覆盖时使用。"
+                           "注意：query、stock_code、industry 三个检索条件至少提供一个，"
+                           "全部留空会返回参数错误。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索关键词，匹配研报标题/股票名称/券商名，如 茅台、半导体、中金。",
+                    },
+                    "stock_code": _REPORT_STOCK_CODE_PARAM,
+                    "industry": _REPORT_INDUSTRY_PARAM,
+                    "days": _REPORT_DAYS_PARAM,
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                        "description": "返回研报条数，按日期倒序，默认 10，最多 50。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_rating_summary",
+            "description": "聚合券商评级观点：统计指定个股或行业近期研报的评级分布"
+                           "（买入/增持/中性等各多少篇）、目标价区间、平均盈利预测与最新研报列表。"
+                           "用户问「券商最近怎么看某只股票/某个行业」、比较多家券商的共识与分歧时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stock_code": _REPORT_STOCK_CODE_PARAM,
+                    "industry": _REPORT_INDUSTRY_PARAM,
+                    "days": _REPORT_DAYS_PARAM,
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_report_content",
+            "description": "研报正文全文检索：按问题/主题对券商研报正文做向量语义检索，"
+                           "返回最相关的正文段落（含券商、日期、研报标题、章节、相关度）。"
+                           "用户问研报观点细节、券商的论证逻辑、多家券商观点分歧的原因，"
+                           "或需要引用研报正文原文时使用。"
+                           "只要评级/目标价等元数据时用 search_research_reports，"
+                           "本工具只在需要正文内容时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索问题或主题（必填），如 "
+                                       "「茅台的渠道改革进展」「半导体国产替代的逻辑」。",
+                    },
+                    "stock_code": _REPORT_STOCK_CODE_PARAM,
+                    "industry": _REPORT_INDUSTRY_PARAM,
+                    "days": _REPORT_VEC_DAYS_PARAM,
+                    "top_k": _REPORT_VEC_TOP_K_PARAM,
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -354,6 +471,51 @@ def _get_data_fetcher():
                 return data_fetcher
             except ImportError:
                 logger.warning("data_fetcher 模块导入失败", exc_info=True)
+                return None
+
+
+def _get_report_library():
+    """延迟导入研报库存储/检索层，导入失败返回 None（不让 ImportError 冒到编排层）。
+
+    report_library 由研报库工作线独立交付，tools 只按公开函数契约
+    （search_reports / rating_summary）接线，模块缺失时优雅降级。
+    """
+    try:
+        from . import report_library
+        return report_library
+    except ImportError:
+        try:
+            from agent import report_library
+            return report_library
+        except ImportError:
+            try:
+                import report_library  # 同目录已加入 sys.path 的场景
+                return report_library
+            except ImportError:
+                logger.warning("report_library 模块导入失败", exc_info=True)
+                return None
+
+
+def _get_report_vectors():
+    """延迟导入研报全文向量检索层，导入失败返回 None（不让 ImportError 冒到编排层）。
+
+    report_vectors 由研报库 v2 向量检索工作线独立交付，tools 只按公开函数契约
+    （search_vectors，全局契约第 5 条）接线；模块缺失或重依赖
+    （sentence_transformers/torch）未安装时优雅降级。
+    """
+    try:
+        from . import report_vectors
+        return report_vectors
+    except ImportError:
+        try:
+            from agent import report_vectors
+            return report_vectors
+        except ImportError:
+            try:
+                import report_vectors  # 同目录已加入 sys.path 的场景
+                return report_vectors
+            except ImportError:
+                logger.warning("report_vectors 模块导入失败", exc_info=True)
                 return None
 
 
@@ -404,6 +566,91 @@ _IMPL = {
 }
 
 
+# ── 研报库工具分发（report_library 存储/检索层，研报库工作线交付）──
+
+class _ParamError(Exception):
+    """工具参数适配器抛出的参数错误：dispatch 统一转成 ok=False 中文提示。"""
+
+
+def _clean_str(value) -> str:
+    """字符串参数清洗：None/非字符串归空串，去首尾空白。"""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _normalize_stock_code(code) -> str:
+    """个股代码归一：去交易所前缀（sh/sz/bj，大小写不敏感）。
+
+    合法输入（sh600519 / SZ000002 / 600519）返回 6 位纯数字代码；
+    空值或清洗后非 6 位纯数字时返回空串（交由检索层按空条件处理，
+    绝不抛异常）。
+    """
+    c = _clean_str(code).lower()
+    for prefix in ("sh", "sz", "bj"):
+        if c.startswith(prefix):
+            c = c[len(prefix):]
+            break
+    return c if len(c) == 6 and c.isdigit() else ""
+
+
+def _search_reports_kwargs(_rl, a: dict) -> dict:
+    """search_research_reports 参数适配：归一个股代码、夹取 days(1-365)/limit(1-50)。
+
+    query / stock_code / industry 三个检索条件全空时抛 _ParamError，
+    dispatch 转成 ok=False 中文提示（schema 无必填项，此处做运行时校验）。
+    """
+    query = _clean_str(a.get("query"))
+    stock_code = _normalize_stock_code(a.get("stock_code"))
+    industry = _clean_str(a.get("industry"))
+    if not (query or stock_code or industry):
+        raise _ParamError("检索条件不足：query / stock_code / industry 至少提供一个检索条件")
+    return {
+        "query": query,
+        "stock_code": stock_code,
+        "industry": industry,
+        "days": _clamp_int(a.get("days"), 30, 1, 365),
+        "limit": _clamp_int(a.get("limit"), 10, 1, 50),
+    }
+
+
+def _rating_summary_kwargs(_rl, a: dict) -> dict:
+    """get_rating_summary 参数适配：归一个股代码、夹取 days(1-365)。"""
+    return {
+        "stock_code": _normalize_stock_code(a.get("stock_code")),
+        "industry": _clean_str(a.get("industry")),
+        "days": _clamp_int(a.get("days"), 30, 1, 365),
+    }
+
+
+# 研报库工具名 → (report_library 函数名, 参数适配器(module, args) -> kwargs)
+# 结构与 _IMPL 一致；execute_tool 先查本表再查 _IMPL
+_REPORT_IMPL = {
+    "search_research_reports": ("search_reports", _search_reports_kwargs),
+    "get_rating_summary":      ("rating_summary", _rating_summary_kwargs),
+}
+
+
+# ── 研报全文向量检索工具分发（report_vectors 向量检索层，研报库 v2 交付）──
+
+def _search_vectors_kwargs(_rv, a: dict) -> dict:
+    """search_report_content 参数适配：归一个股代码、夹取 days(1-365 默认 90)、
+    top_k(1-10 默认 5)。query 必填由 schema required + 运行时必填校验兜底。
+    db_path / embedder 走检索层默认（惰性路径解析 / FakeEmbedder 降级）。"""
+    return {
+        "query": _clean_str(a.get("query")),
+        "stock_code": _normalize_stock_code(a.get("stock_code")),
+        "industry": _clean_str(a.get("industry")),
+        "days": _clamp_int(a.get("days"), 90, 1, 365),
+        "top_k": _clamp_int(a.get("top_k"), 5, 1, 10),
+    }
+
+
+# 研报全文工具名 → (report_vectors 函数名, 参数适配器(module, args) -> kwargs)
+# 结构与 _REPORT_IMPL 一致；execute_tool 查表顺序：本表 → _REPORT_IMPL → _IMPL
+_REPORT_VEC_IMPL = {
+    "search_report_content": ("search_vectors", _search_vectors_kwargs),
+}
+
+
 def _clamp_int(value, default: int, lo: int, hi: int) -> int:
     """整数参数兜底：非法值用默认值，并夹在 [lo, hi] 区间。"""
     try:
@@ -437,7 +684,7 @@ def execute_tool(name: str, args: dict) -> dict:
     统一分发执行工具，绝不抛异常。
 
     返回 {"ok": True, "data": ...} 或 {"ok": False, "error": "中文错误说明"}。
-    内部同步调用数据层，编排层如需并发请自行放线程池。
+    内部同步调用数据层/研报库，编排层如需并发请自行放线程池。
     """
     # 模型有时把 arguments 序列化成字符串，兼容一下
     if isinstance(args, str):
@@ -448,7 +695,11 @@ def execute_tool(name: str, args: dict) -> dict:
     if not isinstance(args, dict):
         return {"ok": False, "error": f"工具参数必须是对象，收到 {type(args).__name__}"}
 
-    impl = _IMPL.get(name)
+    # 查表顺序：研报全文向量 _REPORT_VEC_IMPL → 研报库 _REPORT_IMPL → 数据层 _IMPL；
+    # 三表都不命中才报未注册
+    vec_impl = _REPORT_VEC_IMPL.get(name)
+    report_impl = _REPORT_IMPL.get(name)
+    impl = vec_impl or report_impl or _IMPL.get(name)
     if not impl:
         return {"ok": False, "error": f"未注册的工具：{name}"}
     fetcher_name, arg_builder = impl
@@ -459,19 +710,38 @@ def execute_tool(name: str, args: dict) -> dict:
     if missing:
         return {"ok": False, "error": f"缺少必填参数：{', '.join(missing)}"}
 
-    # 数据层函数可能改名/未实现：getattr 保护，不抛 ImportError/AttributeError
-    df = _get_data_fetcher()
-    if df is None:
-        return {"ok": False, "error": "数据采集模块不可用"}
-    fetcher = getattr(df, fetcher_name, None)
+    # 后端函数可能改名/未实现：getattr 保护，不抛 ImportError/AttributeError
+    if vec_impl:
+        backend = _get_report_vectors()
+        if backend is None:
+            return {"ok": False, "error": "研报全文模块不可用"}
+    elif report_impl:
+        backend = _get_report_library()
+        if backend is None:
+            return {"ok": False, "error": "研报库模块不可用"}
+    else:
+        backend = _get_data_fetcher()
+        if backend is None:
+            return {"ok": False, "error": "数据采集模块不可用"}
+    fetcher = getattr(backend, fetcher_name, None)
     if not callable(fetcher):
-        logger.warning("数据层函数不存在或不可调用：%s（工具 %s）", fetcher_name, name)
-        return {"ok": False, "error": f"数据接口暂不可用（{fetcher_name} 未实现）"}
+        logger.warning("后端模块函数不存在或不可调用：%s（工具 %s）", fetcher_name, name)
+        if vec_impl:
+            kind = "研报全文接口"
+        else:
+            kind = "研报库接口" if report_impl else "数据接口"
+        return {"ok": False, "error": f"{kind}暂不可用（{fetcher_name} 未实现）"}
 
     try:
-        kwargs = arg_builder(df, args)
+        kwargs = arg_builder(backend, args)
         data = fetcher(**kwargs)
+        # 研报全文检索降级信号：hits 为空且带 note 说明索引未建/依赖缺失等，
+        # 按全局契约第 6 条转成 ok=False 并原样透传 note
+        if vec_impl and isinstance(data, dict) and not data.get("hits") and data.get("note"):
+            return {"ok": False, "error": _clean_str(data.get("note"))}
         return {"ok": True, "data": _json_safe(data)}
+    except _ParamError as e:
+        return {"ok": False, "error": str(e)}
     except Exception as e:
         logger.warning("工具执行失败 name=%s fetcher=%s", name, fetcher_name, exc_info=True)
         return {"ok": False, "error": f"工具执行出错：{e}"}
@@ -501,6 +771,9 @@ _SHORT_DESC = {
     "get_global_indices": "全球主要指数行情",
     "get_china_macro": "中国宏观数据（CPI/PMI/M2 等）",
     "get_us_macro": "美国宏观数据（美债/VIX 等）",
+    "search_research_reports": "券商研报检索（评级/目标价/盈利预测）",
+    "get_rating_summary": "券商评级聚合（评级分布/目标价区间）",
+    "search_report_content": "研报正文全文检索（观点细节/论证逻辑）",
 }
 
 

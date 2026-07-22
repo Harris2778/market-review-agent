@@ -32,6 +32,7 @@ FAKE_ENV = {
     # 存档/图表目录隔离到 tmp，防止测试往真实 data/archive 与 charts 写垃圾
     "ARCHIVE_DIR": "/tmp/market_review_agent_test_archive",
     "CHART_DIR": "/tmp/market_review_agent_test_charts",
+    "REPORTS_DB_PATH": "/tmp/market_review_agent_test_reports.db",
 }
 
 for _key, _value in FAKE_ENV.items():
