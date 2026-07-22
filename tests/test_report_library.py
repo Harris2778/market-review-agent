@@ -307,8 +307,21 @@ def test_search_industry_like(db):
     ])
     result = rl.search_reports(industry="食品")
     assert result["total"] == 2
+    assert "note" not in result  # 正常命中不带回退说明
     assert rl.search_reports(industry="电子")["total"] == 1
-    assert rl.search_reports(industry="不存在的行业")["total"] == 0
+
+
+def test_search_industry_fallback_on_zero_hit(db):
+    """行业过滤零命中：回退为不限行业检索并带 note（检索类安全，聚合类不回退）。"""
+    rl.init_db()
+    rl.upsert_reports([
+        make_record(info_code="IC-F1", industry="食品饮料"),
+        make_record(info_code="IC-E1", industry="电子", stock_code="002475",
+                    stock_name="立讯精密", title="电子行业点评"),
+    ])
+    result = rl.search_reports(industry="不存在的行业")
+    assert result["total"] == 2
+    assert "行业过滤「不存在的行业」无命中" in result["note"]
 
 
 def test_search_query_matches_title_stock_name_org(db):

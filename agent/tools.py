@@ -55,7 +55,12 @@ _REPORT_STOCK_CODE_PARAM = {
 
 _REPORT_INDUSTRY_PARAM = {
     "type": "string",
-    "description": "行业名（如 食品饮料、电子、半导体），按行业检索/聚合研报时使用。",
+    "description": (
+        "行业名过滤。库内为申万风格行业名（如 白酒Ⅱ、非白酒、电池、半导体、"
+        "汽车零部件、证券Ⅱ、IT服务Ⅱ），通俗叫法（如 食品饮料、白酒）常无命中。"
+        "不确定时建议留空；检索类工具在行业过滤无命中时会自动回退为不限行业"
+        "并在 note 字段说明。"
+    ),
 }
 
 _REPORT_DAYS_PARAM = {

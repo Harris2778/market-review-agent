@@ -578,16 +578,20 @@ def search_vectors(
             if ind:
                 where.append("r.industry LIKE ? ESCAPE '\\'")
                 params.append(f"%{report_library._escape_like(ind)}%")
-            sql = (
-                "SELECT c.chunk_id, c.info_code, c.section, c.text, e.vector, "
-                "r.title, r.org, r.publish_date, r.rating "
-                f"FROM {CHUNKS_TABLE} c "
-                f"JOIN {EMBEDDINGS_TABLE} e ON e.chunk_id = c.chunk_id "
-                "JOIN reports r ON r.info_code = c.info_code "
-                f"WHERE {' AND '.join(where)}"
-            )
+
+            def _query_rows(w: List[str], p: List[Any]):
+                sql = (
+                    "SELECT c.chunk_id, c.info_code, c.section, c.text, e.vector, "
+                    "r.title, r.org, r.publish_date, r.rating "
+                    f"FROM {CHUNKS_TABLE} c "
+                    f"JOIN {EMBEDDINGS_TABLE} e ON e.chunk_id = c.chunk_id "
+                    "JOIN reports r ON r.info_code = c.info_code "
+                    f"WHERE {' AND '.join(w)}"
+                )
+                return conn.execute(sql, p).fetchall()
+
             try:
-                rows = conn.execute(sql, params).fetchall()
+                rows = _query_rows(where, params)
                 total_chunks = conn.execute(
                     f"SELECT COUNT(*) AS n FROM {CHUNKS_TABLE}"
                 ).fetchone()["n"]
@@ -596,6 +600,26 @@ def search_vectors(
                 return _degraded(
                     "研报向量索引尚未建立：请先运行全文采集与 build_index"
                 )
+
+            # 行业过滤零命中回退：库内行业名为申万风格（如 白酒Ⅱ），
+            # 通俗叫法（如 食品饮料）常全空——去掉行业过滤重查并标注，
+            # 避免模型在空结果上无限换词重试（检索类结果逐条可见行业，回退安全）。
+            fallback_note = ""
+            if not rows and ind:
+                where_fb = ["r.publish_date >= date('now', ?)"]
+                params_fb: List[Any] = [f"-{_clamp_days(days)} days"]
+                if code:
+                    where_fb.append("r.stock_code = ?")
+                    params_fb.append(code)
+                try:
+                    rows = _query_rows(where_fb, params_fb)
+                except sqlite3.Error:
+                    rows = []
+                if rows:
+                    fallback_note = (
+                        f"行业过滤「{ind}」无命中，已回退为不限行业检索"
+                        "（命中研报的行业可能与所问不同，引用时请核对条目自身行业）"
+                    )
         finally:
             conn.close()
 
@@ -633,7 +657,8 @@ def search_vectors(
                     "score": round(score, 4),
                 }
             )
-        return {"total_chunks": total_chunks, "hits": hits}
+        return {"total_chunks": total_chunks, "hits": hits,
+                **({"note": fallback_note} if fallback_note else {})}
     except Exception as e:
         logger.warning("search_vectors 异常（fail-safe）: %s", e, exc_info=True)
         return _degraded(f"向量检索失败：{e}")

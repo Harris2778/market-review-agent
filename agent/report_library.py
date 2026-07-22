@@ -443,6 +443,11 @@ def search_reports(
     按 publish_date DESC、created_at DESC 排序；limit 夹取 1-50；
     total 为过滤条件命中总数（不受 limit 截断）。
     库文件不存在/无表/空库/异常时返回 total=0 的合法结构，绝不抛出。
+
+    行业过滤回退：industry 非空且过滤后 total=0 时，自动去掉行业过滤重查；
+    有命中则结果带 note 说明「行业过滤「X」无命中，已回退为不限行业检索」
+    （库内行业名为申万风格如 白酒Ⅱ，通俗叫法如 食品饮料 常无命中；
+    检索类结果逐条可见行业，回退安全——聚合类 rating_summary 故意不做此回退）。
     """
     try:
         path = _db_path(db_path)
@@ -455,12 +460,28 @@ def search_reports(
             total = conn.execute(
                 f"SELECT COUNT(*) AS n FROM {TABLE_NAME} WHERE {where}", params
             ).fetchone()["n"]
+            note = ""
+            if total == 0 and _to_text(industry):
+                where_fb, params_fb = _build_filters(stock_code, "", query, days)
+                total_fb = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {TABLE_NAME} WHERE {where_fb}",
+                    params_fb,
+                ).fetchone()["n"]
+                if total_fb > 0:
+                    where, params, total = where_fb, params_fb, total_fb
+                    note = (
+                        f"行业过滤「{_to_text(industry)}」无命中，"
+                        "已回退为不限行业检索（命中条目的行业可能与所问不同）"
+                    )
             rows = conn.execute(
                 f"SELECT * FROM {TABLE_NAME} WHERE {where} "
                 f"ORDER BY publish_date DESC, created_at DESC LIMIT ?",
                 (*params, lim),
             ).fetchall()
-            return {"total": total, "reports": [_row_to_item(r) for r in rows]}
+            out = {"total": total, "reports": [_row_to_item(r) for r in rows]}
+            if note:
+                out["note"] = note
+            return out
         finally:
             conn.close()
     except sqlite3.Error as e:

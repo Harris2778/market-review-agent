@@ -372,17 +372,30 @@ def test_search_stock_code_prefix_filter(db):
 
 
 def test_search_industry_filter(db):
-    """industry LIKE %..% 过滤；LIKE 通配符注入不改变语义。"""
+    """industry LIKE %..% 过滤；无命中自动回退为不限行业并带 note。"""
     _seed_search_corpus(db)
     res = rv.search_vectors(
         "研报", industry="电子", db_path=db, embedder=rv.FakeEmbedder()
     )
     assert {h["info_code"] for h in res["hits"]} == {"IC-B"}
-    # 注入 % 通配符：按字面匹配，命中为零而非全表
+    assert "note" not in res  # 正常命中不带回退说明
+
+
+def test_search_industry_fallback_on_zero_hit(db):
+    """行业过滤零命中：回退为不限行业检索，note 说明回退（LIKE 转义仍生效）。"""
+    _seed_search_corpus(db)
+    # 库内不存在的行业名 → 直接过滤为空 → 回退后命中全部
+    res = rv.search_vectors(
+        "研报", industry="白酒Ⅱ", db_path=db, embedder=rv.FakeEmbedder()
+    )
+    assert len(res["hits"]) == 3
+    assert "行业过滤「白酒Ⅱ」无命中" in res["note"]
+    # 注入 % 通配符：按字面匹配直接命中为零（转义生效），随后回退
     res2 = rv.search_vectors(
         "研报", industry="%", db_path=db, embedder=rv.FakeEmbedder()
     )
-    assert res2["hits"] == []
+    assert len(res2["hits"]) == 3
+    assert "无命中" in res2["note"]  # note 存在即证明直接过滤是零命中（转义成功）
 
 
 def test_search_days_filter(db):
