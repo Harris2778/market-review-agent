@@ -162,11 +162,37 @@ def test_db_path_env_used_when_no_param(db):
 
 def test_db_path_default_under_project_data(monkeypatch):
     monkeypatch.delenv(kb.CAMPUS_KB_DB_PATH_ENV, raising=False)
+    monkeypatch.delenv(kb.DATA_DIR_ENV, raising=False)
     path = kb._db_path()
     assert path.endswith(os.path.join("data", "campus_kb.db"))
     assert os.path.dirname(os.path.dirname(path)) == os.path.dirname(
         os.path.dirname(os.path.abspath(kb.__file__))
     )
+
+
+def test_db_path_data_dir_absolute_used(monkeypatch, tmp_path):
+    """DATA_DIR 为绝对路径（如 Railway 卷 /data）时直接使用。"""
+    monkeypatch.delenv(kb.CAMPUS_KB_DB_PATH_ENV, raising=False)
+    monkeypatch.setenv(kb.DATA_DIR_ENV, str(tmp_path))
+    path = kb._db_path()
+    assert path == str(tmp_path / "campus_kb.db")
+    kb.init_db()  # 惰性解析落库到 DATA_DIR
+    assert os.path.isfile(path)
+
+
+def test_db_path_data_dir_relative_resolves_under_project(monkeypatch):
+    monkeypatch.delenv(kb.CAMPUS_KB_DB_PATH_ENV, raising=False)
+    monkeypatch.setenv(kb.DATA_DIR_ENV, "custom_data")
+    path = kb._db_path()
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(kb.__file__)))
+    assert path == os.path.join(project_root, "custom_data", "campus_kb.db")
+
+
+def test_db_path_env_beats_data_dir(monkeypatch, tmp_path):
+    """CAMPUS_KB_DB_PATH 优先级高于 DATA_DIR。"""
+    monkeypatch.setenv(kb.CAMPUS_KB_DB_PATH_ENV, str(tmp_path / "env.db"))
+    monkeypatch.setenv(kb.DATA_DIR_ENV, str(tmp_path / "other"))
+    assert kb._db_path() == str(tmp_path / "env.db")
 
 
 # ── upsert ──

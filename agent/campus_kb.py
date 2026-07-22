@@ -11,7 +11,8 @@
 
 存储契约（与全局契约一致）：
 - 路径解析：显式 db_path 参数 > CAMPUS_KB_DB_PATH 环境变量 >
-  <项目根>/data/campus_kb.db；env 一律调用时惰性读取，禁止 import 时定死。
+  ${DATA_DIR:-data}/campus_kb.db（DATA_DIR 相对项目根，绝对路径直接用）；
+  env 一律调用时惰性读取，禁止 import 时定死。
 - 表 kb_entries：source TEXT、source_id TEXT、title TEXT、content TEXT、
   url TEXT、metadata_json TEXT、updated_at TEXT，
   PRIMARY KEY(source, source_id)，重复 upsert 全字段覆盖。
@@ -38,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 CAMPUS_KB_DB_PATH_ENV = "CAMPUS_KB_DB_PATH"
+DATA_DIR_ENV = "DATA_DIR"
 DB_FILENAME = "campus_kb.db"
 
 # 项目根 = agent/ 的上一级（本文件位于 <项目根>/agent/campus_kb.py）
@@ -117,14 +119,17 @@ _FTS_SUPPORTED: Optional[bool] = None
 def _db_path(db_path: Optional[str] = None) -> str:
     """库文件路径解析（调用时惰性读 env）：
 
-    显式参数 > CAMPUS_KB_DB_PATH 环境变量 > <项目根>/data/campus_kb.db。
+    显式参数 > CAMPUS_KB_DB_PATH 环境变量 > ${DATA_DIR:-data}/campus_kb.db。
+    DATA_DIR 为相对路径时相对项目根解析，绝对路径（如 Railway 卷 /data）直接使用
+    ——与 report_library 的路径语义对齐。
     """
     if isinstance(db_path, str) and db_path.strip():
         return db_path.strip()
     env_path = os.getenv(CAMPUS_KB_DB_PATH_ENV)
     if env_path and env_path.strip():
         return env_path.strip()
-    return os.path.join(_PROJECT_ROOT, "data", DB_FILENAME)
+    data_dir = (os.getenv(DATA_DIR_ENV) or "").strip() or "data"
+    return os.path.join(_PROJECT_ROOT, data_dir, DB_FILENAME)
 
 
 def _connect_write(path: str) -> sqlite3.Connection:
