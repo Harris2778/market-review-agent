@@ -309,12 +309,28 @@ _PERSONA_KEYWORDS = [
 
 # 校园知识库：选课/课程评价/保研交换/校园生活类，单独命中即判 campus_kb
 # （与金融语境正交，无需市场语境；插入位置与 social_sentiment 同块，
-#  含『复盘』或显式数据查询指令的消息保持旧路由——宁可漏判，不可误判）
+#  含『复盘』或金融信号词的消息让位金融路由——宁可漏判，不可误判）
 _CAMPUS_KB_KEYWORDS = [
-    "选课", "课程", "点评", "老师", "给分", "绩点",
-    "保研", "交换", "留学",
-    "转专业", "辅修", "奖学金",
-    "宿舍", "食堂", "校医院", "军训", "校园",
+    # 学业与课程
+    "选课", "课程", "这门课", "点评", "老师", "给分", "绩点", "GPA", "gpa",
+    "必修", "培养方案", "考核", "学分", "考试", "期末", "作业", "难吗",
+    "开课", "开的课", "开课单位", "值得选", "成绩", "课表",
+    # 升学与发展
+    "保研", "考研", "读研", "读博", "深造", "PhD", "phd", "出国",
+    "交换", "留学", "留学生", "国际生", "国际学生", "转专业", "辅修",
+    "奖学金", "实习", "加注", "导师", "四六级", "勤工",
+    # 校园生活
+    "宿舍", "紫荆", "几人间", "食堂", "校医院", "军训", "校园", "校内",
+    "体测", "自习", "校园卡", "快递", "新生", "入学", "报到", "图书馆",
+    "校历", "放假", "学费", "住宿费", "社团", "志愿者", "体育馆", "游泳",
+    "体育课", "清华",
+]
+
+# 金融强信号词：与校园关键词共现时让位金融路由
+# （防『清华系持股』『某基金会捐赠』类金融消息被校园路由劫持）
+_FINANCE_STRONG_KEYWORDS = [
+    "股", "板块", "大盘", "基金", "期货", "债", "行情", "涨停", "跌停",
+    "资金流", "市值", "估值", "K线", "北向", "指数", "ETF",
 ]
 
 # 显式数据查询指令词：命中时保持旧 mcp_query 路由，不判 social_sentiment/persona
@@ -343,8 +359,36 @@ _AGENT_ROUTE_HINTS = {
         "get_course_review_summary。引用时遵守「校园知识库引用规范」：标注来源，"
         "点评总结注明基于 N 条学生点评的自动摘要并提示信息时效，"
         "不得把学生点评个例当作官方政策陈述。拿到数据后再组织回答，不要凭空描述校园信息。"
+        "检索结果不理想时，可用 source 参数按来源分源重试"
+        "（sem_handbook/thubook/thucourse_course/thucourse_summary），"
+        "或换同义关键词多次检索，不要一次检索无果就放弃。"
     ),
 }
+
+
+def _campus_fallback_hit(message: str) -> bool:
+    """general_chat 校园兜底探针：用原始消息检索校园知识库，
+    top1 条目命中 ≥2 个不同关键词（含长词二字组扩词）则改道 campus_kb。
+
+    关键词路由白名单无法穷尽自然问法（『紫荆公寓是几人间』『想出国读研读博』），
+    漏判会让 LLM 在无工具路径凭空编造。此探针以检索命中做二次确认：
+    金融/闲聊消息在校园库中几乎零命中，不会误判。
+    任何异常返回 False——绝不抛出，闲聊路径零影响。
+    """
+    try:
+        from agent import campus_kb
+        kws = campus_kb._expand_relaxed_keywords(campus_kb._keywords(message))
+        if not kws:
+            return False
+        results = campus_kb.search_kb(message, limit=1)
+        if not results:
+            return False
+        top = results[0]
+        text = ((top.get("title") or "") + (top.get("content") or "")).lower()
+        hits = sum(1 for kw in kws if kw.lower() in text)
+        return hits >= 2
+    except Exception:
+        return False
 
 
 def detect_intent(message: str) -> tuple[str, Optional[str]]:
@@ -372,11 +416,13 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
     #   2. 含『复盘』二字的消息优先复盘，跳过本块（『今日复盘』必须仍走 market_review）；
     #   3. 含显式数据查询指令词的消息保持旧 mcp_query 路由（『今天涨停家数查询』不被抢）；
     #   4. 弱信号与 persona 关键词必须同时带市场语境（市场语境词或个股/行业实体）才判。
-    if "复盘" not in msg and not any(w in msg for w in _DATA_QUERY_COMMANDS):
-        # 校园知识库强信号：单独命中即判 campus_kb（校园语境与金融语境正交，
-        # 无需市场语境；同受复盘/数据查询指令护栏约束）
+    # 校园强信号单独前置：不受数据查询指令词护栏约束（『成绩排名多少才能保研』
+    # 含『排名』仍须判 campus_kb），但金融信号词共现时让位（『清华系持股』不被劫持）。
+    has_finance_signal = any(w in msg for w in _FINANCE_STRONG_KEYWORDS)
+    if "复盘" not in msg and not has_finance_signal:
         if any(kw in msg for kw in _CAMPUS_KB_KEYWORDS):
             return ("campus_kb", None)
+    if "复盘" not in msg and not any(w in msg for w in _DATA_QUERY_COMMANDS):
         if any(kw in msg for kw in _SOCIAL_STRONG_KEYWORDS):
             return ("social_sentiment", None)
         has_market_context = _count_entities(msg) >= 1 or any(
@@ -714,6 +760,26 @@ async def _replace_unsourced_stream(agen):
             yield emit
     if tail:
         yield _replace_unsourced(tail)
+
+
+# 元推理开头清洗：LLM 偶发把「数据已经够了」类思考句写进正文开头，
+# 校园路径出口做确定性剥除（只剥开头连续元推理句，不动正文）
+_META_OPENING_RE = re.compile(
+    r"^\s*(?:"
+    r"数据已经(?:比较)?(?:充分|够)?了?[。，,]?"
+    r"|现有数据已经足够回答(?:用户的)?问题了?[。，,]?"
+    r"|现在数据(?:已经)?足够回答(?:用户的)?问题了?[。，,]?"
+    r"|信息已经(?:足够|够)(?:回答(?:用户的)?问题)?了?[。，,]?"
+    r"|数据已经足够回答用户的问题了?[。，,]?"
+    r"|下面整理回答[。，,]?"
+    r"|我来整理回答[。，,]?"
+    r")+"
+)
+
+
+def _strip_meta_openings(text: str) -> str:
+    """剥除正文开头的连续元推理句（校园问答出口卫生）。"""
+    return _META_OPENING_RE.sub("", text or "", count=1)
 
 
 def _clean_markdown(text: str) -> str:
@@ -1147,6 +1213,10 @@ class MarketReviewAgent:
         """
         history = _trim_history(history)
         intent, sector, inherited_from = _resolve_contextual_intent(user_message, history)
+        # general_chat 校园兜底：关键词白名单漏判的校园问题用知识库检索二次确认，
+        # 命中即改道 campus_kb（走工具链），避免无工具闲聊路径凭空编造
+        if intent == "general_chat" and _campus_fallback_hit(user_message):
+            intent = "campus_kb"
         # 继承意图的追问：在数据路径的 user prompt 开头加一行上下文说明
         context_note = (
             f"用户此前在询问{inherited_from}，本条为追问，请结合该语境组织回答。"
@@ -1166,6 +1236,7 @@ class MarketReviewAgent:
             return await self._agent_query(
                 user_message, stream, history=history,
                 hint=_AGENT_ROUTE_HINTS[intent],
+                disclaimer=(intent != "campus_kb"),  # 校园回答不附金融风险提示
             )
 
         if intent == "general_chat":
@@ -1196,9 +1267,9 @@ class MarketReviewAgent:
         return result
 
     async def _chat(self, message: str, stream: bool, history: list = None):
-        """通用对话。带对话历史，让闲聊也有上下文。"""
+        """通用对话。带对话历史，让闲聊也有上下文。闲聊不附金融风险提示。"""
         system = get_system_prompt("general_chat")
-        return await self._call_llm(system, message, stream, history=history)
+        return await self._call_llm(system, message, stream, history=history, disclaimer=False)
 
     # ── 第七波：自选股管理（加 / 删 / 列表 / 复盘）──
 
@@ -2069,7 +2140,7 @@ class MarketReviewAgent:
     _TOOL_RESULT_MAX_CHARS = 3000  # 单条工具结果截断长度，防 context 膨胀
     _CRITIQUE_MIN_CHARS = 500    # 草稿不长于此长度时不做自我审查（成本护栏）
 
-    async def _agent_query(self, user_message: str, stream: bool, history: list = None, hint: str = None):
+    async def _agent_query(self, user_message: str, stream: bool, history: list = None, hint: str = None, disclaimer: bool = True):
         """
         Agent 工具调用循环（第二波）：模型自主决定调用哪些数据工具，多轮拿数后再成文。
         仅由 process_message 在复杂分析场景路由进入。
@@ -2157,7 +2228,12 @@ class MarketReviewAgent:
                         )
                     draft = choice.message.content or ""
                     final = await self._critique_and_revise(draft, query_context)
-                    disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+                    if not disclaimer:  # 校园路径：确定性剥除开头元推理句
+                        final = _strip_meta_openings(final)
+                    disclaimer = (
+                        "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+                        if disclaimer else ""
+                    )
                     content = _clean_markdown(final) + disclaimer
                     # 第四波：存档最终产出（trade_date 用当前日期）
                     self._archive_safe("agent_query", None, content, query_context, date_str)
@@ -2198,9 +2274,37 @@ class MarketReviewAgent:
             logger.warning("Agent 工具循环异常，降级为普通对话路径: %s", e, exc_info=True)
             return await self._chat(user_message, stream, history=history)
 
-        # 循环超轮：模型仍要调工具 → 降级
-        logger.warning("Agent 工具循环达到 %d 轮上限仍未收敛，降级为普通对话路径", self._AGENT_MAX_ROUNDS)
-        return await self._chat(user_message, stream, history=history)
+        # 循环超轮：模型仍要调工具 → 不丢弃已检索成果，
+        # 追加「工具用尽」指令后做最后一次无工具强制成文；异常才降级 _chat
+        logger.warning("Agent 工具循环达到 %d 轮上限，基于已检索成果强制成文", self._AGENT_MAX_ROUNDS)
+        try:
+            messages.append({
+                "role": "user",
+                "content": "工具调用次数已用完，禁止再调用任何工具。请基于以上已经检索到的"
+                           "信息直接回答最初的问题：已查证的内容如实组织成文并按来源规范"
+                           "标注出处；未能查证的部分明确说明「未能查证」，不得编造。",
+            })
+            completion = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=8192,
+            )
+            draft = completion.choices[0].message.content or ""
+            query_context = user_message + "\n\n" + "\n".join(tool_context_parts)
+            final = await self._critique_and_revise(draft, query_context)
+            if not disclaimer:  # 校园路径：确定性剥除开头元推理句
+                final = _strip_meta_openings(final)
+            disclaimer_text = (
+                "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+                if disclaimer else ""
+            )
+            content = _clean_markdown(final) + disclaimer_text
+            self._archive_safe("agent_query", None, content, query_context, date_str)
+            return {"role": "assistant", "content": content}
+        except Exception as e:
+            logger.warning("超轮强制成文异常，降级为普通对话路径: %s", e, exc_info=True)
+            return await self._chat(user_message, stream, history=history)
 
     async def _critique_and_revise(self, draft: str, context: str) -> str:
         """
@@ -2267,13 +2371,14 @@ class MarketReviewAgent:
 
     async def _call_llm(
         self, system_prompt: str, user_message: str, stream: bool = False,
-        history: list = None, archive_callback=None,
+        history: list = None, archive_callback=None, disclaimer: bool = True,
     ):
         """
         调用 DeepSeek API。
         history 非空时按 system + history + 当前 user 组装 messages（闲聊上下文）。
         archive_callback：第四波存档回调，仅流式路径有效，透传给 _stream_response，
         在流结束后以最终全文调用（签名为 callback(accumulated_text)）。
+        disclaimer：非流式出口是否追加金融风险提示（闲聊/校园路径传 False）。
         """
         messages = [{"role": "system", "content": system_prompt}]
         if history:
@@ -2307,7 +2412,10 @@ class MarketReviewAgent:
                 else:
                     logger.info("检测到 LLM 输出截断（finish_reason=length），已自动续写一次")
                 raw = (raw or "") + more
-            disclaimer = "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+            disclaimer = (
+                "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
+                if disclaimer else ""
+            )
             clean = _clean_markdown(raw)
             return {"role": "assistant", "content": clean + disclaimer}
 

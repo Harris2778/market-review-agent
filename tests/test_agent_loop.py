@@ -374,7 +374,8 @@ class TestAgentLoop:
         )
 
     def test_round_cap_stops_and_degrades(self):
-        """模型永远返回 tool_calls → 循环在 8 轮内停止并降级 _chat。"""
+        """模型永远返回 tool_calls → 循环在 8 轮停止后基于已检索成果强制成文
+        （第 9 次 create 不带 tools），仅在强制成文异常时才降级 _chat。"""
         tools_mod = _import_tools()
         tool_name = tools_mod.TOOL_REGISTRY[0]["function"]["name"]
         agent = _make_agent()
@@ -395,15 +396,22 @@ class TestAgentLoop:
             result = asyncio.run(agent._agent_query("持续追问", stream=False))
 
         create = agent.client.chat.completions.create
-        assert create.await_count <= 8, (
-            f"工具循环最多 8 轮，create 实际被调 {create.await_count} 次——"
-            f"未在轮次上限停止"
+        assert create.await_count == 9, (
+            f"8 轮工具循环 + 1 次强制成文，create 实际被调 {create.await_count} 次"
         )
-        assert agent._chat.await_count == 1, (
-            "撞轮次上限后应降级 _chat（恰好 1 次）"
+        # 强制成文调用禁止再调工具（不传 tools），并携带「工具用尽」指令
+        last_kwargs = create.await_args_list[-1].kwargs
+        assert "tools" not in last_kwargs
+        assert any(
+            "工具调用次数已用完" in str(m.get("content", ""))
+            for m in last_kwargs["messages"] if isinstance(m, dict)
         )
-        assert result["content"] == "降级闲聊回答", (
-            f"降级后应返回 _chat 的结果: {result!r}"
+        assert agent._chat.await_count == 0, (
+            "强制成文成功时不应降级 _chat"
+        )
+        # 本 mock 下强制成文拿到的是空 draft，只验证未走 _chat 降级结果
+        assert result["content"] != "降级闲聊回答", (
+            f"强制成文路径不应返回 _chat 的结果: {result!r}"
         )
 
     def test_create_exception_degrades_to_chat(self):

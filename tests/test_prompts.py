@@ -18,6 +18,7 @@ from agent.system_prompts import (
     AGENT_QUERY_PROMPT,
     COMPLIANCE_PROMPT,
     CRITIQUE_PROMPT,
+    GENERAL_CHAT_PROMPT,
     MARKET_REVIEW_PROMPT,
     NEWS_ANALYSIS_PROMPT,
     NEWS_OUTPUT_RULES,
@@ -222,7 +223,7 @@ class TestExistingKeysRegression:
         assert get_system_prompt("sector_deep_dive", "半导体") == COMPLIANCE_PROMPT + SECTOR_DEEP_DIVE_PROMPT
         assert get_system_prompt("news_only") == COMPLIANCE_PROMPT + NEWS_OUTPUT_RULES
         assert get_system_prompt("news_analysis") == COMPLIANCE_PROMPT + NEWS_ANALYSIS_PROMPT
-        assert get_system_prompt("general_chat") == COMPLIANCE_PROMPT
+        assert get_system_prompt("general_chat") == COMPLIANCE_PROMPT + GENERAL_CHAT_PROMPT
 
     def test_unknown_key_fallback(self):
         """未知 key 行为与改动前一致：回落 COMPLIANCE_PROMPT，不抛异常。"""

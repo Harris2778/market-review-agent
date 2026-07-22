@@ -660,8 +660,8 @@ TOOL_REGISTRY: list = [
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 20,
-                        "default": 5,
-                        "description": "返回条目数，默认 5，最多 20。",
+                        "default": 10,
+                        "description": "返回条目数，默认 10，最多 20。",
                     },
                 },
                 "required": ["query"],
@@ -1480,7 +1480,20 @@ _CAMPUS_KB_SOURCES = (
 )
 
 # 检索结果正文截断长度（防上下文爆炸）
-_CAMPUS_CONTENT_MAX = 500
+_CAMPUS_CONTENT_MAX = 1500
+
+
+def _cut_campus_content(text: str, limit: int = _CAMPUS_CONTENT_MAX) -> str:
+    """校园正文截断：句对齐切割——在 limit 内最后一个句末标点（。！？；\n）处截，
+    避免把硬事实（时限/费用/比例等）从句子中间拦腰切断。"""
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max(window.rfind(p) for p in ("。", "！", "？", "；", "\n"))
+    if cut >= int(limit * 0.5):  # 句末点太靠前才用，否则硬切
+        return window[: cut + 1]
+    return window
 
 # 库为空/未建库时的中文指引（提示先运行回填脚本）
 _CAMPUS_EMPTY_GUIDANCE = (
@@ -1539,7 +1552,7 @@ def _handle_search_campus_knowledge(args: dict) -> dict:
         return {"ok": False, "query": query,
                 "note": "校园知识库检索接口不可用（search_kb 未实现）"}
     source = _normalize_campus_source(args.get("source"))
-    limit = _clamp_int(args.get("limit"), 5, 1, 20)
+    limit = _clamp_int(args.get("limit"), 10, 1, 20)
     results = search_fn(query, source=source, limit=limit)
     if not isinstance(results, list):
         results = []
@@ -1556,16 +1569,20 @@ def _handle_search_campus_knowledge(args: dict) -> dict:
         slim.append({
             "source": str(entry.get("source") or ""),
             "title": str(entry.get("title") or ""),
-            "content": str(entry.get("content") or "")[:_CAMPUS_CONTENT_MAX],
+            "content": _cut_campus_content(entry.get("content")),
             "url": str(entry.get("url") or ""),
             "score": entry.get("score"),
         })
+    note = "正文为检索片段（截断至 1500 字），引用时请按来源规范标注出处"
+    if len(slim) >= limit:
+        note += f"；本次命中已达到返回上限（前 {len(slim)} 条），" \
+                "枚举类问题如需更全清单请加大 limit 或缩小检索范围"
     return {
         "ok": True,
         "query": query,
         "source": source,
         "results": slim,
-        "note": "正文为检索片段（截断至 500 字），引用时请按来源规范标注出处",
+        "note": note,
     }
 
 

@@ -119,7 +119,7 @@ class TestToolRegistry:
         }
         limit = params["properties"]["limit"]
         assert limit["minimum"] == 1 and limit["maximum"] == 20
-        assert limit["default"] == 5
+        assert limit["default"] == 10
 
     def test_get_course_review_summary_schema(self):
         tool = next(t for t in tools_mod.TOOL_REGISTRY
@@ -159,17 +159,17 @@ class TestSearchCampusKnowledge:
         assert first["score"] == 2.5
         # 检索参数透传
         _, kwargs = fake_kb.search_kb.call_args
-        assert kwargs["source"] is None and kwargs["limit"] == 5
+        assert kwargs["source"] is None and kwargs["limit"] == 10
 
     def test_content_truncated_to_500_chars(self, fake_kb):
         fake_kb.search_kb.return_value = [
-            _kb_entry(content="字" * 800),
+            _kb_entry(content="字" * 2000),
         ]
         result = tools_mod.execute_tool(
             "search_campus_knowledge", {"query": "手册"}
         )
         content = result["data"]["results"][0]["content"]
-        assert len(content) == 500
+        assert len(content) == 1500  # 句对齐截断上限 1500（无标点时硬切）
 
     def test_valid_source_passthrough(self, fake_kb):
         fake_kb.search_kb.return_value = [_kb_entry(source="thubook")]
@@ -506,3 +506,208 @@ class TestCampusKbCitationPrompt:
         # 既有引用规范不被破坏
         assert "## 社媒舆情引用规范" in AGENT_QUERY_PROMPT
         assert "## 研报引用规范" in AGENT_QUERY_PROMPT
+
+
+# ════════════════════════════════════════════════════════════════
+# QA 全题库质保第二轮系统性修复（2026-07-23）：
+# 路由词表扩容 / 『排名』类指令词解封 / 金融信号让位 /
+# general_chat 校园兜底探针 / 风险提示按意图分流
+# ════════════════════════════════════════════════════════════════
+
+
+class TestCampusRoutingExpansion:
+    """QA 实测漏判问法回归：扩词后必须判 campus_kb。"""
+
+    @pytest.mark.parametrize("q", [
+        "成绩排名多少才能保研经管？",       # 『排名』指令词不得再封锁校园路由
+        "想出国读研读博，手册里有什么建议？",
+        "国际生实习加注怎么办理？",
+        "经管本科有哪些必修课？",
+        "经管的培养方案是怎样的？",
+        "体育课选不上怎么办？",
+        "商法学这门课怎么样？",
+        "转化医学工程值得选吗？",
+        "商法学难吗？期末怎么考？",
+        "体测都测什么？不及格怎么办？",
+        "清华的GPA怎么算？",
+        "校内哪里可以自习？",
+        "紫荆公寓是几人间？",
+        "校园卡丢了怎么办？",
+        "数据科学导论是谁开的课？",
+    ])
+    def test_expanded_keywords_route_campus(self, q):
+        assert detect_intent(q)[0] == "campus_kb"
+
+    @pytest.mark.parametrize("q", [
+        "清华系持股的股票有哪些？",   # 金融信号共现让位，不得被『清华』劫持
+        "紫金矿业行情怎么样？",       # 金融语境（『紫荆』谐音误差伤防护）
+        "今天A股大盘怎么样？",         # 金融主线回归
+        "帮我查一下茅台的估值",
+        "今日复盘",
+    ])
+    def test_finance_signal_not_hijacked(self, q):
+        assert detect_intent(q)[0] != "campus_kb"
+
+
+class TestCampusFallbackProbe:
+    """_campus_fallback_hit：top1 命中 ≥2 关键词才改道，异常静默 False。"""
+
+    def _fake_kb(self, monkeypatch, results):
+        import agent.campus_kb as campus_kb
+        monkeypatch.setattr(campus_kb, "search_kb",
+                            lambda *a, **kw: results)
+
+    def test_hit_when_two_keywords_matched(self, monkeypatch):
+        self._fake_kb(monkeypatch, [{
+            "source": "thubook", "source_id": "thubook:dorm",
+            "title": "宿舍介绍 - 紫荆公寓",
+            "content": "紫荆公寓为4人间上床下桌，两间共用一个中厅。",
+        }])
+        assert orchestrator._campus_fallback_hit("紫荆公寓是几人间") is True
+
+    def test_miss_when_no_results(self, monkeypatch):
+        self._fake_kb(monkeypatch, [])
+        assert orchestrator._campus_fallback_hit("茅台走势如何") is False
+
+    def test_miss_when_single_keyword_hit(self, monkeypatch):
+        self._fake_kb(monkeypatch, [{
+            "source": "thubook", "source_id": "t:1",
+            "title": "北京旅游推荐",
+            "content": "故宫和长城。",
+        }])
+        assert orchestrator._campus_fallback_hit("北京哪里好玩") is False
+
+    def test_exception_returns_false(self, monkeypatch):
+        import agent.campus_kb as campus_kb
+        def _boom(*a, **kw):
+            raise RuntimeError("db gone")
+        monkeypatch.setattr(campus_kb, "search_kb", _boom)
+        assert orchestrator._campus_fallback_hit("宿舍怎么样") is False
+
+
+class TestCampusFallbackWiring:
+    """process_message 兜底接线：general_chat 命中探针 → campus_kb 工具链，
+    且校园回答不附金融风险提示。"""
+
+    def test_general_chat_rerouted_to_campus(self, monkeypatch):
+        agent = _make_agent()
+        agent._agent_query = AsyncMock(
+            return_value={"role": "assistant", "content": "校园答案"}
+        )
+        agent._chat = AsyncMock(return_value={"role": "assistant", "content": "闲聊"})
+        monkeypatch.setattr(orchestrator, "_campus_fallback_hit", lambda m: True)
+        r = asyncio.run(agent.process_message("一个关键词表外的校园问题"))
+        assert r["content"] == "校园答案"
+        agent._chat.assert_not_called()
+        _, kwargs = agent._agent_query.call_args
+        assert kwargs.get("hint") == orchestrator._AGENT_ROUTE_HINTS["campus_kb"]
+        assert kwargs.get("disclaimer") is False  # 校园回答不附金融风险提示
+
+    def test_probe_miss_keeps_general_chat(self, monkeypatch):
+        agent = _make_agent()
+        agent._chat = AsyncMock(return_value={"role": "assistant", "content": "闲聊"})
+        monkeypatch.setattr(orchestrator, "_campus_fallback_hit", lambda m: False)
+        r = asyncio.run(agent.process_message("今天天气不错"))
+        assert r["content"] == "闲聊"
+
+
+class TestDisclaimerGating:
+    """风险提示分流：闲聊与校园路径不追加，金融 Agent 路径保持追加。"""
+
+    def test_chat_passes_disclaimer_false(self):
+        agent = _make_agent()
+        captured = {}
+        async def fake_call(system, message, stream, history=None, **kw):
+            captured.update(kw)
+            return {"role": "assistant", "content": "ok"}
+        agent._call_llm = fake_call
+        asyncio.run(agent._chat("你好", False))
+        assert captured.get("disclaimer") is False
+
+    def test_agent_query_disclaimer_param_default_true(self):
+        import inspect
+        sig = inspect.signature(MarketReviewAgent._agent_query)
+        assert sig.parameters["disclaimer"].default is True
+
+    def test_call_llm_disclaimer_param_default_true(self):
+        import inspect
+        sig = inspect.signature(MarketReviewAgent._call_llm)
+        assert sig.parameters["disclaimer"].default is True
+
+
+class TestAgentLoopExhaustion:
+    """工具循环超轮：基于已检索成果强制成文，不再丢弃上下文降级闲聊。"""
+
+    def test_forced_answer_on_round_limit(self, monkeypatch):
+        agent = _make_agent()
+        calls = []
+
+        tool_msg = MagicMock()
+        tool_msg.tool_calls = [MagicMock(
+            id="tc1",
+            function=MagicMock(name="search_campus_knowledge",
+                               arguments='{"query": "必修课"}'),
+        )]
+        tool_msg.content = None
+        final_msg = MagicMock()
+        final_msg.tool_calls = None
+        final_msg.content = "基于已检索信息的回答"
+
+        def make_completion(msg):
+            comp = MagicMock()
+            comp.choices = [MagicMock(message=msg, finish_reason="stop")]
+            return comp
+
+        async def fake_create(**kw):
+            calls.append(kw)
+            return make_completion(tool_msg if len(calls) <= 8 else final_msg)
+
+        agent.client.chat.completions.create = fake_create
+        monkeypatch.setattr(
+            orchestrator, "execute_tool",
+            lambda *a, **kw: {"ok": True, "results": []},
+        )
+        r = asyncio.run(agent._agent_query("经管本科有哪些必修课？", False))
+        assert "基于已检索信息" in r["content"]
+        assert len(calls) == 9  # 8 轮循环 + 1 次强制成文
+        assert "tools" not in calls[-1]  # 强制成文禁止再调工具
+        assert any(
+            isinstance(m, dict) and "工具调用次数已用完" in str(m.get("content", ""))
+            for m in calls[-1]["messages"]
+        )
+
+
+class TestContentCutAndMetaStrip:
+    """第三轮修复：句对齐截断（硬事实不再拦腰切断）+ 元推理开头剥除。"""
+
+    def test_cut_campus_content_sentence_aligned(self):
+        text = "前提条件说明。" + "x" * 900 + "。材料递交后，需7个工作日可以拿到护照。" + "y" * 800
+        out = tools_mod._cut_campus_content(text)
+        # 截断点落在句末标点处，且长度不超上限
+        assert len(out) <= 1500
+        assert out.endswith(("。", "！", "？", "；", "\n"))
+        # 句对齐窗口覆盖到 7 个工作日所在的完整句
+        assert "7个工作日" in out
+
+    def test_cut_campus_content_short_text_unchanged(self):
+        assert tools_mod._cut_campus_content("短文本。") == "短文本。"
+        assert tools_mod._cut_campus_content("") == ""
+
+    def test_cut_campus_content_no_good_breakpoint_hard_cut(self):
+        text = "一" * 2000  # 无句末标点 → 硬切
+        out = tools_mod._cut_campus_content(text)
+        assert len(out) == 1500
+
+    @pytest.mark.parametrize("opening", [
+        "数据已经够了。",
+        "现有数据已经足够回答用户的问题了。",
+        "信息已经足够了，",
+        "下面整理回答。",
+    ])
+    def test_strip_meta_openings(self, opening):
+        text = opening + "【结论】紫荆公寓为4人间。"
+        assert orchestrator._strip_meta_openings(text) == "【结论】紫荆公寓为4人间。"
+
+    def test_strip_meta_openings_preserves_body(self):
+        text = "紫荆公寓数据已经够了4人间标准配置。"
+        assert orchestrator._strip_meta_openings(text) == text  # 非开头不动

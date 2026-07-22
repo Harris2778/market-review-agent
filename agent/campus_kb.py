@@ -56,6 +56,8 @@ FTS_MIN_KEYWORD_CHARS = 3
 
 # LIKE 启发式评分：标题命中权重高于正文
 _LIKE_TITLE_WEIGHT = 3
+# 精确括号匹配加权：教师枚举场景『（李东）』精确命中应压过『李东红/李东海』等同名干扰
+_LIKE_EXACT_PAREN_WEIGHT = 10
 
 # 入库列（顺序与 INSERT 参数一致；主键列在前）
 _COLUMNS: Tuple[str, ...] = (
@@ -307,7 +309,8 @@ def _build_fts_match(keywords: List[str]) -> str:
 
 
 def _like_score(title: str, content: str, keywords: List[str]) -> float:
-    """LIKE 命中次数启发式评分：标题命中 ×权重 + 正文命中次数（大小写不敏感）。"""
+    """LIKE 命中次数启发式评分：标题命中 ×权重 + 正文命中次数（大小写不敏感）。
+    标题中『（关键词）』/(keywords) 精确括号形式额外加权（教师枚举同名消歧）。"""
     t, c = title.lower(), content.lower()
     score = 0.0
     for kw in keywords:
@@ -315,6 +318,9 @@ def _like_score(title: str, content: str, keywords: List[str]) -> float:
         if not k:
             continue
         score += _LIKE_TITLE_WEIGHT * t.count(k) + c.count(k)
+        score += _LIKE_EXACT_PAREN_WEIGHT * (
+            t.count(f"（{k}）") + t.count(f"({k})")
+        )
     return score
 
 

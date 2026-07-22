@@ -553,3 +553,17 @@ def test_strict_and_still_preferred_over_partial(db):
     ])
     rs = kb.search_kb("选课 绩点", limit=5)
     assert rs[0]["source_id"] == "t:both"
+
+
+def test_like_score_exact_paren_teacher_disambiguation(db):
+    """教师枚举同名消歧：『（李东）』精确括号命中应压过『李东红/李东海』。"""
+    kb.upsert_entries([
+        make_entry(source="thucourse_course", source_id="c:1",
+                   title="应用时间序列分析（李东红）",
+                   content="开课单位：经济管理学院。教师：李东红。"),
+        make_entry(source="thucourse_course", source_id="c:2",
+                   title="高等统计选讲（李东）",
+                   content="开课单位：工业工程系。教师：李东。"),
+    ])
+    rs = kb.search_kb("李东", limit=5)
+    assert rs and rs[0]["source_id"] == "c:2"

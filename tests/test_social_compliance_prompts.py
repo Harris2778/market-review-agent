@@ -24,6 +24,7 @@ from agent.system_prompts import (
     AGENT_QUERY_PROMPT,
     COMPLIANCE_PROMPT,
     CRITIQUE_PROMPT,
+    GENERAL_CHAT_PROMPT,
     MARKET_REVIEW_PROMPT,
     NEWS_ANALYSIS_PROMPT,
     NEWS_OUTPUT_RULES,
@@ -207,7 +208,7 @@ class TestPromptAssemblyRegression:
         assert get_system_prompt("news_only") == COMPLIANCE_PROMPT + NEWS_OUTPUT_RULES
         assert get_system_prompt("news_analysis") == COMPLIANCE_PROMPT + NEWS_ANALYSIS_PROMPT
         assert get_system_prompt("watchlist") == COMPLIANCE_PROMPT + WATCHLIST_REVIEW_PROMPT
-        assert get_system_prompt("general_chat") == COMPLIANCE_PROMPT
+        assert get_system_prompt("general_chat") == COMPLIANCE_PROMPT + GENERAL_CHAT_PROMPT
 
     def test_unknown_key_fallback(self):
         """未知 key 回落 COMPLIANCE_PROMPT，社媒例外随之生效。"""
