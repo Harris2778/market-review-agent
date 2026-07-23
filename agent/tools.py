@@ -578,6 +578,8 @@ TOOL_REGISTRY: list = [
         "function": {
             "name": "get_stock_valuation",
             "description": "获取 A 股个股估值历史：PE/PB 时间序列与当前估值水平。"
+                           "返回字段中 latest/points 为个股口径，benchmark_market 为大盘基准、"
+                           "benchmark_industry 为行业基准，做对比时注意区分、不要把基准值当成个股值。"
                            "判断个股贵贱、估值分位、做历史估值对比时使用。"
                            "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
             "parameters": {

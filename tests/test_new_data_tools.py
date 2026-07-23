@@ -108,15 +108,33 @@ class TestMcpToolNameAndParams:
             "symbol": "sh600519", "type": "sjl", "rank": "y3"})
 
     def test_fetch_stock_valuation_crop_structure(self):
-        """返回 latest / points[:20] / total 的裁剪结构。"""
-        dp = [{"day": f"2024-01-{i:02d}", "val": i} for i in range(1, 31)]
-        with patch(MCP, return_value=_empty_result({"dp": dp})):
+        """返回 latest / points[:20] / total 的裁剪结构（gg=个股口径）。"""
+        gg = [{"day": f"2024-01-{i:02d}", "val": i} for i in range(1, 31)]
+        dp = [{"day": "2024-01-01", "val": 999}]  # 大盘基准：不得混入个股字段
+        hy = [{"day": "2024-01-01", "val": 888}]
+        with patch(MCP, return_value=_empty_result({"gg": gg, "dp": dp, "hy": hy})):
             out = fetch_stock_valuation("sh600519")
-        assert out["latest"] == dp[0]
-        assert out["points"] == dp[:20]
+        assert out["latest"] == gg[0]
+        assert out["points"] == gg[:20]
         assert len(out["points"]) == 20
         assert out["total"] == 30
+        assert out["benchmark_market"] == dp[0]
+        assert out["benchmark_industry"] == hy[0]
         assert out["type"] == "syl" and out["rank"] == "y1"
+
+    def test_fetch_stock_valuation_dp_is_benchmark_not_stock(self):
+        """QA 实锤防回归：dp 是大盘基准序列（所有股票同值），latest 必须取 gg。
+        旧版误用 dp 导致茅台/五粮液 PE 都答成 17.88。"""
+        payload = {"gg": [{"day": "2026-07-23", "val": "19.53"}],
+                   "dp": [{"day": "2026-07-23", "val": "17.88"}]}
+        with patch(MCP, return_value=_empty_result(payload)):
+            out = fetch_stock_valuation("sh600519")
+        assert out["latest"]["val"] == "19.53"
+        assert out["benchmark_market"]["val"] == "17.88"
+        # gg 缺失时 latest=None，绝不回退用 dp 冒充个股
+        with patch(MCP, return_value=_empty_result({"gg": [], "dp": payload["dp"]})):
+            out2 = fetch_stock_valuation("sh600519")
+        assert out2["latest"] is None and out2["total"] == 0
 
     def test_fetch_lockup_schedule(self):
         with patch(MCP, return_value=_empty_result({})) as m:
@@ -211,7 +229,8 @@ _WRAPPERS_EMPTY_CASES = [
     (fetch_shareholder_count, ("600519",), []),
     (fetch_financial_report_full, ("sh600519",), {}),
     (fetch_stock_valuation, ("sh600519",),
-     {"type": "syl", "rank": "y1", "latest": None, "points": [], "total": 0}),
+     {"type": "syl", "rank": "y1", "latest": None, "points": [], "total": 0,
+      "benchmark_market": None, "benchmark_industry": None}),
     (fetch_lockup_schedule, ("sh600519",), {"data": [], "rowCount": 0}),
     (fetch_margin_detail, ("sh600519",), []),
     (fetch_block_trades, ("sh600519",), []),

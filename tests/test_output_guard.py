@@ -103,3 +103,23 @@ def test_abnormal_inputs_no_crash():
     assert fix_uncovered_conclusions("   ") == "   "
     assert fix_uncovered_conclusions(123) == 123
     assert fix_uncovered_conclusions(["未覆盖"]) == ["未覆盖"]
+
+
+# ---------- 防误伤：基准未覆盖 ≠ 估值未覆盖 ----------
+
+def test_benchmark_uncovered_does_not_kill_head_conclusion():
+    """QA 实锤防回归：「数据未覆盖全市场基准PE」只缺基准对照，
+    个股估值数据正常时，头部「茅台更便宜」结论必须保留。"""
+    text = (
+        "茅台更便宜，估值吸引力更高。\n"
+        "茅台市盈率19.53，五粮液市盈率23.05，行业基准19.11。\n"
+        "数据未覆盖全市场基准PE，无法给出相对大盘的折溢价。"
+    )
+    assert fix_uncovered_conclusions(text) == text
+
+
+def test_pe_substring_alone_not_valuation_topic():
+    """估值主题不再用 PE/PB 子串匹配：仅含 PE 缩写 + 未覆盖词
+    且带「基准」的句子不得触发估值主题未覆盖。"""
+    text = "茅台更便宜。\n数据未覆盖全市场基准PE。"
+    assert fix_uncovered_conclusions(text) == text

@@ -1294,26 +1294,34 @@ def fetch_financial_report_full(paper_code: str, source: str = "gjzb", r_date: s
 
 
 def fetch_stock_valuation(symbol: str, vtype: str = "syl", rank: str = "y1") -> dict:
-    """A股估值历史（智研 cnStockValuationDetail）。symbol 需带前缀。
+    """A股估值历史（智研 cnStockValuationDetail）。symbol 需带前缀（不带前缀返回空序列）。
 
-    vtype: syl 市盈率TTM / sjl 市净率 / sxl 市现率；
-    rank: y1/y3/y5/y10/all。result.data.dp 为 [{day,val}] 倒序（实测很大），
-    返回 {'type','rank','latest': dp[0], 'points': dp[:20], 'total': len(dp)}。
-    失败时 latest=None、points=[]、total=0。
+    vtype: syl 市盈率TTM / sjl 市净率 / sxl 市现率；rank: y1/y3/y5/y10/all。
+    返回结构关键坑（QA 实锤）：result.data 有三条序列——gg=个股（正确口径）、
+    dp=大盘基准（所有股票返回相同值！）、hy=行业基准。旧版误用 dp 当个股，
+    导致茅台/五粮液 PE 都答成 17.88（实为大盘基准）。
+    返回 {'type','rank','latest': gg[0], 'points': gg[:20], 'total': len(gg),
+    'benchmark_market': dp[0], 'benchmark_industry': hy[0]}；失败时 latest=None。
     """
     try:
         d = _mcp_call("cnStockValuationDetail", {
             "symbol": str(symbol), "type": str(vtype), "rank": str(rank),
         })
-        dp = d.get("result", {}).get("data", {}).get("dp", []) or []
-        if not isinstance(dp, list):
-            dp = []
+        data = d.get("result", {}).get("data", {}) or {}
+        gg = data.get("gg", []) or []
+        dp = data.get("dp", []) or []
+        hy = data.get("hy", []) or []
+        if not isinstance(gg, list):
+            gg = []
         return {"type": vtype, "rank": rank,
-                "latest": dp[0] if dp else None,
-                "points": dp[:20], "total": len(dp)}
+                "latest": gg[0] if gg else None,
+                "points": gg[:20], "total": len(gg),
+                "benchmark_market": dp[0] if isinstance(dp, list) and dp else None,
+                "benchmark_industry": hy[0] if isinstance(hy, list) and hy else None}
     except Exception as e:
         logger.warning("fetch_stock_valuation 获取失败 symbol=%s: %s", symbol, e)
-        return {"type": vtype, "rank": rank, "latest": None, "points": [], "total": 0}
+        return {"type": vtype, "rank": rank, "latest": None, "points": [],
+                "total": 0, "benchmark_market": None, "benchmark_industry": None}
 
 
 def fetch_lockup_schedule(symbol: str, num: int = 10) -> dict:
