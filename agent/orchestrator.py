@@ -9,6 +9,7 @@ import os
 import time
 import asyncio
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import AsyncGenerator, Optional
 
 from openai import AsyncOpenAI
@@ -337,6 +338,40 @@ _FINANCE_STRONG_KEYWORDS = [
 # （防止抢走『今天涨停家数查询』等既有简单数据查询——宁可漏判，不可误判）
 _DATA_QUERY_COMMANDS = ("查询", "查一下", "帮我查", "列出", "列表", "排名")
 
+# ── 海外市场（美股/港股）识别：优先于 A 股复盘/板块/个股模板 ──
+# 防『纳斯达克指数』被 A 股复盘模板劫持、『00700』前导零代码无人识别、
+# 『美联储联邦基金利率』被 fund_query 的『基金』二字碰撞
+_US_MARKET_KEYWORDS = [
+    "美股", "纳斯达克", "纳指", "标普", "道琼斯", "道指", "中概",
+    "美联储", "联邦基金", "非农", "苹果", "英伟达", "特斯拉", "微软",
+    "谷歌", "亚马逊",
+]
+_HK_MARKET_KEYWORDS = [
+    "港股", "恒生", "恒指", "港交所", "港股通", "南向", "H股",
+    "腾讯", "美团", "小米集团",
+]
+_HK_CODE_RE = re.compile(r"(?<!\d)0\d{4}(?!\d)")  # 港股 5 位前导零代码（00700/06715）
+_US_TICKER_RE = re.compile(
+    r"(?<![A-Za-z])(AAPL|NVDA|TSLA|MSFT|GOOG|GOOGL|AMZN|META|NFLX|AMD|INTC|BABA|JD|PDD|NIO|XPEV|LI)(?![A-Za-z])"
+)
+_CN_CODE_RE = re.compile(r"(?<!\d)(?:60|68|00|30)\d{4}(?!\d)|(?:sh|sz|bj)\d{6}(?!\d)", re.IGNORECASE)
+
+# 宏观关键词：命中即走 Agent 工具循环（宏观取数工具），
+# 同时防止大写缩写撞个股 stock_patterns 的 [A-Z] 模式（『GDP增速』≠ 个股）
+_MACRO_KEYWORDS = [
+    "CPI", "cpi", "PPI", "ppi", "PMI", "pmi", "GDP", "gdp", "LPR", "lpr",
+    "非农", "利率决议", "降准", "降息", "存款利率", "社融", "M2",
+]
+
+# 分析型个股/公司诉求：带实体命中时走 Agent 工具循环，
+# 不被确定性行情卡短路（模板卡只有价格快照，无技术分析/估值/财报能力）
+_ANALYTIC_STOCK_KEYWORDS = [
+    "技术分析", "MACD", "macd", "KDJ", "kdj", "均线", "支撑", "压力位",
+    "估值", "市盈率", "市净率", "贵不贵", "便不便宜",
+    "财报", "年报", "季报", "业绩", "财务", "基本面", "股息", "分红", "换手率",
+    "量价", "趋势", "对比", "比较", "公告", "介绍", "情况", "新闻",
+]
+
 # 两意图的路由提示：process_message 接线时作为 hint 透传给 _agent_query，
 # 非空时以『【本问题路由提示】...』追加到 AGENT_QUERY_PROMPT 系统消息尾部
 _AGENT_ROUTE_HINTS = {
@@ -362,6 +397,18 @@ _AGENT_ROUTE_HINTS = {
         "检索结果不理想时，可用 source 参数按来源分源重试"
         "（sem_handbook/thubook/thucourse_course/thucourse_summary），"
         "或换同义关键词多次检索，不要一次检索无果就放弃。"
+    ),
+    "us_hk_query": (
+        "【本问题路由提示】用户在问美股/港股/海外市场问题，请优先使用对应市场的工具取数"
+        "（港股行情/财报用港股工具，美股行情/财报/新闻用美股工具，宏观数据用宏观工具）。"
+        "接口不可用或数据未覆盖时如实说明「数据未覆盖」，绝不凭训练记忆报行情数字；"
+        "客观数据查询不得套用合规拒答话术。"
+    ),
+    "agent_analyze": (
+        "【本问题路由提示】用户在问金融数据/分析型问题（个股技术分析/估值/财报/公告新闻/"
+        "多标的对比/宏观数据/资金流向等），请按需组合工具取数：行情K线、技术指标、"
+        "财务基本面、宏观数据、新闻舆情、多标的分别取数后对比。数据未覆盖的如实说明，"
+        "不得凭记忆编造任何数字、日期与来源；客观数据查询不得套用合规拒答话术。"
     ),
 }
 
@@ -389,6 +436,85 @@ def _campus_fallback_hit(message: str) -> bool:
         return hits >= 2
     except Exception:
         return False
+
+
+# general_chat 金融兜底探针词表：闲聊路由里混入的金融数据/分析信号。
+# 命中即改道 Agent 工具循环（有工具、有合规、有风险提示），
+# 防无工具闲聊路径凭训练记忆编造行情/宏观数字（QA 实锤：北向/沪指/成交额/
+# CPI/PMI/LPR/财报类问题漏路由后硬编数字、虚构来源）。
+_FINANCE_FALLBACK_KEYWORDS = [
+    "北向", "南向", "沪指", "上证", "深成指", "创业板", "科创板", "成交额",
+    "涨停", "跌停", "炸板", "连板", "龙虎榜",
+    "CPI", "cpi", "PPI", "ppi", "PMI", "pmi", "GDP", "gdp", "LPR", "lpr",
+    "非农", "美联储", "加息", "降息", "降准", "利率", "汇率",
+    "财报", "年报", "季报", "业绩预告", "市盈率", "市净率", "估值",
+    "换手率", "股息", "分红", "美股", "港股", "A股", "大盘", "股市",
+    "纳斯达克", "恒生", "中概", "股价", "股票", "板块", "指数", "基金",
+    "债券", "国债", "期货", "资金流向", "资金流", "主力",
+    "财经", "金融", "宏观", "利好", "利空", "新闻", "资讯", "快讯",
+    "行情", "走势", "涨跌", "市值", "营收", "净利润",
+]
+# 闲聊豁免：含这些词的消息不触发金融兜底（『讲个笑话』『涨知识了』类）
+_CHITCHAT_EXEMPTIONS = ("笑话", "段子", "故事", "绕口令", "诗", "歌词", "游戏")
+
+
+def _finance_fallback_hit(message: str) -> bool:
+    """general_chat 金融兜底探针：消息含金融数据/分析信号词则改道 Agent 工具循环。
+
+    只在 detect_intent 已判 general_chat（其他路由都没接住）后运行，
+    词表全是金融信号词，命中即说明问题实质是金融数据/分析诉求。
+    """
+    msg = (message or "").strip()
+    if len(msg) < 4:
+        return False
+    if any(w in msg for w in _CHITCHAT_EXEMPTIONS):
+        return False
+    return any(w in msg for w in _FINANCE_FALLBACK_KEYWORDS)
+
+
+def _has_stock_entity(msg: str) -> bool:
+    """公司级实体探测（分析型路由用）：个股关键词、6 位 A 股代码、
+    5 位港股代码、常见美股 ticker、『公司』。
+    行业词不算——『半导体新闻』要保持板块新闻既有路由不被抢走。"""
+    if any(kw in msg for kw in _STOCK_ENTITY_KEYWORDS):
+        return True
+    if _CN_CODE_RE.search(msg) or _HK_CODE_RE.search(msg) or _US_TICKER_RE.search(msg):
+        return True
+    return "公司" in msg
+
+
+# ── 风险提示统一兜底 ──
+# QA 实锤：风险提示按路由模板挂载，stock_query/news_only/mcp_query 等确定性
+# 拼接路径与 general_chat 下的金融内容全部漏挂。改为 dict 出口集中追加。
+_DISCLAIMER_TEXT = (
+    "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。"
+    "市场有风险，投资需谨慎。"
+)
+# 内容级金融信号：general_chat 回答里出现这些词说明实际输出了金融内容
+_FINANCE_CONTENT_SIGNALS = [
+    "股", "基金", "涨", "跌", "板块", "指数", "行情", "估值", "资金",
+    "期货", "债", "汇率", "利率", "CPI", "GDP", "营收", "净利润",
+    "市值", "成交", "财经", "宏观", "大盘",
+]
+
+
+def _ensure_disclaimer(result, intent: str):
+    """风险提示统一兜底（dict 出口，判重幂等）。
+
+    - campus_kb：永不追加（校园回答与投资风险无关）；
+    - general_chat：仅当回答内容实际含金融信号时追加（闲聊不打扰）；
+    - 其他金融意图：一律追加（已含『风险提示』的跳过）；
+    - 非 dict（流式生成器）：原样透传。
+    """
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content") or ""
+    if intent == "campus_kb" or "风险提示" in content:
+        return result
+    if intent != "general_chat" or any(w in content for w in _FINANCE_CONTENT_SIGNALS):
+        result = dict(result)
+        result["content"] = content + _DISCLAIMER_TEXT
+    return result
 
 
 def detect_intent(message: str) -> tuple[str, Optional[str]]:
@@ -433,6 +559,25 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
                 return ("social_sentiment", None)
             if any(kw in msg for kw in _PERSONA_KEYWORDS):
                 return ("persona", None)
+
+    # 海外市场（美股/港股）：优先于 A 股复盘/板块/个股模板判定，
+    # 防『纳斯达克指数』被 A 股复盘模板劫持、『美联储加息』被 fund_query 碰撞、
+    # 『00700』前导零代码无人识别。复盘诉求（『美股复盘』暂不支持）让位旧逻辑。
+    if "复盘" not in msg:
+        if (any(kw in msg for kw in _US_MARKET_KEYWORDS)
+                or any(kw in msg for kw in _HK_MARKET_KEYWORDS)
+                or _HK_CODE_RE.search(msg) or _US_TICKER_RE.search(msg)):
+            return ("us_hk_query", msg)
+
+    # 分析型个股/公司诉求（技术分析/估值/财报/公告新闻/多实体对比）：
+    # 走 Agent 工具循环（有取数与分析能力），不被确定性行情卡短路
+    # （模板卡只有价格快照；分析型问题走模板会零分析、无风险提示）。
+    # 含『板块/行业』的消息让位板块路由（板块新闻/板块深挖既有路径不动）。
+    if "复盘" not in msg and "板块" not in msg and "行业" not in msg and _has_stock_entity(msg):
+        if _count_entities(msg) >= 2:
+            return ("agent_analyze", msg)
+        if any(kw in msg for kw in _ANALYTIC_STOCK_KEYWORDS):
+            return ("agent_analyze", msg)
 
     # 先提取行业名（如果有的话，优先判定为板块聚焦）
     sector = _extract_sector(msg)
@@ -521,6 +666,11 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
+    # 宏观关键词护栏：CPI/GDP 等大写缩写会撞 stock_patterns 的 [A-Z] 模式
+    # （『GDP增速怎么样』被误判个股查询——QA 实锤），个股判定前拦截
+    if any(kw in msg for kw in _MACRO_KEYWORDS):
+        return ("agent_analyze", msg)
+
     # 股票代码/名称查询
     stock_patterns = [r"分析.{0,4}[A-Z]{1,5}$", r"[A-Z]{1,5}.*(股价|行情|分析|怎么样)", r"(茅台|五粮液|宁德|比亚迪|中芯)"]
     for p in stock_patterns:
@@ -558,12 +708,18 @@ _FOLLOWUP_PATTERNS = [
     # 展开追问：继续 / 再说说 / 详细说 / 那怎么办
     r"^(继续|再说说|详细说|展开说|具体说|深入说)",
     r"^(那|那么|所以)(呢|怎么样|如何|怎么办|意味着)",
+    # 指代追问：那它的财报呢 / 那这家公司估值怎么样（上文个股查询）
+    r"^(那|那么)(它|他|她|这家|这个|该公司|公司|该股)?(的)?"
+    r"(财报|业绩|财务|估值|新闻|走势|股价|资金流|基本面|技术面|公告|舆情|分红)",
+    # 跨市场/跨标的短追问：那港股呢 / 那茅台呢
+    r"^那.{1,8}呢[？?]?$",
 ]
 
 # 意图类型 → 中文描述（用于追问提示行）
 _INTENT_LABELS = {
     "market_review": "全市场复盘",
     "sector_deep_dive": "板块深挖",
+    "stock_query": "个股查询",
 }
 
 
@@ -611,7 +767,7 @@ def _resolve_contextual_intent(message: str, history: list) -> tuple[str, Option
         return intent, sector, None
 
     prev_intent, prev_sector = detect_intent(prev_user_msg)
-    if prev_intent not in ("market_review", "sector_deep_dive"):
+    if prev_intent not in ("market_review", "sector_deep_dive", "stock_query"):
         return intent, sector, None
 
     msg = message.strip()
@@ -633,6 +789,10 @@ def _resolve_contextual_intent(message: str, history: list) -> tuple[str, Option
             return "sector_deep_dive", prev_sector, label
     elif prev_intent == "market_review" and is_followup:
         return "market_review", None, _INTENT_LABELS["market_review"]
+    elif prev_intent == "stock_query" and is_followup:
+        # 个股追问（『那它的财报怎么样』）：升级为 Agent 工具循环，
+        # 上文个股语境经 history 透传，防跌回无工具闲聊路径凭记忆背数字
+        return "agent_analyze", None, _INTENT_LABELS["stock_query"]
 
     return intent, sector, None
 
@@ -773,6 +933,10 @@ _META_OPENING_RE = re.compile(
     r"|数据已经足够回答用户的问题了?[。，,]?"
     r"|下面整理回答[。，,]?"
     r"|我来整理回答[。，,]?"
+    r"|(?:现在)?数据已经够了[。，,]?(?:可以给出结论[。，,]?)?"
+    r"|以下(?:是|为)?修正后的(?:完整)?(?:正文|回答|内容)?[:：]?"
+    r"|修正后的(?:完整)?正文[:：]?"
+    r"|根据(?:以上|上述)(?:审查|审核)(?:意见|建议)?[，,]?"
     r")+"
 )
 
@@ -780,6 +944,89 @@ _META_OPENING_RE = re.compile(
 def _strip_meta_openings(text: str) -> str:
     """剥除正文开头的连续元推理句（校园问答出口卫生）。"""
     return _META_OPENING_RE.sub("", text or "", count=1)
+
+
+# 工具函数名软泄漏：LLM 偶发把 snake_case 工具名写进自然语言正文
+# （『通过 get_market_sentiment 获取…』）。确定性剥除标记本身，保留句子其余部分。
+_FUNC_NAME_RE = re.compile(
+    r"\b(?:get|fetch|search|analyze|collect|format|compact|execute)_[a-z0-9_]+\b"
+)
+# 内部结构化字段泄漏：persona 框架等场景的 signal:/confidence:/disclaimer: 字段
+# 被 LLM 原文誊进正文（QA 实锤），连字段名带取值一并剥除
+_INTERNAL_FIELD_RE = re.compile(
+    r"\b(?:signal|confidence|disclaimer|output_schema|checklist)\s*[:：]\s*[^\n，。；]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_function_names(text: str) -> str:
+    """剥除正文中泄漏的工具函数名与内部结构化字段标记，保留句子其余文字。"""
+    if not text:
+        return text or ""
+    return _INTERNAL_FIELD_RE.sub("", _FUNC_NAME_RE.sub("", text))
+
+
+# DeepSeek DSML 文本工具调用：模型偶发把工具调用以纯文本标记输出
+# （<｜｜DSML｜｜tool_calls>…</｜｜DSML｜｜tool_calls>，｜ 为全角竖线 U+FF5C），
+# 而非结构化 message.tool_calls。这里做确定性解析与剥除，杜绝原始标记泄漏给用户。
+_DSML_TOOL_CALLS_RE = re.compile(
+    r"<[｜|]{2}DSML[｜|]{2}tool_calls>.*?(?:</[｜|]{2}DSML[｜|]{2}tool_calls>|\Z)",
+    re.DOTALL,
+)
+_DSML_INVOKE_RE = re.compile(
+    r"<[｜|]{2}DSML[｜|]{2}invoke\s+name=\"([^\"]+)\"[^>]*>"
+    r"(.*?)(?:</[｜|]{2}DSML[｜|]{2}invoke>|\Z)",
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<[｜|]{2}DSML[｜|]{2}parameter\s+name=\"([^\"]+)\""
+    r"(?:\s+string=\"(true|false)\")?[^>]*>"
+    r"(.*?)(?:</[｜|]{2}DSML[｜|]{2}parameter>|\Z)",
+    re.DOTALL,
+)
+
+
+def _strip_dsml(text: str) -> str:
+    """剥除 DSML 工具调用标记：完整块整体删除，未闭合/孤立的标记行逐行剔除。"""
+    if not text or "DSML" not in text:
+        return text or ""
+    text = _DSML_TOOL_CALLS_RE.sub("", text)
+    lines = [
+        ln for ln in text.split("\n")
+        if "DSML｜｜" not in ln and "DSML||" not in ln
+    ]
+    return "\n".join(lines).strip()
+
+
+def _parse_dsml_tool_calls(text: str):
+    """解析 DSML 纯文本工具调用块。
+
+    返回 (calls, remainder)：calls 为 [(工具名, 参数dict)]；remainder 为剔除
+    DSML 标记后的剩余文本。无 DSML 内容时 calls 为空、remainder 为原文。
+    参数类型按 string 属性还原：string="true" 保留字符串，否则按 JSON 解析
+    （数字/布尔），解析失败回退为字符串。
+    """
+    if not text or "DSML" not in text:
+        return [], text or ""
+    calls = []
+    for inv in _DSML_INVOKE_RE.finditer(text):
+        name = inv.group(1).strip()
+        if not name:
+            continue
+        args = {}
+        for pm in _DSML_PARAM_RE.finditer(inv.group(2)):
+            pname = pm.group(1).strip()
+            is_string = (pm.group(2) or "true").strip().lower() != "false"
+            raw = pm.group(3).strip()
+            if is_string:
+                args[pname] = raw
+            else:
+                try:
+                    args[pname] = json.loads(raw)
+                except Exception:
+                    args[pname] = raw
+        calls.append((name, args))
+    return calls, _strip_dsml(text)
 
 
 def _clean_markdown(text: str) -> str:
@@ -791,6 +1038,9 @@ def _clean_markdown(text: str) -> str:
     """
     if not text:
         return text or ""
+
+    # 0. 水平分隔线（---/———）整行删除
+    text = re.sub(r"^\s*-{3,}\s*$", "", text, flags=re.MULTILINE)
 
     # 1. 管道表格 → 缩进纯文本
     lines = text.split("\n")
@@ -1213,9 +1463,17 @@ class MarketReviewAgent:
         """
         history = _trim_history(history)
         intent, sector, inherited_from = _resolve_contextual_intent(user_message, history)
+        # general_chat 金融兜底（先于校园探针）：金融数据/分析诉求改道 Agent 工具循环。
+        # 校园库含证券投资类书籍笔记，『推荐几只股票』『沪指走势』会在库中命中
+        # ≥2 关键词被校园探针误判（QA 实锤），金融探针必须先跑
+        if intent == "general_chat" and _finance_fallback_hit(user_message):
+            intent = "agent_analyze"
         # general_chat 校园兜底：关键词白名单漏判的校园问题用知识库检索二次确认，
-        # 命中即改道 campus_kb（走工具链），避免无工具闲聊路径凭空编造
-        if intent == "general_chat" and _campus_fallback_hit(user_message):
+        # 命中即改道 campus_kb（走工具链），避免无工具闲聊路径凭空编造；
+        # 金融强信号词共现时让位（『清华系持股』类不被校园路由劫持）
+        if (intent == "general_chat"
+                and not any(w in user_message for w in _FINANCE_STRONG_KEYWORDS)
+                and _campus_fallback_hit(user_message)):
             intent = "campus_kb"
         # 继承意图的追问：在数据路径的 user prompt 开头加一行上下文说明
         context_note = (
@@ -1227,22 +1485,31 @@ class MarketReviewAgent:
         # 裸行业名命中板块意图时，若消息实为比较/多实体分析（如『比较白酒和半导体』），
         # 也让位给 Agent 循环；规则保守，拿不准走原路径
         if intent in ("general_chat", "sector_deep_dive") and _should_use_agent_query(user_message):
-            return await self._agent_query(user_message, stream, history=history)
+            return _ensure_disclaimer(
+                await self._agent_query(user_message, stream, history=history), intent
+            )
 
         # 社媒舆情 / 投资人格高优先级意图：直接走 Agent 工具循环，并透传路由提示
         # hint（追加到 AGENT_QUERY_PROMPT 系统消息尾部）。工具注册表未就绪或循环
         # 异常时 _agent_query 内部仍降级 _chat，兜底链不变。
         if intent in _AGENT_ROUTE_HINTS:
-            return await self._agent_query(
-                user_message, stream, history=history,
-                hint=_AGENT_ROUTE_HINTS[intent],
-                disclaimer=(intent != "campus_kb"),  # 校园回答不附金融风险提示
+            return _ensure_disclaimer(
+                await self._agent_query(
+                    user_message, stream, history=history,
+                    hint=_AGENT_ROUTE_HINTS[intent],
+                    disclaimer=(intent != "campus_kb"),  # 校园回答不附金融风险提示
+                ),
+                intent,
             )
 
         if intent == "general_chat":
-            return await self._chat(user_message, stream, history=history)
+            return _ensure_disclaimer(
+                await self._chat(user_message, stream, history=history), intent
+            )
         elif intent == "market_review":
-            return await self._market_review(stream, context_note=context_note)
+            return _ensure_disclaimer(
+                await self._market_review(stream, context_note=context_note), intent
+            )
         elif intent == "watchlist":
             result = await self._watchlist(user_message, stream)
         elif intent == "news_only":
@@ -1254,17 +1521,21 @@ class MarketReviewAgent:
         elif intent == "fund_query" or intent == "mcp_query":
             result = await self._fund_query(user_message, False)
         else:
-            return await self._sector_deep_dive(sector, stream, context_note=context_note)
+            return _ensure_disclaimer(
+                await self._sector_deep_dive(sector, stream, context_note=context_note), intent
+            )
 
         # 简单查询返回dict → 流式模式包装为生成器
         if stream and isinstance(result, dict):
+            result = _ensure_disclaimer(result, intent)
+
             async def _wrap():
                 text = result.get("content", "")
                 for i in range(0, len(text), 80):
                     yield text[i:i+80]
                     await asyncio.sleep(0.01)
             return _wrap()
-        return result
+        return _ensure_disclaimer(result, intent)
 
     async def _chat(self, message: str, stream: bool, history: list = None):
         """通用对话。带对话历史，让闲聊也有上下文。闲聊不附金融风险提示。"""
@@ -1919,9 +2190,28 @@ class MarketReviewAgent:
             quote = fetch_stock_quote(market, code) or {}
             kline = fetch_stock_kline(market, code, 5) or []
             news = fetch_stock_news(code, market, 5) or []
-            kline_str = ", ".join(k.get("date","")[-5:] + ":" + str(k.get("close","?")) for k in kline[:5])
-            news_str = " | ".join(n.get("title","")[:40] for n in news[:3])
-            info = f"{name}({code})\n行情：价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}%\n开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}\n近5日K线：{kline_str}\n相关新闻：{news_str}\n"
+            # K线拼接防御：date/trade_date 双键兜底，取不到日期不输出裸冒号
+            kline_parts = []
+            for k in kline[:5]:
+                d = str(k.get("date") or k.get("trade_date") or "")[-5:]
+                c = k.get("close", "?")
+                kline_parts.append(f"{d}:{c}" if d else f"收盘{c}")
+            kline_str = ", ".join(kline_parts) if kline_parts else "数据未覆盖"
+            news_items = [n.get("title", "")[:40] for n in news[:3] if n.get("title")]
+            news_str = "；".join(news_items) if news_items else "数据未覆盖"
+            if not quote and not kline and not news:
+                # 取数全失败：如实声明，不输出空白模板
+                info = f"{name}({code})\n行情数据暂不可用（接口未返回数据），请稍后再试。"
+            else:
+                quote_str = (
+                    f"价格{quote.get('price','?')} 涨跌{quote.get('pct','?')}%"
+                    if quote else "数据未覆盖"
+                )
+                ohl_str = (
+                    f"开盘{quote.get('open','?')} 最高{quote.get('high','?')} 最低{quote.get('low','?')}"
+                    if quote else ""
+                )
+                info = f"{name}({code})\n行情：{quote_str}\n{ohl_str}\n近5日K线：{kline_str}\n相关新闻：{news_str}\n"
         except Exception as e:
             logger.warning("个股数据获取失败(%s %s): %s", market, code, e, exc_info=True)
             info = f"{name}({code})\n数据暂不可用，请稍后再试。"
@@ -2200,6 +2490,44 @@ class MarketReviewAgent:
                 )
                 choice = completion.choices[0]
                 tool_calls = getattr(choice.message, "tool_calls", None)
+                assistant_msg_override = None
+
+                # DeepSeek 偶发把工具调用以 DSML 纯文本输出而非结构化 tool_calls：
+                # 解析成合成调用继续工具循环，杜绝原始标记泄漏给用户
+                if not tool_calls:
+                    dsml_calls, dsml_remainder = _parse_dsml_tool_calls(
+                        choice.message.content or ""
+                    )
+                    if dsml_calls:
+                        logger.warning(
+                            "检测到 DSML 文本工具调用 %d 个，解析后继续工具循环",
+                            len(dsml_calls),
+                        )
+                        tool_calls = [
+                            SimpleNamespace(
+                                id=f"dsml-{_}-{i}",
+                                function=SimpleNamespace(
+                                    name=n,
+                                    arguments=json.dumps(a, ensure_ascii=False),
+                                ),
+                            )
+                            for i, (n, a) in enumerate(dsml_calls)
+                        ]
+                        assistant_msg_override = {
+                            "role": "assistant",
+                            "content": dsml_remainder or None,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": n,
+                                        "arguments": json.dumps(a, ensure_ascii=False),
+                                    },
+                                }
+                                for tc, (n, a) in zip(tool_calls, dsml_calls)
+                            ],
+                        }
 
                 if not tool_calls:
                     # 模型返回纯文本 → 工具循环收敛，最终成文
@@ -2226,10 +2554,10 @@ class MarketReviewAgent:
                                 "agent_query", None, query_context, date_str
                             ),
                         )
-                    draft = choice.message.content or ""
+                    draft = _strip_dsml(choice.message.content or "")
                     final = await self._critique_and_revise(draft, query_context)
-                    if not disclaimer:  # 校园路径：确定性剥除开头元推理句
-                        final = _strip_meta_openings(final)
+                    # 出口卫生（全路径）：剥除开头元推理句 + 工具函数名软泄漏
+                    final = _strip_function_names(_strip_meta_openings(final))
                     disclaimer = (
                         "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
                         if disclaimer else ""
@@ -2240,7 +2568,7 @@ class MarketReviewAgent:
                     return {"role": "assistant", "content": content}
 
                 # 有工具调用：回显 assistant 消息，逐个在线程池执行并追加 tool 结果
-                messages.append(_assistant_tool_message(choice.message))
+                messages.append(assistant_msg_override or _assistant_tool_message(choice.message))
                 for tc in tool_calls:
                     fn_name = tc.function.name
                     try:
@@ -2290,11 +2618,11 @@ class MarketReviewAgent:
                 temperature=0.2,
                 max_tokens=8192,
             )
-            draft = completion.choices[0].message.content or ""
+            draft = _strip_dsml(completion.choices[0].message.content or "")
             query_context = user_message + "\n\n" + "\n".join(tool_context_parts)
             final = await self._critique_and_revise(draft, query_context)
-            if not disclaimer:  # 校园路径：确定性剥除开头元推理句
-                final = _strip_meta_openings(final)
+            # 出口卫生（全路径）：剥除开头元推理句 + 工具函数名软泄漏
+            final = _strip_function_names(_strip_meta_openings(final))
             disclaimer_text = (
                 "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
                 if disclaimer else ""
@@ -2416,7 +2744,7 @@ class MarketReviewAgent:
                 "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，不构成任何投资建议。市场有风险，投资需谨慎。"
                 if disclaimer else ""
             )
-            clean = _clean_markdown(raw)
+            clean = _clean_markdown(_strip_function_names(_strip_meta_openings(_strip_dsml(raw))))
             return {"role": "assistant", "content": clean + disclaimer}
 
     async def _stream_response(self, messages: list, archive_callback=None) -> AsyncGenerator:

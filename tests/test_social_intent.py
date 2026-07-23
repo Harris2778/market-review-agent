@@ -258,7 +258,8 @@ class TestUserReportedQuestions:
         assert agent._chat.await_count == 0, "Q7 不应落入纯闲聊 _chat"
         assert agent._market_review.await_count == 0, "Q7 不应被劫持去全市场复盘"
         assert agent._sector_deep_dive.await_count == 0, "Q7 不应落入单板块深挖"
-        assert result["content"] == "agent答案"
+        assert result["content"].startswith("agent答案")
+        assert "风险提示" in result["content"]  # 出口统一兜底追加
 
 
 # ════════════════════════════════════════════════════════════════
@@ -348,7 +349,8 @@ class TestRoutingHintWiring:
         assert hint_marker in hint, (
             f"意图 {intent} 的 hint 应引导优先使用 {hint_marker}"
         )
-        assert result["content"] == "agent答案"
+        assert result["content"].startswith("agent答案")
+        assert "风险提示" in result["content"]  # 出口统一兜底追加（非校园意图）
 
 
 # ════════════════════════════════════════════════════════════════

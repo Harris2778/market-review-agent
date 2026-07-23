@@ -76,7 +76,7 @@ class TestDetectIntent:
             ("电子行业怎么样", "sector_deep_dive", "电子"),
             # ── 个股查询（股票名称 / 代码）──
             ("茅台怎么样", "stock_query", None),
-            ("分析AAPL", "stock_query", None),
+            ("分析AAPL", "us_hk_query", None),
             # ── 新闻查询 ──
             ("今天有什么新闻", "news_only", None),
             ("银行板块新闻", "news_only", "银行"),

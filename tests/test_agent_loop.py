@@ -465,7 +465,8 @@ class TestProcessMessageRouting:
         assert agent._sector_deep_dive.await_count == 0, (
             "复杂分析不应落入单板块深挖路径"
         )
-        assert result["content"] == "agent答案"
+        assert result["content"].startswith("agent答案")
+        assert "风险提示" in result["content"]  # 出口统一兜底追加
 
     def test_small_talk_routes_to_chat(self):
         agent = _make_agent()

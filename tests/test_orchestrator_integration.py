@@ -237,7 +237,8 @@ class TestWatchlistRouting:
             "agent.data_fetcher.fetch_stock_quote", MagicMock(return_value=quote)
         ):
             result = asyncio.run(agent.process_message("复盘我的自选股"))
-        assert result == {"role": "assistant", "content": "复盘结果"}
+        assert result["content"].startswith("复盘结果")
+        assert "风险提示" in result["content"]  # 出口统一兜底追加
         assert agent._call_llm.await_count == 1
         system_prompt = agent._call_llm.await_args.args[0]
         user_prompt = agent._call_llm.await_args.args[1]
@@ -256,7 +257,8 @@ class TestWatchlistRouting:
             MagicMock(side_effect=Exception("network boom")),
         ):
             result = asyncio.run(agent.process_message("复盘我的自选股"))
-        assert result["content"] == "复盘结果"
+        assert result["content"].startswith("复盘结果")
+        assert "风险提示" in result["content"]  # 出口统一兜底追加
         user_prompt = agent._call_llm.await_args.args[1]
         assert "行情数据暂不可用" in user_prompt
 
