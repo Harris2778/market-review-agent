@@ -160,9 +160,9 @@ def _read_jsonl(dir_path):
 class TestNewToolRegistry:
 
     def test_registry_total_32(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 37, (
-            f"TOOL_REGISTRY 应为 37 个工具（32 + 5 港美股 "
-            f"+ 2 校园知识库），实际 {len(tools_mod.TOOL_REGISTRY)}"
+        assert len(tools_mod.TOOL_REGISTRY) == 54, (
+            f"TOOL_REGISTRY 应为 54 个工具（37 + 17 智研 MCP），"
+            f"实际 {len(tools_mod.TOOL_REGISTRY)}"
         )
 
     def test_new_tools_schema_complete(self):

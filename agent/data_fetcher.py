@@ -1076,14 +1076,17 @@ def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
 
 
 def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
-    """个股新闻搜索。A股 symbol 需带sh/sz前缀，港美股裸代码（前缀自动剥离）。"""
+    """个股新闻搜索。A股 symbol 需带sh/sz前缀，港美股裸代码（前缀自动剥离）。
+
+    出口套 _dedup_news_fuzzy 模糊去重（剥栏目前缀/【】标签后按前15字判重）。
+    """
     symbol = _normalize_market_symbol(market, symbol)
     d = _mcp_call("stockNewsSearch", {"market": market, "symbol": symbol, "num": str(min(20,limit)), "page": "1"})
     items = []
     data = d.get("result",{}).get("data",[]) or []
     for it in data[:limit]:
         items.append({"title": _sanitize_news_text(it.get("title","")), "url": it.get("url","")})
-    return items
+    return _dedup_news_fuzzy(items)
 
 
 def fetch_hk_finance_report(symbol: str, indicator: str = "净利润", years: int = 1) -> dict:
@@ -1130,6 +1133,483 @@ def fetch_revenue_composition(paper_code: str, fr_date: str = "") -> dict:
     d = _mcp_call("cnFinanceRevenueComposition", args)
     data = d.get("result",{}).get("data",{}) or d.get("data",{}) or {}
     return {"股票": data.get("sname",""), "按产品": data.get("by_product",[]), "按行业": data.get("by_business",[]), "按地区": data.get("by_region",[])}
+
+
+# ── 智研 MCP 包装函数（17 个）──
+# 统一风格仿 fetch_revenue_composition：异常不抛出、失败返回空结构、
+# 参数一律 str() 传 MCP。以下接口均经实测，返回形状见各 docstring。
+
+
+def _truncate_long_strings(value, max_len: int = 500):
+    """递归截断 dict/list 中的超长字符串（在标点边界截断），其余类型原样。"""
+    if isinstance(value, str):
+        return _truncate_at_boundary(value, max_len) if len(value) > max_len else value
+    if isinstance(value, dict):
+        return {k: _truncate_long_strings(v, max_len) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_truncate_long_strings(v, max_len) for v in value]
+    return value
+
+
+def fetch_company_profile(symbol: str) -> dict:
+    """A股公司概况（智研 cnCompanyBasicInfo）。symbol 需带前缀如 sh600519。
+
+    result.data 精简返回：Industry 只留 name 列表、fareArea 截 300 字、
+    其余标量字段原样保留，嵌套结构剔除。失败返回 {}。
+    """
+    try:
+        d = _mcp_call("cnCompanyBasicInfo", {"symbol": str(symbol)})
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for k, v in data.items():
+            if k == "Industry":
+                if isinstance(v, list):
+                    out["Industry"] = [x.get("name", "") for x in v
+                                       if isinstance(x, dict) and x.get("name")]
+            elif k == "fareArea":
+                out["fareArea"] = _truncate_at_boundary(str(v or ""), 300)
+            elif v is None or isinstance(v, (str, int, float, bool)):
+                out[k] = v
+        return out
+    except Exception as e:
+        logger.warning("fetch_company_profile 获取失败 symbol=%s: %s", symbol, e)
+        return {}
+
+
+def fetch_company_managers(symbol: str) -> dict:
+    """A股公司高管（智研 cnCompanyManagerInfo）。symbol 需带前缀如 sh600519。
+
+    返回 {'companyinfo': 原样, 'incumbent': 人员条目(含Name/zhiwu的dict)最多10条,
+    'change': 变动条目最多5条}，逐层防御。失败返回 {}。
+    """
+    try:
+        d = _mcp_call("cnCompanyManagerInfo", {"symbol": str(symbol)})
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return {}
+        inc = data.get("incumbent", []) or []
+        persons = [p for p in inc
+                   if isinstance(p, dict) and (p.get("Name") or p.get("zhiwu"))][:10] \
+            if isinstance(inc, list) else []
+        chg = data.get("change", []) or []
+        changes = [c for c in chg if isinstance(c, dict)][:5] \
+            if isinstance(chg, list) else []
+        return {"companyinfo": data.get("companyinfo", {}),
+                "incumbent": persons, "change": changes}
+    except Exception as e:
+        logger.warning("fetch_company_managers 获取失败 symbol=%s: %s", symbol, e)
+        return {}
+
+
+def fetch_shareholder_count(code: str, type: str = "amount") -> list:
+    """A股股东户数历史（智研 cnCompanyShareholderHistory）。
+
+    参数 Code 为不带前缀的 6 位代码（sh/sz 前缀自动剥离），
+    Type: amount 户数 / average 户均持股。
+    result.data 是数字字符串键的 dict（值为 {ANum,Num,EndDate,close}），
+    转 list 按 EndDate 降序取 8 期。失败返回 []。
+    """
+    try:
+        code6 = re.sub(r"^[a-zA-Z]+", "", str(code or "").strip())
+        d = _mcp_call("cnCompanyShareholderHistory", {"Code": code6, "Type": str(type)})
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return []
+        rows = [v for v in data.values() if isinstance(v, dict)]
+        rows.sort(key=lambda x: str(x.get("EndDate", "")), reverse=True)
+        return rows[:8]
+    except Exception as e:
+        logger.warning("fetch_shareholder_count 获取失败 code=%s: %s", code, e)
+        return []
+
+
+def fetch_financial_report_full(paper_code: str, source: str = "gjzb", r_date: str = "") -> dict:
+    """A股财报全指标（智研 cnFinanceReportsFull）。paperCode 如 sz000002。
+
+    source: lrb 利润表 / fzb 负债表 / llb 流量表 / gjzb 关键指标 / zxzb 专项。
+    r_date 为空时先调 cnFinanceReportDateList（参数名是 paperCode 不是 symbol）
+    取 result.data.dList[0].date_value 作为最新报告期。
+    返回 {'报告期': rDate, 'source': source,
+    '指标': {item_title: {'值': item_value, '同比': item_tongbi}}}，
+    条目列表扁平化为指标字典，跳过 item_display=='大类' 的分组行。失败返回 {}。
+    """
+    try:
+        if not r_date:
+            dl = _mcp_call("cnFinanceReportDateList", {"paperCode": str(paper_code)})
+            dlist = dl.get("result", {}).get("data", {}).get("dList", []) or []
+            if not dlist or not isinstance(dlist[0], dict):
+                return {}
+            r_date = str(dlist[0].get("date_value", "") or "")
+            if not r_date:
+                return {}
+        d = _mcp_call("cnFinanceReportsFull", {
+            "paperCode": str(paper_code), "rDate": str(r_date), "source": str(source),
+        })
+        data = d.get("result", {}).get("data", {}) or {}
+        report_list = data.get("report_list", {}) or {}
+        if not isinstance(report_list, dict) or not report_list:
+            return {}
+        entry = report_list.get(r_date)
+        if not isinstance(entry, dict):
+            # 报告期键格式不符时兜底取第一期
+            entry = next(iter(report_list.values()), {})
+        rows = entry.get("data", []) or []
+        if not isinstance(rows, list):
+            return {}
+        indicators = {}
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            if it.get("item_display") == "大类":  # 分组行，无数据含义
+                continue
+            title = it.get("item_title", "")
+            if not title:
+                continue
+            indicators[title] = {"值": it.get("item_value", ""),
+                                 "同比": it.get("item_tongbi", "")}
+        return {"报告期": r_date, "source": source, "指标": indicators}
+    except Exception as e:
+        logger.warning("fetch_financial_report_full 获取失败 paperCode=%s source=%s: %s",
+                       paper_code, source, e)
+        return {}
+
+
+def fetch_stock_valuation(symbol: str, vtype: str = "syl", rank: str = "y1") -> dict:
+    """A股估值历史（智研 cnStockValuationDetail）。symbol 需带前缀。
+
+    vtype: syl 市盈率TTM / sjl 市净率 / sxl 市现率；
+    rank: y1/y3/y5/y10/all。result.data.dp 为 [{day,val}] 倒序（实测很大），
+    返回 {'type','rank','latest': dp[0], 'points': dp[:20], 'total': len(dp)}。
+    失败时 latest=None、points=[]、total=0。
+    """
+    try:
+        d = _mcp_call("cnStockValuationDetail", {
+            "symbol": str(symbol), "type": str(vtype), "rank": str(rank),
+        })
+        dp = d.get("result", {}).get("data", {}).get("dp", []) or []
+        if not isinstance(dp, list):
+            dp = []
+        return {"type": vtype, "rank": rank,
+                "latest": dp[0] if dp else None,
+                "points": dp[:20], "total": len(dp)}
+    except Exception as e:
+        logger.warning("fetch_stock_valuation 获取失败 symbol=%s: %s", symbol, e)
+        return {"type": vtype, "rank": rank, "latest": None, "points": [], "total": 0}
+
+
+def fetch_lockup_schedule(symbol: str, num: int = 10) -> dict:
+    """A股限售解禁日程（智研 cnStockLockupFuture）。symbol 需带前缀。
+
+    返回 {'data': result.data.data 列表(取num条), 'rowCount': 总数}。失败返回空结构。
+    """
+    try:
+        d = _mcp_call("cnStockLockupFuture", {
+            "symbol": str(symbol), "num": str(num), "page": "1",
+        })
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return {"data": [], "rowCount": 0}
+        rows = data.get("data", []) or []
+        if not isinstance(rows, list):
+            rows = []
+        return {"data": rows[:num], "rowCount": data.get("rowCount", len(rows))}
+    except Exception as e:
+        logger.warning("fetch_lockup_schedule 获取失败 symbol=%s: %s", symbol, e)
+        return {"data": [], "rowCount": 0}
+
+
+def fetch_margin_detail(symbol: str, num: int = 10) -> list:
+    """A股融资融券明细（智研 cnStockTradingMarginList）。symbol 需带前缀。
+
+    result.data 为按日列表：day/rz_bl 融资余额/rq_bl 融券余量/rzrq_bl 两融余额/
+    rz_net 融资净买入/rzrq_amt 两融交易额，映射中文键取 num 条。失败返回 []。
+    """
+    try:
+        d = _mcp_call("cnStockTradingMarginList", {
+            "symbol": str(symbol), "num": str(num), "page": "1",
+        })
+        rows = d.get("result", {}).get("data", []) or []
+        if isinstance(rows, dict):
+            rows = rows.get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:num]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "日期": it.get("day", ""),
+                "融资余额": it.get("rz_bl", ""),
+                "融券余量": it.get("rq_bl", ""),
+                "两融余额": it.get("rzrq_bl", ""),
+                "融资净买入": it.get("rz_net", ""),
+                "两融交易额": it.get("rzrq_amt", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_margin_detail 获取失败 symbol=%s: %s", symbol, e)
+        return []
+
+
+def fetch_block_trades(symbol: str, num: int = 10) -> list:
+    """A股大宗交易（智研 cnTradingBlockList）。symbol 需带前缀。
+
+    注意分页参数名是 p 不是 page。result.data.data 字段
+    trade_date/price/volumn/amount/buyer/seller/unit，取 num 条。失败返回 []。
+    """
+    try:
+        d = _mcp_call("cnTradingBlockList", {
+            "symbol": str(symbol), "num": str(num), "p": "1",
+        })
+        rows = d.get("result", {}).get("data", {}).get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:num]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "trade_date": it.get("trade_date", ""),
+                "price": it.get("price", ""),
+                "volumn": it.get("volumn", ""),
+                "amount": it.get("amount", ""),
+                "buyer": it.get("buyer", ""),
+                "seller": it.get("seller", ""),
+                "unit": it.get("unit", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_block_trades 获取失败 symbol=%s: %s", symbol, e)
+        return []
+
+
+def fetch_connect_holdings(type: str = "sh", sort: str = "hold_ratio", num: int = 20) -> list:
+    """沪深港通持股（智研 cnStockConnectHoldings）。
+
+    type: hk 港股通 / sz 深股通 / sh 沪股通；sort: hold_date/hold_num/hold_ratio；
+    asc 必填（'0' 从大到小）。result.data.s_list 映射
+    {name,symbol,hold_ratio,hold_num,hold_date,current_price}。失败返回 []。
+    """
+    try:
+        d = _mcp_call("cnStockConnectHoldings", {
+            "type": str(type), "sort": str(sort), "asc": "0",
+            "num": str(num), "page": "1",
+        })
+        slist = d.get("result", {}).get("data", {}).get("s_list", []) or []
+        if not isinstance(slist, list):
+            return []
+        items = []
+        for it in slist[:num]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "name": it.get("name", ""),
+                "symbol": it.get("symbol", ""),
+                "hold_ratio": it.get("hold_ratio", ""),
+                "hold_num": it.get("hold_num", ""),
+                "hold_date": it.get("hold_date", ""),
+                "current_price": it.get("current_price", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_connect_holdings 获取失败 type=%s: %s", type, e)
+        return []
+
+
+def fetch_fund_info(symbol: str) -> dict:
+    """公募基金档案（智研 fund_info）。symbol 为 6 位基金代码。
+
+    result.data 原样返回，超长文本（>500字）在标点边界截断。失败返回 {}。
+    """
+    try:
+        d = _mcp_call("fund_info", {"symbol": str(symbol)})
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return {}
+        return _truncate_long_strings(data, 500)
+    except Exception as e:
+        logger.warning("fetch_fund_info 获取失败 symbol=%s: %s", symbol, e)
+        return {}
+
+
+def fetch_fund_networth(symbol: str, limit: int = 10) -> list:
+    """公募基金净值历史（智研 fund_networth）。symbol 为 6 位基金代码。
+
+    result.data 为 [{ENDDATE,UNITNAV,UNITACCNAV,NAVGRTD}] 倒序，取 limit 条。
+    失败返回 []。
+    """
+    try:
+        d = _mcp_call("fund_networth", {"symbol": str(symbol), "num": str(limit)})
+        rows = d.get("result", {}).get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:limit]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "ENDDATE": it.get("ENDDATE", ""),
+                "UNITNAV": it.get("UNITNAV", ""),
+                "UNITACCNAV": it.get("UNITACCNAV", ""),
+                "NAVGRTD": it.get("NAVGRTD", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_fund_networth 获取失败 symbol=%s: %s", symbol, e)
+        return []
+
+
+def fetch_fund_holdings(symbol: str, num: int = 10) -> list:
+    """公募基金重仓股（智研 fund_heavy_stock）。symbol 为 6 位基金代码。
+
+    result.data.data 映射 {SKNAME→名称, SYMBOL→代码, NAVRTO→占净值比例,
+    HOLDMKTCAP→持仓市值, ENDDATE→截止日}，取 num 条。失败返回 []。
+    """
+    try:
+        d = _mcp_call("fund_heavy_stock", {"symbol": str(symbol), "num": str(num)})
+        rows = d.get("result", {}).get("data", {}).get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:num]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "名称": it.get("SKNAME", ""),
+                "代码": it.get("SYMBOL", ""),
+                "占净值比例": it.get("NAVRTO", ""),
+                "持仓市值": it.get("HOLDMKTCAP", ""),
+                "截止日": it.get("ENDDATE", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_fund_holdings 获取失败 symbol=%s: %s", symbol, e)
+        return []
+
+
+def fetch_fund_dividend(symbol: str) -> dict:
+    """公募基金分红拆分（智研 fund_dividend）。symbol 为 6 位基金代码。
+
+    返回 result.data 的 cf（拆分）/fh（分红）两键（可能为空列表）。失败返回空结构。
+    """
+    try:
+        d = _mcp_call("fund_dividend", {"symbol": str(symbol)})
+        data = d.get("result", {}).get("data", {}) or {}
+        if not isinstance(data, dict):
+            return {"cf": [], "fh": []}
+        cf = data.get("cf", []) or []
+        fh = data.get("fh", []) or []
+        return {"cf": cf if isinstance(cf, list) else [],
+                "fh": fh if isinstance(fh, list) else []}
+    except Exception as e:
+        logger.warning("fetch_fund_dividend 获取失败 symbol=%s: %s", symbol, e)
+        return {"cf": [], "fh": []}
+
+
+def fetch_forex_quote(symbol: str) -> dict:
+    """外汇实时报价（智研 forexQuoteLatest）。symbol 为全大写货币对如 USDCNY。
+
+    注意该接口返回在顶层 data 键而不是 result.data，
+    取 d.get('data') or d.get('result',{}).get('data')。失败返回 {}。
+    """
+    try:
+        d = _mcp_call("forexQuoteLatest", {"symbol": str(symbol).upper()})
+        data = d.get("data") or d.get("result", {}).get("data") or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("fetch_forex_quote 获取失败 symbol=%s: %s", symbol, e)
+        return {}
+
+
+def fetch_commodity_futures_list(market: str) -> list:
+    """商品期货合约列表（智研 futureCommodityList）。
+
+    market: dce/shfe/czce/gfex。result.data.data 映射
+    {contract,name,symbol,market}。失败返回 []。
+    """
+    try:
+        d = _mcp_call("futureCommodityList", {"type": str(market)})
+        rows = d.get("result", {}).get("data", {}).get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "contract": it.get("contract", ""),
+                "name": it.get("name", ""),
+                "symbol": it.get("symbol", ""),
+                "market": it.get("market", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_commodity_futures_list 获取失败 market=%s: %s", market, e)
+        return []
+
+
+def fetch_hk_special_ranking(node: str = "lcg_hk", sort: str = "changepercent", num: int = 20) -> list:
+    """港股特色排行（智研 hkStockSpecialRanking）。
+
+    node: gqg_hk 国企 / lcg_hk 蓝筹 / hcg_hk 红筹；
+    node/sort/asc/num/page 五参数全必填。result.data.data 映射
+    {name,symbol,price,changepercent,pe,volume,换手率(←hsl)}。失败返回 []。
+    """
+    try:
+        d = _mcp_call("hkStockSpecialRanking", {
+            "node": str(node), "sort": str(sort), "asc": "0",
+            "num": str(num), "page": "1",
+        })
+        rows = d.get("result", {}).get("data", {}).get("data", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:num]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "name": it.get("name", ""),
+                "symbol": it.get("symbol", ""),
+                "price": it.get("price", ""),
+                "changepercent": it.get("changepercent", ""),
+                "pe": it.get("pe", ""),
+                "volume": it.get("volume", ""),
+                "换手率": it.get("hsl", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_hk_special_ranking 获取失败 node=%s: %s", node, e)
+        return []
+
+
+def fetch_us_fund_flow_history(symbol: str, days: int = 20) -> list:
+    """美股资金流向历史（智研 usTradingFundFlow60Days）。symbol 裸 ticker。
+
+    注意参数名是 ' symbol' 带前导空格（实测如此，原样传）。
+    result.data.history 为 [{date,mf 主力净流入,p 收盘价}]，映射中文键取 days 条。
+    失败返回 []。
+    """
+    try:
+        symbol = _normalize_market_symbol("us", symbol)
+        d = _mcp_call("usTradingFundFlow60Days", {" symbol": str(symbol), "days": str(days)})
+        rows = d.get("result", {}).get("data", {}).get("history", []) or []
+        if not isinstance(rows, list):
+            return []
+        items = []
+        for it in rows[:days]:
+            if not isinstance(it, dict):
+                continue
+            items.append({
+                "日期": it.get("date", ""),
+                "主力净流入": it.get("mf", ""),
+                "收盘价": it.get("p", ""),
+            })
+        return items
+    except Exception as e:
+        logger.warning("fetch_us_fund_flow_history 获取失败 symbol=%s: %s", symbol, e)
+        return []
 
 
 def fetch_sector_components(node: str, sort: str = "percent", num: int = 20) -> list:
@@ -1218,8 +1698,12 @@ def fetch_express(date: str = "") -> list:
     return []
 
 
-def fetch_block_trades(code: str = "", date: str = "") -> list:
-    """大宗交易。"""
+def fetch_block_trades_tushare(code: str = "", date: str = "") -> list:
+    """大宗交易（Tushare 全市场口径，按日期扫描）。
+
+    原名 fetch_block_trades；与新增的智研版 fetch_block_trades(symbol, num)
+    （cnTradingBlockList，个股口径）同名冲突，故改名保留。
+    """
     pro = _get_pro()
     if not pro:
         return []
@@ -1229,7 +1713,7 @@ def fetch_block_trades(code: str = "", date: str = "") -> list:
         if df is not None and not df.empty:
             return [{"code": r["ts_code"], "date": r.get("trade_date",""), "price": r.get("price",""), "amount": r.get("amount","")} for _, r in df.head(20).iterrows()]
     except Exception as e:
-        logger.warning("fetch_block_trades 大宗交易获取失败 code=%s date=%s: %s", code, date, e)
+        logger.warning("fetch_block_trades_tushare 大宗交易获取失败 code=%s date=%s: %s", code, date, e)
     return []
 
 
@@ -1293,8 +1777,12 @@ def fetch_share_float(date: str = "") -> list:
     return []
 
 
-def fetch_fund_info(symbol: str) -> dict:
-    """基金档案。"""
+def fetch_fund_info_brief(symbol: str) -> dict:
+    """基金档案精简版（仅 name/type/nav）。
+
+    原名 fetch_fund_info；与新增的智研版 fetch_fund_info（fund_info 全量档案，
+    长文本截 500 字）同名冲突，故改名保留。当前无活跃调用方。
+    """
     d = _mcp_call("fund_info", {"symbol": symbol})
     data = d.get("result",{}).get("data",{}) or {}
     return {"name": data.get("name",""), "type": data.get("type",""), "nav": data.get("nav","")}
@@ -1354,6 +1842,41 @@ def _fmt_news_time(raw, fallback: str = "") -> str:
     return s[:19]
 
 
+def _fuzzy_title_key(title: str, n: int = 15) -> str:
+    """新闻标题模糊去重键：剥栏目前缀与【】标签、去非标点字符后小写取前 n 字。
+
+    处理步骤：
+    1. 剥栏目前缀：如「快讯丨xxx」「财经要闻丨xxx」（丨 前最多 12 个非冒号字符）；
+    2. 剥【】标签：如「【快讯】xxx」（标签内 1-10 字）；
+    3. 去除所有非标点语义字符（只留数字/英文/汉字），转小写，取前 n 字。
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r'^[^：:丨]{0,12}丨', '', t)
+    t = re.sub(r'^【[^】]{1,10}】', '', t)
+    t = re.sub(r'[^0-9a-zA-Z\u4e00-\u9fff]+', '', t)
+    return t.lower()[:n]
+
+
+def _dedup_news_fuzzy(items: list, n: int = 15) -> list:
+    """按 _fuzzy_title_key 模糊去重，保留先出现者。
+
+    标题为空（无法计算有效键）的条目不去重、原样保留。
+    """
+    seen = set()
+    out = []
+    for it in items:
+        title = it.get("title", "") if isinstance(it, dict) else ""
+        key = _fuzzy_title_key(title or "", n)
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(it)
+    return out
+
+
 def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
     """新浪智研MCP新闻搜索。复用通用 _mcp_call 通道。
 
@@ -1367,6 +1890,7 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
     max_pages = max(1, (limit + page_size - 1) // page_size)
     today_str = datetime.now().strftime("%Y-%m-%d")
     seen = set()
+    seen_fuzzy = set()  # 模糊键（剥栏目前缀/【】标签/标点）双查，防同源换皮重复
     try:
         for page in range(1, max_pages + 1):
             parsed = _mcp_call("qNewsSearch", {"keyword": keyword, "num": page_size, "page": page})
@@ -1389,7 +1913,12 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
                     title = _truncate_at_boundary(content, 80)
                 if not title or title in seen:
                     continue
+                fkey = _fuzzy_title_key(title)
+                if fkey and fkey in seen_fuzzy:
+                    continue
                 seen.add(title)
+                if fkey:
+                    seen_fuzzy.add(fkey)
                 raw_time = ""
                 for tf in ("ctime", "mtime", "pubtime", "time", "create_time", "pub_date", "date"):
                     if nd.get(tf):
@@ -1408,6 +1937,65 @@ def fetch_mcp_news(keyword: str, limit: int = 30) -> list:
                 time.sleep(0.3)  # 轻微限速
     except Exception as e:
         logger.warning("智研MCP新闻解析失败: %s", e)
+    return items[:limit]
+
+
+def fetch_mcp_flash(limit: int = 30) -> list:
+    """新浪智研MCP 7x24 快讯（newsFlashList）。复用通用 _mcp_call 通道。
+
+    num/page 参数为字符串，接口单页上限 20 条；limit > 20 时自动翻页
+    （页间限速，仿 fetch_mcp_news），某页返回不足单页条数时提前结束。
+    result.data.items 为 [{cTime(epoch秒), content, docid}]：快讯无独立标题，
+    title 用 _truncate_at_boundary(content, 80) 生成，完整 content（截 500）
+    另存 content 字段供下游行业关键词匹配。同标题跨页精确+模糊双查去重。
+    """
+    items = []
+    if not _env("SINA_MCP_TOKEN", ""):
+        return items
+    page_size = 20  # 接口 num 上限
+    max_pages = max(1, (limit + page_size - 1) // page_size)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    seen = set()
+    seen_fuzzy = set()
+    try:
+        for page in range(1, max_pages + 1):
+            parsed = _mcp_call("newsFlashList", {"num": str(page_size), "page": str(page)})
+            if not parsed:
+                break
+            flash_list = parsed.get("result",{}).get("data",{}).get("items",[])
+            if not flash_list:
+                flash_list = parsed.get("data",{}).get("items",[])
+            if not flash_list:
+                break
+            for nd in flash_list:
+                if not isinstance(nd, dict):
+                    continue
+                content = nd.get("content","") or ""
+                if not content:
+                    continue
+                title = _truncate_at_boundary(content, 80)
+                if not title or title in seen:
+                    continue
+                fkey = _fuzzy_title_key(title)
+                if fkey and fkey in seen_fuzzy:
+                    continue
+                seen.add(title)
+                if fkey:
+                    seen_fuzzy.add(fkey)
+                items.append({
+                    "source": "智研快讯",
+                    "time": _fmt_news_time(nd.get("cTime", ""), today_str),
+                    "title": _sanitize_news_text(title),
+                    "content": _sanitize_news_text(content, max_len=500),
+                })
+                if len(items) >= limit:
+                    return items
+            if len(flash_list) < page_size:
+                break  # 本页未凑满，后面没有更多结果
+            if page < max_pages:
+                time.sleep(0.3)  # 轻微限速
+    except Exception as e:
+        logger.warning("智研MCP快讯解析失败: %s", e)
     return items[:limit]
 
 
@@ -1530,70 +2118,29 @@ def fetch_cls_telegraph(limit: int = 20) -> list:
 
 
 def fetch_news_pool(sector_keywords: list = None, days: int = 3) -> dict:
-    """统一新闻聚合池：并行拉取 5 个新闻源，跨源按标题去重。
+    """统一新闻聚合池：新闻源已全部切换到新浪智研，并行拉取 2 个源，跨源去重。
 
     参数：
         sector_keywords: 行业关键词列表，首个关键词用作智研 MCP 搜索词（缺省 "A股"）。
-            传入（板块查询）时各源加深抓取：东财加翻第2页、财联社拉满约100条、
-            智研翻3页，提高板块新闻出货率与48小时覆盖。
-        days: 新浪/Tushare 回溯天数（每天各拉取一次，覆盖 48 小时以上）
+            传入（板块查询）时两源加深抓取（各 60 条，内部自动翻页），
+            提高板块新闻出货率与48小时覆盖。
+        days: 保留兼容旧签名，当前两源均为滚动实时源、无按日回溯，不再使用。
 
     返回：
-        {'sina': [...], 'eastmoney': [...], 'mcp': [...], 'cls': [...], 'tushare': [...]}
+        {'mcp': [...], 'flash': [...]}（键只有这两个）
         每条统一为 {'title': str, 'time': str, 'source': str}，并保留源自带的
         content/summary/brief 正文字段（供下游行业关键词匹配）；
         单源失败只降级为该源空列表，不影响其他源。
+        跨源去重 = 精确 title + 模糊键（_fuzzy_title_key）双查。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     search_kw = sector_keywords[0] if sector_keywords else "A股"
-
-    # 回溯日期列表：今天起往前 days 天（新浪用 YYYY-MM-DD，Tushare 用 YYYYMMDD）
-    today = datetime.now()
-    date_list = [(today - timedelta(days=i)) for i in range(days)]
-
-    def _job_sina():
-        """新浪：每天最多 100 条（内部自动翻页），逐日串行避免触发限流。
-
-        接口 date 参数当前失效（各日期返回同一滚动列表），逐日调用会产生
-        重复——由聚合出口的跨源标题去重消化；保留逐日调用是为了接口一旦
-        恢复按日查询，历史回溯无需改代码即可生效。
-        """
-        pool = []
-        for d in date_list:
-            pool.extend(fetch_sina_news(100, d.strftime("%Y-%m-%d")))
-        return pool
-
-    def _job_eastmoney():
-        """东方财富：7x24 实时快讯。板块查询时加深到第2页，补足24-48小时覆盖。"""
-        items = fetch_eastmoney_news(100 if sector_keywords else 50)
-        if sector_keywords:
-            items.extend(fetch_eastmoney_news_page2(80))
-        return items
-
-    def _job_mcp():
-        """智研 MCP：按关键词搜索快讯（内部自动翻页）。"""
-        return fetch_mcp_news(search_kw, 60 if sector_keywords else 30)
-
-    def _job_cls():
-        """财联社电报：实时滚动。板块查询时拉满 5 页（约100条）加深回溯。"""
-        return fetch_cls_telegraph(100 if sector_keywords else 50)
-
-    def _job_tushare():
-        """Tushare 新闻：逐日拉取。token 无 news 权限时整体跳过，不耗配额。"""
-        if _TUSHARE_NEWS_DENIED:
-            return []
-        pool = []
-        for d in date_list:
-            pool.extend(fetch_tushare_news(d.strftime("%Y%m%d"), 40))
-        return pool
+    deep_limit = 60 if sector_keywords else 30
 
     jobs = {
-        "sina": _job_sina,
-        "eastmoney": _job_eastmoney,
-        "mcp": _job_mcp,
-        "cls": _job_cls,
-        "tushare": _job_tushare,
+        "mcp": lambda: fetch_mcp_news(search_kw, deep_limit),
+        "flash": lambda: fetch_mcp_flash(deep_limit),
     }
 
     # 并行拉取；单源异常只记日志并降级为空列表
@@ -1608,13 +2155,13 @@ def fetch_news_pool(sector_keywords: list = None, days: int = 3) -> dict:
                 logger.warning("新闻池源 %s 拉取失败，已降级为空: %s", name, e)
                 raw[name] = []
 
-    # 统一为 {'title','time','source'} 并跨源按标题去重
-    # 优先级：实时源（东财/财联社）在前，保证重复新闻保留时间更准的一条
+    # 统一为 {'title','time','source'} 并跨源去重：精确 title + 模糊键双查
     # content/summary/brief 等正文字段随条目保留，供下游行业关键词匹配
-    today_str = today.strftime("%Y-%m-%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     seen_titles = set()
+    seen_fuzzy = set()
     pool = {}
-    for name in ("eastmoney", "cls", "mcp", "sina", "tushare"):
+    for name in ("mcp", "flash"):
         unified = []
         for it in raw[name]:
             title = (it.get("title", "") or "").strip()
@@ -1624,7 +2171,12 @@ def fetch_news_pool(sector_keywords: list = None, days: int = 3) -> dict:
             title = _sanitize_news_text(title)
             if not title or title in seen_titles:
                 continue
+            fkey = _fuzzy_title_key(title)
+            if fkey and fkey in seen_fuzzy:
+                continue
             seen_titles.add(title)
+            if fkey:
+                seen_fuzzy.add(fkey)
             entry = {
                 "title": title,
                 "time": _fmt_news_time(it.get("time", ""), today_str),
@@ -2760,7 +3312,7 @@ async def collect_market_snapshot(
         "lian_ban": loop.run_in_executor(None, fetch_lian_ban),
         "forecast": loop.run_in_executor(None, fetch_forecast, date),
         "express": loop.run_in_executor(None, fetch_express, date),
-        "block": loop.run_in_executor(None, fetch_block_trades, "", date),
+        "block": loop.run_in_executor(None, fetch_block_trades_tushare, "", date),
         "ggt": loop.run_in_executor(None, fetch_ggt_daily),
         "repurchase": loop.run_in_executor(None, fetch_repurchase, date),
         "share_float": loop.run_in_executor(None, fetch_share_float, date),

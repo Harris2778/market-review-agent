@@ -42,7 +42,7 @@ from agent.orchestrator import MarketReviewAgent
 FIXED_TRADE_DATE = datetime(2025, 1, 10)
 DAY0 = "2025-01-10"
 
-POOL_KEYS = {"sina", "eastmoney", "mcp", "cls", "tushare"}
+POOL_KEYS = {"mcp", "flash"}
 
 
 def _make_agent() -> MarketReviewAgent:
@@ -261,19 +261,18 @@ class TestNewsOnlySourceLabelRemoval:
 
     def test_item_lines_have_no_source_label(self):
         pool = _empty_pool()
-        pool["sina"] = [
-            _item("沪深两市成交额突破一万五千亿元", f"{DAY0} 09:30:00", "新浪财经"),
-        ]
-        pool["eastmoney"] = [
-            _item("北向资金单日净流入超百亿元", f"{DAY0} 10:00:00", "东方财富"),
-        ]
         pool["mcp"] = [
+            _item("沪深两市成交额突破一万五千亿元", f"{DAY0} 09:30:00", "智研"),
             _item("央行开展5000亿元MLF操作", f"{DAY0} 11:00:00", "智研"),
+        ]
+        pool["flash"] = [
+            _item("北向资金单日净流入超百亿元", f"{DAY0} 10:00:00", "智研快讯"),
         ]
         content = self._run(pool)["content"]
 
-        # 任何来源展示名都不得以【】标签形式出现在条目前缀
-        for label in ("【新浪】", "【东方财富】", "【新浪智研】", "【财联社】", "【Tushare】"):
+        # 任何来源展示名（含已弃用源）都不得以【】标签形式出现在条目前缀
+        for label in ("【智研】", "【智研快讯】",
+                      "【新浪】", "【东方财富】", "【新浪智研】", "【财联社】", "【Tushare】"):
             assert label not in content, f"条目不应再带来源标签 {label}:\n{content}"
         # 条目行格式：[时间] 标题
         assert f"[01-10 09:30] 沪深两市成交额突破一万五千亿元" in content
@@ -282,22 +281,22 @@ class TestNewsOnlySourceLabelRemoval:
     def test_header_source_stats_retained(self):
         """头部「来源：xxxN条」统计行保留（用户靠它验证多源出货）。"""
         pool = _empty_pool()
-        pool["sina"] = [
-            _item("新闻条目标题甲内容", f"{DAY0} 09:30:00", "新浪财经"),
-            _item("新闻条目标题乙内容", f"{DAY0} 10:00:00", "新浪财经"),
+        pool["mcp"] = [
+            _item("新闻条目标题甲内容", f"{DAY0} 09:30:00", "智研"),
+            _item("新闻条目标题乙内容", f"{DAY0} 10:00:00", "智研"),
         ]
-        pool["eastmoney"] = [
-            _item("北向资金单日净流入超百亿元", f"{DAY0} 11:00:00", "东方财富"),
+        pool["flash"] = [
+            _item("北向资金单日净流入超百亿元", f"{DAY0} 11:00:00", "智研快讯"),
         ]
         content = self._run(pool)["content"]
         assert "来源：" in content
-        assert "新浪2条" in content and "东方财富1条" in content
+        assert "智研2条" in content and "智研快讯1条" in content
 
     def test_external_title_symbols_stripped(self):
         """外部新闻标题混入 #/* 时，展示清单不带这两个符号。"""
         pool = _empty_pool()
-        pool["sina"] = [
-            _item("央行开展5000亿元MLF操作#重磅*解读", f"{DAY0} 09:30:00", "新浪财经"),
+        pool["mcp"] = [
+            _item("央行开展5000亿元MLF操作#重磅*解读", f"{DAY0} 09:30:00", "智研"),
         ]
         content = self._run(pool)["content"]
         assert "#" not in content and "*" not in content
@@ -315,7 +314,7 @@ class TestSectorNewsAnalysisCleaning:
 
     def _pool(self):
         pool = _empty_pool()
-        pool["sina"] = [_item(self.BANK_TITLE, f"{DAY0} 09:30:00", "新浪财经")]
+        pool["mcp"] = [_item(self.BANK_TITLE, f"{DAY0} 09:30:00", "智研")]
         return pool
 
     def test_nonstream_analysis_markdown_cleaned(self):
@@ -369,7 +368,7 @@ class TestSectorNewsAnalysisCleaning:
         # 第一块是确定性清单（不经过 LLM），且不带来源标签
         assert chunks[0].startswith("银行板块新闻汇总")
         assert self.BANK_TITLE in chunks[0]
-        assert "【新浪】" not in chunks[0]
+        assert "【智研】" not in chunks[0]
         # 解读正文在清单之后流出
         assert "偏多" in full and "降准利好银行" in full
         assert full.index(self.BANK_TITLE) < full.index("偏多")

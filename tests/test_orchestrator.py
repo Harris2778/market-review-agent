@@ -85,6 +85,11 @@ class TestDetectIntent:
             ("螺纹钢期货怎么样", "futures_query", None),
             # ── 基金查询 ──
             ("ETF基金净值", "fund_query", None),
+            # ── 基金强信号优先于板块/行业护栏（QA 实锤：消费行业基金误路由板块）──
+            ("易方达消费行业基金（110022）最新净值多少", "fund_query", None),
+            ("110022基金重仓了哪些股票", "fund_query", None),
+            ("这个基金的分红情况怎么样", "fund_query", None),
+            ("半导体行业基金净值查询", "fund_query", None),
             # ── 简单数据查询走 MCP ──
             ("今天涨停家数查询", "mcp_query", None),
             # ── general_chat 兜底 ──
@@ -288,10 +293,13 @@ class TestCacheBehavior:
 
 
 class TestNewsDedup:
-    """fetch_sina_news 跨日期返回重复标题时，最终输出中每个标题只出现一次。"""
+    """fetch_news_pool（智研双源 mcp/flash）返回重复标题时，最终输出中每个标题只出现一次。"""
 
-    def _run_news_only(self, sina_side_effect, mcp_items=None, em_items=None):
-        """驱动 _news_only，返回 result dict（content 为最终新闻文本）。"""
+    def _run_news_only(self, pool):
+        """驱动 _news_only，返回 result dict（content 为最终新闻文本）。
+
+        pool 为 fetch_news_pool 的返回 dict，契约只含 ('mcp','flash') 两键。
+        """
         agent = _make_agent()
         agent._call_llm = AsyncMock(
             return_value={"role": "assistant", "content": "placeholder"}
@@ -301,32 +309,26 @@ class TestNewsDedup:
             "agent.orchestrator._get_latest_trade_date",
             return_value=FIXED_TRADE_DATE,
         ), patch(
-            "agent.data_fetcher.fetch_sina_news",
-            MagicMock(side_effect=sina_side_effect),
-        ) as sina_mock, patch(
-            "agent.data_fetcher.fetch_mcp_news",
-            MagicMock(return_value=mcp_items or []),
-        ), patch(
-            "agent.data_fetcher.fetch_eastmoney_news",
-            MagicMock(return_value=em_items or []),
-        ):
+            "agent.data_fetcher.fetch_news_pool",
+            MagicMock(return_value=pool),
+        ) as pool_mock:
             result = asyncio.run(agent._news_only(None, stream=False))
 
-        return result, sina_mock
+        return result, pool_mock
 
     def test_duplicate_titles_deduped(self):
-        """3 天抓取中重复出现的标题，最终文本里只保留一条。"""
+        """mcp/flash 两源返回相同标题，最终文本里只保留一条。"""
         dup_items = [
             {"time": "2025-01-10 09:30:00", "title": "央行开展中期借贷便利操作"},
             {"time": "2025-01-10 10:00:00", "title": "证监会发布新规稳定市场"},
         ]
-        # 3 个日期每次都返回相同的两条（模拟跨天重复推送）
-        result, sina_mock = self._run_news_only(
-            [list(dup_items), list(dup_items), list(dup_items)]
+        # 两源返回完全相同的两条（模拟跨源重复推送）
+        result, pool_mock = self._run_news_only(
+            {"mcp": list(dup_items), "flash": list(dup_items)}
         )
 
-        # _news_only 应对 3 个日期各调用一次 fetch_sina_news
-        assert sina_mock.call_count == 3
+        # 双源聚合路径下 fetch_news_pool 只调用一次
+        assert pool_mock.call_count == 1
 
         content = result["content"]
         assert content.count("央行开展中期借贷便利操作") == 1, (
@@ -341,7 +343,7 @@ class TestNewsDedup:
             {"time": "2025-01-10 09:31:00", "title": "某大型银行发布年度业绩快报"},
             {"time": "2025-01-10 11:00:00", "title": "沪深两市成交额突破万亿元"},
         ]
-        result, _ = self._run_news_only([day_items, [], []])
+        result, _ = self._run_news_only({"mcp": day_items, "flash": []})
 
         content = result["content"]
         assert content.count("某大型银行发布年度业绩快报") == 1
@@ -354,7 +356,7 @@ class TestNewsDedup:
             {"time": "2025-01-10 09:31:00", "title": "短"},
             {"time": "2025-01-10 11:00:00", "title": "这是一条正常长度的新闻标题"},
         ]
-        result, _ = self._run_news_only([day_items, [], []])
+        result, _ = self._run_news_only({"mcp": day_items, "flash": []})
 
         content = result["content"]
         assert "这是一条正常长度的新闻标题" in content

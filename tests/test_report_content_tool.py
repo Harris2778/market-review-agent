@@ -306,12 +306,12 @@ class TestReportContentPrompt:
 
 class TestToolCatalog32:
     def test_catalog_32_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 37
+        assert len(tools_mod.TOOL_REGISTRY) == 54
         catalog = tools_mod.get_tool_catalog()
-        assert "共 37 个" in catalog
+        assert "共 54 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 37, (
-            f"目录应有 32 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 54, (
+            f"目录应有 54 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tool_in_short_desc_and_catalog(self):
@@ -347,6 +347,16 @@ class TestToolCatalog32:
             # 港美股数据源工具（新浪智研）
             "get_hk_finance_report", "get_hk_fund_flow", "get_us_fund_flow",
             "get_us_market_breadth", "get_stock_major_events",
+            # 智研 MCP 数据源工具（17 个）
+            "get_company_profile", "get_company_managers",
+            "get_shareholder_count", "get_financial_report_full",
+            "get_stock_valuation", "get_lockup_schedule",
+            "get_margin_detail", "get_block_trades",
+            "get_connect_holdings", "get_fund_info",
+            "get_fund_networth", "get_fund_holdings",
+            "get_fund_dividend", "get_forex_quote",
+            "get_commodity_futures_list", "get_hk_special_ranking",
+            "get_us_fund_flow_history",
         }
 
         # v1 研报工具分发路径不变（仍走 report_library）

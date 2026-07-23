@@ -11,8 +11,9 @@
 5. fetch_cls_telegraph：title 为空时 brief 边界截断做标题；summary 字段随条目导出；
    HTTP 非 200 安全降级。
 6. fetch_eastmoney_news/page2：标题完整保留、超长边界截断；HTTP 非 200 安全降级。
-7. fetch_news_pool 板块模式：东财加深翻第2页、财联社/东财上限提升、
-   content/summary/brief 字段随统一条目保留、Tushare denied 时整体跳过。
+7. fetch_news_pool 板块模式：智研双源加深抓取（各 60 条）、
+   content/summary/brief 字段随统一条目保留、弃用源（东财/新浪/财联社/Tushare）
+   任何模式下都不再被调用。
 
 规则：全部 mock 网络层（requests / _mcp_call / _get_pro / 五个 fetch 函数），
 零真实 API 调用；全局标记 _TUSHARE_NEWS_DENIED 用 monkeypatch 隔离。
@@ -365,81 +366,68 @@ class TestSinaNewsTime:
 
 
 # ════════════════════════════════════════════════════════════════
-# 6. fetch_news_pool：板块模式加深 + 字段保留 + Tushare 短路
+# 6. fetch_news_pool：板块模式加深 + 字段保留 + 旧源剔除
 # ════════════════════════════════════════════════════════════════
 
 
 class TestNewsPoolSectorMode:
 
-    def _patch_all(self, monkeypatch, em1=None, em2=None, mcp=None, cls=None,
-                   sina=None, tushare=None):
-        monkeypatch.setattr(data_fetcher, "fetch_eastmoney_news",
-                            MagicMock(return_value=em1 or []))
-        monkeypatch.setattr(data_fetcher, "fetch_eastmoney_news_page2",
-                            MagicMock(return_value=em2 or []))
+    def _patch_all(self, monkeypatch, mcp=None, flash=None):
         monkeypatch.setattr(data_fetcher, "fetch_mcp_news",
                             MagicMock(return_value=mcp or []))
-        monkeypatch.setattr(data_fetcher, "fetch_cls_telegraph",
-                            MagicMock(return_value=cls or []))
-        monkeypatch.setattr(data_fetcher, "fetch_sina_news",
-                            MagicMock(return_value=sina or []))
-        monkeypatch.setattr(data_fetcher, "fetch_tushare_news",
-                            MagicMock(return_value=tushare or []))
+        monkeypatch.setattr(data_fetcher, "fetch_mcp_flash",
+                            MagicMock(return_value=flash or []))
 
     def test_sector_mode_deepens_sources(self, monkeypatch):
-        """板块查询：东财 limit=100 + 翻第2页；财联社 limit=100；智研 limit=60。"""
-        monkeypatch.setattr(data_fetcher, "_TUSHARE_NEWS_DENIED", False)
+        """板块查询：智研双源加深抓取（各 60 条），mcp 以行业关键词搜索。"""
         self._patch_all(monkeypatch)
         pool = data_fetcher.fetch_news_pool(sector_keywords=["银行"], days=3)
 
-        data_fetcher.fetch_eastmoney_news.assert_called_once_with(100)
-        data_fetcher.fetch_eastmoney_news_page2.assert_called_once_with(80)
-        data_fetcher.fetch_cls_telegraph.assert_called_once_with(100)
         data_fetcher.fetch_mcp_news.assert_called_once_with("银行", 60)
-        assert set(pool.keys()) == {"sina", "eastmoney", "mcp", "cls", "tushare"}
+        data_fetcher.fetch_mcp_flash.assert_called_once_with(60)
+        assert set(pool.keys()) == {"mcp", "flash"}
 
-    def test_non_sector_mode_no_page2(self, monkeypatch):
-        """全市场查询：不翻第2页，维持原上限。"""
-        monkeypatch.setattr(data_fetcher, "_TUSHARE_NEWS_DENIED", False)
+    def test_non_sector_mode_uses_shallow_limit(self, monkeypatch):
+        """全市场查询：不加深，维持默认上限（各 30 条），mcp 用 "A股" 搜索词。"""
         self._patch_all(monkeypatch)
         data_fetcher.fetch_news_pool()
 
-        data_fetcher.fetch_eastmoney_news.assert_called_once_with(50)
-        data_fetcher.fetch_eastmoney_news_page2.assert_not_called()
-        data_fetcher.fetch_cls_telegraph.assert_called_once_with(50)
+        data_fetcher.fetch_mcp_news.assert_called_once_with("A股", 30)
+        data_fetcher.fetch_mcp_flash.assert_called_once_with(30)
 
     def test_unified_entries_preserve_body_fields(self, monkeypatch):
         """统一条目保留 content/summary/brief，供下游行业关键词匹配（误杀修复）。"""
-        monkeypatch.setattr(data_fetcher, "_TUSHARE_NEWS_DENIED", False)
-        em = [{"title": "央行开展MLF操作", "time": "2026-07-22 09:00:00",
-               "source": "东方财富", "summary": "银行业流动性充裕"}]
-        cls = [{"title": "财联社快讯：降准落地", "time": "2026-07-22 10:00:00",
-                "source": "财联社电报", "brief": "释放长期资金", "summary": "释放长期资金"}]
         mcp = [{"title": "银行快讯标题", "time": "2026-07-22 11:00:00",
                 "source": "智研", "content": "完整正文内容"}]
-        self._patch_all(monkeypatch, em1=em, cls=cls, mcp=mcp)
+        flash = [{"title": "智研快讯：降准落地", "time": "2026-07-22 10:00:00",
+                  "source": "智研快讯", "brief": "释放长期资金", "summary": "释放长期资金"}]
+        self._patch_all(monkeypatch, mcp=mcp, flash=flash)
         pool = data_fetcher.fetch_news_pool(sector_keywords=["银行"], days=3)
 
-        assert pool["eastmoney"][0]["summary"] == "银行业流动性充裕"
-        assert pool["cls"][0]["brief"] == "释放长期资金"
-        assert pool["cls"][0]["summary"] == "释放长期资金"
         assert pool["mcp"][0]["content"] == "完整正文内容"
+        assert pool["flash"][0]["brief"] == "释放长期资金"
+        assert pool["flash"][0]["summary"] == "释放长期资金"
 
-    def test_tushare_denied_skips_all_daily_calls(self, monkeypatch):
-        """Tushare 已判定无权限：池子不再逐日调用该源（3天×N次配额全省）。"""
-        monkeypatch.setattr(data_fetcher, "_TUSHARE_NEWS_DENIED", True)
+    def test_deprecated_sources_not_called(self, monkeypatch):
+        """东财/新浪/财联社/Tushare 已弃用：池子任何模式下都不调用这些源。"""
         self._patch_all(monkeypatch)
+        for fname in ("fetch_sina_news", "fetch_eastmoney_news",
+                      "fetch_eastmoney_news_page2", "fetch_cls_telegraph",
+                      "fetch_tushare_news"):
+            monkeypatch.setattr(data_fetcher, fname, MagicMock(return_value=[]))
         pool = data_fetcher.fetch_news_pool(sector_keywords=["银行"], days=3)
 
-        data_fetcher.fetch_tushare_news.assert_not_called()
-        assert pool["tushare"] == []
+        for fname in ("fetch_sina_news", "fetch_eastmoney_news",
+                      "fetch_eastmoney_news_page2", "fetch_cls_telegraph",
+                      "fetch_tushare_news"):
+            getattr(data_fetcher, fname).assert_not_called()
+        assert set(pool.keys()) == {"mcp", "flash"}
 
     def test_sector_pool_covers_two_days(self, monkeypatch):
         """48小时覆盖回归：两天的新闻都进池（修复『只覆盖一天』的数据层前提）。"""
-        monkeypatch.setattr(data_fetcher, "_TUSHARE_NEWS_DENIED", False)
-        em1 = [{"title": "今日银行快讯", "time": "2026-07-22 09:00:00", "source": "东方财富"}]
-        em2 = [{"title": "昨日银行快讯", "time": "2026-07-21 15:00:00", "source": "东方财富"}]
-        self._patch_all(monkeypatch, em1=em1, em2=em2)
+        mcp = [{"title": "今日银行快讯", "time": "2026-07-22 09:00:00", "source": "智研"}]
+        flash = [{"title": "昨日银行快讯", "time": "2026-07-21 15:00:00", "source": "智研快讯"}]
+        self._patch_all(monkeypatch, mcp=mcp, flash=flash)
         pool = data_fetcher.fetch_news_pool(sector_keywords=["银行"], days=3)
-        days = {it["time"][:10] for it in pool["eastmoney"]}
+        days = {it["time"][:10] for items in pool.values() for it in items}
         assert days == {"2026-07-22", "2026-07-21"}

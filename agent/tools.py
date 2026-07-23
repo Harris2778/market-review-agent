@@ -47,6 +47,18 @@ _SYMBOL_PARAM = {
                    "美股为裸 ticker（如 AAPL，大小写均可，不要加 us 前缀）。",
 }
 
+# ── 智研扩展数据工具共享片段（公司基本面/基金/外汇/商品期货/港美榜单）──
+
+_A_SHARE_SYMBOL_PARAM = {
+    "type": "string",
+    "description": "A 股股票代码，需带交易所前缀小写（如 sh600519、sz000002）。",
+}
+
+_FUND_CODE_PARAM = {
+    "type": "string",
+    "description": "基金代码，纯 6 位数字（如 110022），不带任何前缀。",
+}
+
 # ── 研报库工具共享片段 ──
 
 _REPORT_STOCK_CODE_PARAM = {
@@ -483,6 +495,315 @@ TOOL_REGISTRY: list = [
             "description": "获取美国宏观数据：联邦基金利率、10Y/2Y 美债收益率、利差、VIX 恐慌指数。"
                            "分析海外流动性、风险偏好时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    # ── 智研扩展数据工具（公司基本面/基金/外汇/商品期货/港美榜单）──
+    {
+        "type": "function",
+        "function": {
+            "name": "get_company_profile",
+            "description": "获取 A 股上市公司基本资料：公司简介、所属行业、上市信息、注册地址等。"
+                           "用户问公司是做什么的、主营业务、所属行业、上市时间等基本面背景时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519、sz000002）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_company_managers",
+            "description": "获取 A 股上市公司高管名单与履历：董事长/总经理/董秘等姓名、职务、简介。"
+                           "用户问公司管理层、高管背景、人事变动时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_shareholder_count",
+            "description": "获取 A 股股东户数及历史变化：最新股东户数、较上期增减、筹码集中/分散趋势。"
+                           "分析筹码集中度、散户进出动向时使用。"
+                           "code 为 A 股代码，带交易所前缀（sh600519）或纯 6 位（600519）均可，"
+                           "系统会自动去前缀。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "A 股股票代码，带交易所前缀（如 sh600519）或纯 6 位"
+                                       "（如 600519）均可，系统会自动去前缀。",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_financial_report_full",
+            "description": "获取 A 股完整财务报表（资产负债表/利润表/现金流量表明细，默认国际准则 gjzb）。"
+                           "需要财报科目级明细、做深度财务分析时使用；只要关键指标快报时不必调用本工具。"
+                           "paper_code 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paper_code": _A_SHARE_SYMBOL_PARAM,
+                    "source": {
+                        "type": "string",
+                        "default": "gjzb",
+                        "description": "报表口径数据源，缺省 gjzb（国际准则报表）；一般无需指定。",
+                    },
+                    "r_date": {
+                        "type": "string",
+                        "default": "",
+                        "description": "报告期（可选，如 2024-12-31）；留空返回最新报告期。",
+                    },
+                },
+                "required": ["paper_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_valuation",
+            "description": "获取 A 股个股估值历史：PE/PB 时间序列与当前估值水平。"
+                           "判断个股贵贱、估值分位、做历史估值对比时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_lockup_schedule",
+            "description": "获取 A 股限售解禁日程：解禁日期、解禁数量/市值、股东类型。"
+                           "评估解禁抛压、回答某股近期有无解禁时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_margin_detail",
+            "description": "获取 A 股个股融资融券明细：融资余额/融资买入额、融券余量、两融余额变化。"
+                           "分析个股杠杆资金动向、多空力量时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_block_trades",
+            "description": "获取 A 股个股大宗交易记录：成交日期、成交价/成交量/成交额、买卖营业部、折溢价率。"
+                           "跟踪机构大宗调仓、异常折价成交时使用。"
+                           "symbol 为 A 股代码，需带交易所前缀小写（如 sh600519）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _A_SHARE_SYMBOL_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_connect_holdings",
+            "description": "获取沪深港通持股榜：北向资金（沪股通/深股通/港股通）个股持股数量/比例排行。"
+                           "分析外资持仓动向、北向增持/减持个股排行时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["sh", "sz", "hk"],
+                        "default": "sh",
+                        "description": "通道类型：sh=沪股通（默认），sz=深股通，hk=港股通。",
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["hold_ratio", "hold_num", "hold_date"],
+                        "default": "hold_ratio",
+                        "description": "排序字段：hold_ratio=持股比例（默认），hold_num=持股数量，"
+                                       "hold_date=持股日期。",
+                    },
+                    "num": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": "返回条数，默认 20，最大 100。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fund_info",
+            "description": "获取公募基金档案：基金名称、类型、成立日期、规模、管理人等基本信息。"
+                           "用户问某只基金是什么类型、规模多大、哪家公司管理时使用。"
+                           "symbol 为 6 位基金代码（如 110022），不带任何前缀。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _FUND_CODE_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fund_networth",
+            "description": "获取公募基金净值：单位净值/累计净值及近期走势。"
+                           "用户问基金净值、近期涨跌表现时使用。"
+                           "symbol 为 6 位基金代码（如 110022），不带任何前缀。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _FUND_CODE_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fund_holdings",
+            "description": "获取公募基金重仓持股：前十大重仓股、占净值比例。"
+                           "分析基金持仓结构、跟踪明星基金经理调仓时使用。"
+                           "symbol 为 6 位基金代码（如 110022），不带任何前缀。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _FUND_CODE_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_fund_dividend",
+            "description": "获取公募基金分红记录：分红公告日、每份分红金额、累计分红。"
+                           "用户问基金分红历史、分红频率时使用。"
+                           "symbol 为 6 位基金代码（如 110022），不带任何前缀。",
+            "parameters": {
+                "type": "object",
+                "properties": {"symbol": _FUND_CODE_PARAM},
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_forex_quote",
+            "description": "获取外汇汇率行情：指定货币对的最新汇率与涨跌。"
+                           "回答人民币汇率、美元欧元等货币对汇率问题时使用。"
+                           "symbol 为全大写货币对代码（如 USDCNY、EURUSD）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "外汇货币对代码，全大写（如 USDCNY、EURUSD、USDJPY）。",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_commodity_futures_list",
+            "description": "获取商品期货合约列表：指定交易所（大商所/上期所/郑商所/广期所）全部上市合约。"
+                           "回答某交易所有哪些期货品种合约、查具体合约代码时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["dce", "shfe", "czce", "gfex"],
+                        "default": "dce",
+                        "description": "交易所代码：dce=大连商品交易所（默认），shfe=上海期货交易所，"
+                                       "czce=郑州商品交易所，gfex=广州期货交易所。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_hk_special_ranking",
+            "description": "获取港股特色榜单：国企股/蓝筹股/红筹股行情榜（涨跌幅、成交额排名）。"
+                           "浏览港股国企蓝筹红筹表现、找港股大盘蓝筹异动时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "enum": ["gqg_hk", "lcg_hk", "hcg_hk"],
+                        "default": "gqg_hk",
+                        "description": "榜单类型：gqg_hk=国企股榜（默认），lcg_hk=蓝筹股榜，"
+                                       "hcg_hk=红筹股榜。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_us_fund_flow_history",
+            "description": "获取美股个股主力资金流向历史：最近 N 日（默认 60 日）主力净流入/流出序列。"
+                           "分析美股个股资金趋势、主力持续进出时使用；只要当日资金流用 get_us_fund_flow。"
+                           "symbol 为美股裸 ticker（如 AAPL，不加 us 前缀）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "美股裸 ticker（如 AAPL、TSLA），不要加 us 前缀。",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 60,
+                        "default": 60,
+                        "description": "回溯天数，默认 60，最大 60（底层接口为 60 日资金流历史）。",
+                    },
+                },
+                "required": ["symbol"],
+            },
         },
     },
     {
@@ -923,6 +1244,46 @@ _IMPL = {
                                               "limit": _clamp_int(a.get("limit"), 10, 1, 20)}),
     "get_china_macro":      ("fetch_china_macro", lambda df, a: {}),
     "get_us_macro":         ("fetch_us_macro", lambda df, a: {}),
+    # ── 智研扩展数据工具（公司基本面/基金/外汇/商品期货/港美榜单）──
+    "get_company_profile":  ("fetch_company_profile",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_company_managers": ("fetch_company_managers",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_shareholder_count": ("fetch_shareholder_count",
+                              lambda df, a: {"code": a["code"]}),
+    "get_financial_report_full": ("fetch_financial_report_full",
+                                  lambda df, a: {"paper_code": a["paper_code"],
+                                                 "source": a.get("source") or "gjzb",
+                                                 "r_date": a.get("r_date") or ""}),
+    "get_stock_valuation":  ("fetch_stock_valuation",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_lockup_schedule":  ("fetch_lockup_schedule",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_margin_detail":    ("fetch_margin_detail",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_block_trades":     ("fetch_block_trades",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_connect_holdings": ("fetch_connect_holdings",
+                             lambda df, a: {"type": a.get("type") or "sh",
+                                            "sort": a.get("sort") or "hold_ratio",
+                                            "num": _clamp_int(a.get("num"), 20, 1, 100)}),
+    "get_fund_info":        ("fetch_fund_info",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_fund_networth":    ("fetch_fund_networth",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_fund_holdings":    ("fetch_fund_holdings",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_fund_dividend":    ("fetch_fund_dividend",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_forex_quote":      ("fetch_forex_quote",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_commodity_futures_list": ("fetch_commodity_futures_list",
+                                   lambda df, a: {"market": a.get("market") or "dce"}),
+    "get_hk_special_ranking": ("fetch_hk_special_ranking",
+                               lambda df, a: {"node": a.get("node") or "gqg_hk"}),
+    "get_us_fund_flow_history": ("fetch_us_fund_flow_history",
+                                 lambda df, a: {"symbol": a["symbol"],
+                                                "days": _clamp_int(a.get("days"), 60, 1, 60)}),
 }
 
 
@@ -1977,6 +2338,23 @@ _SHORT_DESC = {
     "get_stock_major_events": "上市公司重大事项（沪深/港股/美股）",
     "get_china_macro": "中国宏观数据（CPI/PMI/M2 等）",
     "get_us_macro": "美国宏观数据（美债/VIX 等）",
+    "get_company_profile": "A 股公司基本资料（简介/行业/上市信息）",
+    "get_company_managers": "A 股公司高管名单与履历",
+    "get_shareholder_count": "股东户数及筹码集中度变化",
+    "get_financial_report_full": "完整财报科目明细（默认国际准则，可按报告期）",
+    "get_stock_valuation": "个股估值历史（PE/PB 时间序列）",
+    "get_lockup_schedule": "限售解禁日程与解禁规模",
+    "get_margin_detail": "个股融资融券明细（两融资金动向）",
+    "get_block_trades": "个股大宗交易记录（折溢价/营业部）",
+    "get_connect_holdings": "沪深港通持股榜（北向持仓排行）",
+    "get_fund_info": "基金档案（类型/规模/管理人）",
+    "get_fund_networth": "基金净值走势",
+    "get_fund_holdings": "基金重仓持股（前十大重仓）",
+    "get_fund_dividend": "基金分红记录",
+    "get_forex_quote": "外汇汇率行情（货币对如 USDCNY）",
+    "get_commodity_futures_list": "商品期货合约列表（四大交易所）",
+    "get_hk_special_ranking": "港股特色榜（国企/蓝筹/红筹）",
+    "get_us_fund_flow_history": "美股主力资金流向历史（默认 60 日）",
     "search_research_reports": "券商研报检索（评级/目标价/盈利预测）",
     "get_rating_summary": "券商评级聚合（评级分布/目标价区间）",
     "search_report_content": "研报正文全文检索（观点细节/论证逻辑）",
