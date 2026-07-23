@@ -1,36 +1,42 @@
 /* ============================================================
-   金融智能体 —— 前端样式
-   低饱和暖色调 · 大量留白 · 清晰层级
+   Fine —— 前端样式（Kimi 桌面版视觉）
+   中性浅色系 · 无彩色强调 · 无渐变 · 极克制
    ============================================================ */
 
+/* ---------- 隐藏机制（修复弹层默认可见 bug 的核心） ----------
+   类选择器会覆盖 UA 的 [hidden] 规则，必须显式 !important */
+[hidden],
+.hidden {
+  display: none !important;
+}
+
 :root {
-  /* 暖色低饱和调色板 */
-  --bg: #faf7f2;            /* 页面底色：暖白 */
-  --bg-sidebar: #f3eee6;    /* 边栏底色：米色 */
-  --bg-card: #ffffff;
-  --bg-hover: #ece5d9;
-  --bg-active: #e6dccb;
-  --bg-bubble-user: #e8dcc8;      /* 用户气泡：暖沙色 */
-  --bg-bubble-assistant: #ffffff; /* 助手气泡：白 */
-  --bg-code: #f0ebe1;
-  --bg-banner: #f7e9df;
+  /* Kimi 式中性浅色 */
+  --bg: #ffffff;              /* 主背景：近白 */
+  --bg-sidebar: #f7f7f5;      /* 侧边栏：略深的浅灰米 */
+  --bg-hover: #eeeeeb;
+  --bg-active: #e9e9e6;       /* 当前会话高亮浅灰 */
+  --bg-bubble-user: #f2f2ef;  /* 用户气泡浅灰 */
+  --bg-code: #f4f4f1;
+  --bg-input: #ffffff;
+  --bg-banner: #f5f4f0;
+  --bg-auth: #fafaf8;
 
-  --text: #3d3833;          /* 主文字：暖深灰 */
-  --text-secondary: #8a8178;
-  --text-faint: #b3aa9e;
+  --text: #1c1c1a;            /* 近黑 */
+  --text-secondary: #757571;
+  --text-faint: #a8a8a2;
 
-  --accent: #b26a4b;        /* 主强调色：赭石/陶土 */
-  --accent-hover: #9d5a3e;
-  --accent-soft: #f3e3da;
+  --primary: #1f1f1d;         /* 主按钮近黑实心 */
+  --primary-hover: #000000;
+  --primary-ghost: #ededeb;   /* 次要按钮灰底 */
 
-  --border: #e2dacd;
-  --danger: #b3553f;
-  --ok: #6f8f6a;
+  --border: #e6e6e2;
+  --danger: #a8442e;          /* 克制的暗红，仅用于错误/额度告警 */
 
   --radius: 12px;
-  --radius-sm: 8px;
-  --shadow: 0 8px 30px rgba(61, 56, 51, 0.08);
-  --sidebar-w: 264px;
+  --radius-lg: 22px;          /* 输入卡片圆角 16-24px */
+  --sidebar-w: 260px;
+  --content-w: 760px;         /* 消息单列限宽 720-800px */
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -42,7 +48,7 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-size: 15px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 button { font-family: inherit; cursor: pointer; }
@@ -51,84 +57,114 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 /* ---------------- 按钮 ---------------- */
 .btn {
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   padding: 9px 18px;
   font-size: 14px;
   transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
 }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-block { width: 100%; }
-.btn-sm { padding: 5px 12px; font-size: 13px; }
+.btn-sm { padding: 4px 12px; font-size: 13px; }
 
-.btn-primary { background: var(--accent); color: #fff; }
-.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
-
-.btn-outline { background: transparent; border-color: var(--border); color: var(--text); }
-.btn-outline:hover:not(:disabled) { background: var(--bg-hover); }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
 
 .btn-ghost { background: transparent; color: var(--text-secondary); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 
+/* 新对话：全宽浅色描边（Kimi 侧边栏风格） */
+.btn-newchat {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+  text-align: left;
+  padding: 10px 14px;
+}
+.btn-newchat:hover:not(:disabled) { background: var(--bg-hover); }
+
+/* 圆形发送 / 停止按钮（输入卡片右下角） */
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: none;
+  background: var(--primary);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, opacity 0.15s ease;
+  flex-shrink: 0;
+}
+.icon-btn:hover:not(:disabled) { background: var(--primary-hover); }
+.icon-btn:disabled {
+  background: var(--primary-ghost);
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+#stop-btn { font-size: 11px; }
+
 /* ============================================================
-   登录 / 注册
+   登录 / 注册（Kimi 化：居中窄卡片、近黑主按钮、浅灰输入框）
    ============================================================ */
 .auth-view {
   min-height: 100vh;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
   padding: 24px;
+  background: var(--bg-auth);
 }
 
 .auth-card {
   width: 100%;
-  max-width: 380px;
-  background: var(--bg-card);
+  max-width: 360px;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 16px;
-  box-shadow: var(--shadow);
-  padding: 40px 36px 32px;
+  padding: 44px 36px 36px;
 }
 
-.auth-app-name {
-  font-size: 24px;
-  font-weight: 600;
+.auth-brand {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
   text-align: center;
-  letter-spacing: 1px;
+  color: var(--text);
 }
 .auth-subtitle {
   text-align: center;
   color: var(--text-secondary);
   font-size: 13px;
-  margin: 8px 0 28px;
+  margin: 6px 0 30px;
 }
 
 .auth-tabs {
   display: flex;
   background: var(--bg-sidebar);
-  border-radius: var(--radius-sm);
-  padding: 4px;
+  border-radius: 10px;
+  padding: 3px;
   margin-bottom: 24px;
 }
 .auth-tab {
   flex: 1;
   border: none;
   background: transparent;
-  padding: 8px 0;
-  border-radius: 6px;
+  padding: 7px 0;
+  border-radius: 8px;
   font-size: 14px;
   color: var(--text-secondary);
   transition: background 0.15s ease, color 0.15s ease;
 }
 .auth-tab.active {
-  background: var(--bg-card);
+  background: var(--bg);
   color: var(--text);
   font-weight: 600;
-  box-shadow: 0 1px 4px rgba(61, 56, 51, 0.08);
 }
 
-.field { display: block; margin-bottom: 16px; }
+.field { display: block; margin-bottom: 14px; }
 .field-label {
   display: block;
   font-size: 13px;
@@ -138,25 +174,22 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .field input {
   width: 100%;
   padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--bg-sidebar);
   outline: none;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
-.field input:focus { border-color: var(--accent); }
+.field input:focus {
+  border-color: var(--text-faint);
+  background: var(--bg);
+}
 
 .auth-error {
   color: var(--danger);
   font-size: 13px;
   margin-bottom: 12px;
   min-height: 18px;
-}
-
-.auth-footer {
-  margin-top: 20px;
-  color: var(--text-faint);
-  font-size: 12px;
 }
 
 /* ============================================================
@@ -178,12 +211,20 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   flex-direction: column;
 }
 
-.sidebar-top { padding: 16px 14px 10px; }
+.sidebar-brand {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  padding: 20px 18px 12px;
+}
+
+.sidebar-top { padding: 0 12px 10px; }
 
 .conv-list-wrap {
   flex: 1;
   overflow-y: auto;
-  padding: 4px 8px;
+  padding: 2px 8px;
 }
 
 .conv-list { list-style: none; }
@@ -192,9 +233,9 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   position: relative;
   display: flex;
   align-items: center;
-  border-radius: var(--radius-sm);
-  padding: 9px 12px;
-  margin-bottom: 2px;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 1px;
   cursor: pointer;
   color: var(--text-secondary);
   transition: background 0.12s ease;
@@ -203,7 +244,6 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .conv-item.active {
   background: var(--bg-active);
   color: var(--text);
-  font-weight: 500;
 }
 
 .conv-title {
@@ -219,14 +259,14 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   border: none;
   background: transparent;
   color: var(--text-faint);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1;
   padding: 4px 6px;
   border-radius: 6px;
   flex-shrink: 0;
 }
 .conv-item:hover .conv-del { display: block; }
-.conv-del:hover { color: var(--danger); background: rgba(179, 85, 63, 0.1); }
+.conv-del:hover { color: var(--text); background: rgba(0, 0, 0, 0.06); }
 
 .conv-empty {
   text-align: center;
@@ -235,30 +275,17 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   padding: 24px 0;
 }
 
-/* ---------------- 用户信息条 ---------------- */
+/* ---------------- 底部用户区（低调） ---------------- */
 .user-bar {
   border-top: 1px solid var(--border);
-  padding: 12px 14px 14px;
+  padding: 12px 16px 12px;
 }
 
 .user-bar-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
-}
-.user-avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: 600;
-  flex-shrink: 0;
+  margin-bottom: 8px;
 }
 .user-name {
   flex: 1;
@@ -273,30 +300,30 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
 }
 .quota-track {
   flex: 1;
-  height: 6px;
+  height: 4px;
   background: var(--border);
-  border-radius: 3px;
+  border-radius: 2px;
   overflow: hidden;
 }
 .quota-fill {
   height: 100%;
   width: 0%;
-  background: var(--ok);
-  border-radius: 3px;
+  background: #9a9a94;
+  border-radius: 2px;
   transition: width 0.3s ease;
 }
 .quota-fill.low { background: var(--danger); }
 .quota-text {
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--text-faint);
   white-space: nowrap;
 }
 
-.user-bar-actions .btn { width: 100%; }
+.topup-entry { padding-left: 0; }
 
 /* ---------------- 主区域 ---------------- */
 .main {
@@ -311,10 +338,10 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   align-items: center;
   justify-content: center;
   gap: 12px;
-  padding: 10px 20px;
+  padding: 9px 20px;
   background: var(--bg-banner);
   border-bottom: 1px solid var(--border);
-  color: var(--danger);
+  color: var(--text);
   font-size: 14px;
 }
 .quota-banner-reset {
@@ -322,101 +349,122 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   font-size: 13px;
 }
 
+/* ---------------- 消息区（单列居中限宽） ---------------- */
 .messages {
   flex: 1;
   overflow-y: auto;
-  padding: 28px 0 12px;
+  padding: 24px 0 16px;
 }
 
-.welcome {
-  max-width: 720px;
-  margin: 18vh auto 0;
-  text-align: center;
-  color: var(--text-secondary);
-  padding: 0 24px;
-}
-.welcome h2 {
-  color: var(--text);
-  font-size: 26px;
-  font-weight: 600;
-  margin-bottom: 10px;
-  letter-spacing: 1px;
-}
-
-/* ---------------- 消息 ---------------- */
 .msg-row {
-  max-width: 780px;
+  max-width: var(--content-w);
   margin: 0 auto;
-  padding: 8px 24px;
+  padding: 10px 24px;
   display: flex;
 }
 .msg-row.user { justify-content: flex-end; }
 .msg-row.assistant { justify-content: flex-start; }
 
 .msg-bubble {
-  max-width: 82%;
-  padding: 12px 16px;
-  border-radius: var(--radius);
+  max-width: 85%;
   font-size: 15px;
   word-wrap: break-word;
   overflow-wrap: anywhere;
 }
+/* 用户：浅灰圆角气泡靠右 */
 .msg-row.user .msg-bubble {
   background: var(--bg-bubble-user);
-  border-bottom-right-radius: 4px;
+  border-radius: 18px;
+  padding: 10px 16px;
   white-space: pre-wrap;
 }
+/* 助手：无气泡，纯净文本流直接排版（Kimi 风格） */
 .msg-row.assistant .msg-bubble {
-  background: var(--bg-bubble-assistant);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 4px;
-  min-width: 48px;
+  max-width: 100%;
+  width: 100%;
+  padding: 2px 0;
 }
 
 .msg-bubble.thinking {
   color: var(--text-faint);
   font-style: italic;
-  border-color: transparent;
-  background: transparent;
-  padding-left: 4px;
 }
 
-/* ---------------- 输入区 ---------------- */
-.composer {
-  border-top: 1px solid var(--border);
-  padding: 14px 24px 18px;
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  max-width: 828px;
-  width: 100%;
-  margin: 0 auto;
+.stopped-note {
+  color: var(--text-faint);
+  font-size: 13px;
+  margin-top: 6px;
 }
 
-#input {
+/* ---------------- 空状态（居中问候 + 大输入卡片） ---------------- */
+.welcome {
   flex: 1;
-  resize: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 24px 8vh;
+}
+.welcome-title {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+.welcome-sub {
+  color: var(--text-secondary);
+  font-size: 15px;
+  margin-bottom: 32px;
+}
+.composer-slot {
+  width: 100%;
+  max-width: var(--content-w);
+}
+
+/* ---------------- 大输入卡片（Kimi 标志性设计） ---------------- */
+.composer-slot-bottom {
+  margin: 0 auto;
+  padding: 8px 24px 20px;
+}
+
+.composer {
+  background: var(--bg-input);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-card);
-  padding: 12px 14px;
-  max-height: 180px;
-  line-height: 1.5;
-  outline: none;
+  border-radius: var(--radius-lg);
+  padding: 14px 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   transition: border-color 0.15s ease;
 }
-#input:focus { border-color: var(--accent); }
-#input:disabled { background: var(--bg-sidebar); color: var(--text-faint); }
+.composer:focus-within { border-color: var(--text-faint); }
 
-.composer-actions { display: flex; gap: 8px; flex-shrink: 0; }
+#input {
+  width: 100%;
+  resize: none;
+  border: none;
+  background: transparent;
+  padding: 0 2px;
+  max-height: 180px;
+  line-height: 1.6;
+  outline: none;
+}
+#input::placeholder { color: var(--text-faint); }
+#input:disabled { color: var(--text-faint); }
+
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 /* ============================================================
-   加油包弹层
+   加油包弹层（默认 [hidden]+.hidden 双保险，见文件顶部）
    ============================================================ */
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(61, 56, 51, 0.35);
+  background: rgba(0, 0, 0, 0.28);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -425,17 +473,17 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 }
 
 .modal {
-  background: var(--bg-card);
+  background: var(--bg);
   border-radius: 16px;
-  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
   width: 100%;
   max-width: 380px;
-  padding: 32px 28px 24px;
+  padding: 30px 28px 22px;
 }
 
-.modal-title { font-size: 18px; font-weight: 600; margin-bottom: 10px; }
+.modal-title { font-size: 17px; font-weight: 600; margin-bottom: 10px; }
 .modal-desc { color: var(--text-secondary); font-size: 14px; margin-bottom: 20px; }
-.modal-pack { margin-bottom: 16px; }
+.modal-pack { margin-bottom: 14px; }
 .modal-note {
   text-align: center;
   color: var(--text-faint);
@@ -446,7 +494,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   text-align: center;
   color: var(--text-secondary);
   font-size: 13px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 /* ============================================================
@@ -454,7 +502,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
    ============================================================ */
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
   margin: 16px 0 8px;
-  line-height: 1.4;
+  line-height: 1.45;
   font-weight: 600;
 }
 .md h1 { font-size: 20px; }
@@ -462,7 +510,8 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .md h3 { font-size: 16px; }
 .md h4, .md h5, .md h6 { font-size: 15px; }
 .md h1:first-child, .md h2:first-child, .md h3:first-child,
-.md p:first-child, .md ul:first-child, .md ol:first-child { margin-top: 0; }
+.md p:first-child, .md ul:first-child, .md ol:first-child,
+.md table:first-child, .md pre:first-child { margin-top: 0; }
 
 .md p { margin: 8px 0; }
 .md p:last-child { margin-bottom: 0; }
@@ -480,7 +529,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 .md pre {
   background: var(--bg-code);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   padding: 12px 14px;
   margin: 10px 0;
   overflow-x: auto;
@@ -500,13 +549,13 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 }
 .md th { background: var(--bg-sidebar); font-weight: 600; }
 
-.md a { color: var(--accent); text-decoration: underline; }
-.md a:hover { color: var(--accent-hover); }
+.md a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
+.md a:hover { color: var(--text-secondary); }
 
 .md strong { font-weight: 600; }
 
 /* ---------------- 窄屏适配 ---------------- */
 @media (max-width: 720px) {
-  .sidebar { width: 220px; }
+  .sidebar { width: 216px; }
   .msg-bubble { max-width: 92%; }
 }

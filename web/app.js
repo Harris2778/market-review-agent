@@ -1,12 +1,12 @@
 /* ============================================================
-   app.js —— 金融智能体前端主逻辑
-   纯原生 JS，零依赖。接口契约见 HANDOFF / 后端 /api/* 实现。
+   app.js —— Fine 前端主逻辑
+   纯原生 JS，零依赖。接口契约见后端 /api/* 实现。
    ============================================================ */
 (function () {
   'use strict';
 
   /* ==================== 可配置常量 ==================== */
-  var APP_NAME = '金融智能体';   // 页面标题 / 品牌名，改名只动这里
+  var APP_NAME = 'Fine';         // 品牌名 / 页面标题，改名只动这里
   var PACK_SIZE = 50;            // 每个加油包条数（与后端 WEB_PACK_SIZE 默认一致）
   var STORAGE_TOKEN = 'fia_token';
   var STORAGE_USER = 'fia_username';
@@ -27,7 +27,6 @@
   var convList = $('conv-list');
   var convEmpty = $('conv-empty');
   var userName = $('user-name');
-  var userAvatar = $('user-avatar');
   var logoutBtn = $('logout-btn');
   var quotaFill = $('quota-fill');
   var quotaText = $('quota-text');
@@ -39,6 +38,9 @@
   var quotaBannerReset = $('quota-banner-reset');
   var messagesEl = $('messages');
   var welcomeEl = $('welcome');
+  var composer = $('composer');
+  var composerCenterSlot = $('composer-center-slot');
+  var composerBottomSlot = $('composer-bottom-slot');
   var input = $('input');
   var sendBtn = $('send-btn');
   var stopBtn = $('stop-btn');
@@ -68,9 +70,20 @@
     return node;
   }
 
+  /* 隐藏统一走「hidden 属性 + .hidden 类」双保险，
+     CSS 侧 [hidden]/.hidden 均为 display:none !important */
   function setHidden(node, hidden) {
-    if (hidden) node.setAttribute('hidden', '');
-    else node.removeAttribute('hidden');
+    if (hidden) {
+      node.setAttribute('hidden', '');
+      node.classList.add('hidden');
+    } else {
+      node.removeAttribute('hidden');
+      node.classList.remove('hidden');
+    }
+  }
+
+  function isHidden(node) {
+    return node.hasAttribute('hidden');
   }
 
   function authHeaders(extra) {
@@ -115,6 +128,7 @@
     setHidden(appView, true);
     setHidden(authView, false);
     setQuotaBanner(false);
+    closeTopupModal();           // 回到登录页时绝不残留弹层
     authPassword.value = '';
     authUsername.focus();
   }
@@ -200,9 +214,7 @@
   }
 
   function renderUserBar() {
-    var name = state.username || '—';
-    userName.textContent = name;
-    userAvatar.textContent = name.charAt(0).toUpperCase();
+    userName.textContent = state.username || '—';
 
     var me = state.me;
     if (!me) {
@@ -226,7 +238,6 @@
     var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
     setQuotaBanner(!!exhausted);
     input.disabled = !!exhausted;
-    sendBtn.disabled = !!exhausted || state.streaming;
     if (exhausted && me.reset_date) {
       quotaBannerReset.textContent = '将于 ' + formatDate(me.reset_date) + ' 自动重置';
       modalResetDate.textContent = '月度额度将于 ' + formatDate(me.reset_date) + ' 自动重置。';
@@ -234,6 +245,7 @@
       quotaBannerReset.textContent = '次月1日自动重置';
       modalResetDate.textContent = '月度额度将于次月1日自动重置。';
     }
+    updateSendState();
   }
 
   function setQuotaBanner(show) {
@@ -247,7 +259,9 @@
     return (d.getMonth() + 1) + '月' + d.getDate() + '日';
   }
 
-  /* ==================== 加油包 ==================== */
+  /* ==================== 加油包弹层 ====================
+     只在两处打开：用户点「加油包」入口 / 429 额度耗尽。
+     关闭路径：暂不购买按钮、遮罩点击、Esc 键。 */
   function openTopupModal() { setHidden(topupModal, false); }
   function closeTopupModal() { setHidden(topupModal, true); }
 
@@ -329,11 +343,24 @@
     }
   }
 
+  /* ==================== 空状态 / 对话状态布局 ====================
+     空状态：welcome 居中（问候语 + 居中输入卡片）；
+     对话状态：messages 滚动区 + 底部输入卡片。
+     同一个 #composer 节点在两个插槽之间移动。 */
+  function showWelcome(show) {
+    setHidden(welcomeEl, !show);
+    setHidden(messagesEl, show);
+    if (show) {
+      composerCenterSlot.appendChild(composer);
+    } else {
+      composerBottomSlot.appendChild(composer);
+    }
+  }
+
   function startNewChat() {
     state.activeConvId = null;
     messagesEl.innerHTML = '';
-    messagesEl.appendChild(welcomeEl);
-    setHidden(welcomeEl, false);
+    showWelcome(true);
     renderConvList();
     input.focus();
   }
@@ -341,14 +368,17 @@
   /* ==================== 消息渲染 ==================== */
   function renderMessages(messages) {
     messagesEl.innerHTML = '';
-    messagesEl.appendChild(welcomeEl);
-    setHidden(welcomeEl, messages.length > 0);
+    if (!messages.length) {
+      showWelcome(true);
+      return;
+    }
+    showWelcome(false);
     messages.forEach(function (m) { appendMessage(m.role, m.content); });
     scrollToBottom();
   }
 
   function appendMessage(role, content) {
-    setHidden(welcomeEl, true);
+    showWelcome(false);
     var row = el('div', 'msg-row ' + (role === 'user' ? 'user' : 'assistant'));
     var bubble = el('div', 'msg-bubble');
     if (role === 'assistant') {
@@ -368,6 +398,13 @@
   }
 
   /* ==================== 发送与 SSE 流 ==================== */
+  function updateSendState() {
+    var me = state.me;
+    var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
+    // 无内容 / 额度耗尽时发送键置灰；流式期间隐藏发送键改显停止键
+    sendBtn.disabled = !!exhausted || !input.value.trim();
+  }
+
   async function sendMessage() {
     var text = input.value.trim();
     if (!text || state.streaming) return;
@@ -404,7 +441,8 @@
       if (e && e.name === 'AbortError') {
         bubble.classList.remove('thinking');
         if (!bubble.dataset.filled) bubble.innerHTML = '';
-        bubble.insertAdjacentHTML('beforeend', '<p style="color:var(--text-faint);font-size:13px">（已停止生成）</p>');
+        var note = el('p', 'stopped-note', '（已停止生成）');
+        bubble.appendChild(note);
       } else if (e && e.quotaExhausted) {
         // 429：服务端未落库，移除本地乐观气泡并恢复输入
         removeLastTwoBubbles();
@@ -432,19 +470,16 @@
       last.parentNode.removeChild(last);
       rows = messagesEl.querySelectorAll('.msg-row');
     }
-    if (rows.length === 0) setHidden(welcomeEl, false);
+    if (rows.length === 0) showWelcome(true);
   }
 
   function setStreaming(on) {
     state.streaming = on;
     setHidden(sendBtn, on);
     setHidden(stopBtn, !on);
-    var me = state.me;
-    var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
-    sendBtn.disabled = !!exhausted;
-    input.disabled = !!exhausted;
     if (!on) {
       state.abortController = null;
+      updateSendState();
       input.focus();
     }
   }
@@ -525,11 +560,16 @@
     }
   }
 
+  function handleInput() {
+    autoResize();
+    updateSendState();
+  }
+
   /* ==================== 初始化 ==================== */
   function applyBranding() {
     document.title = APP_NAME;
     $('auth-app-name').textContent = APP_NAME;
-    $('welcome-title').textContent = APP_NAME;
+    $('welcome-title').textContent = '你好，我是 ' + APP_NAME;
   }
 
   function bindEvents() {
@@ -541,13 +581,17 @@
     sendBtn.addEventListener('click', sendMessage);
     stopBtn.addEventListener('click', stopStreaming);
     input.addEventListener('keydown', handleKeydown);
-    input.addEventListener('input', autoResize);
-    topupEntryBtn.addEventListener('click', openTopupModal);
-    quotaBannerBtn.addEventListener('click', openTopupModal);
-    buyPackBtn.addEventListener('click', buyPack);
-    topupCloseBtn.addEventListener('click', closeTopupModal);
-    topupModal.addEventListener('click', function (ev) {
+    input.addEventListener('input', handleInput);
+
+    /* 加油包弹层：三个关闭路径 + 两个打开入口 */
+    topupEntryBtn.addEventListener('click', openTopupModal);      // 打开：用户主动
+    quotaBannerBtn.addEventListener('click', openTopupModal);     // 打开：额度提示条
+    topupCloseBtn.addEventListener('click', closeTopupModal);     // 关闭①：暂不购买
+    topupModal.addEventListener('click', function (ev) {          // 关闭②：点击遮罩
       if (ev.target === topupModal) closeTopupModal();
+    });
+    document.addEventListener('keydown', function (ev) {          // 关闭③：Esc 键
+      if (ev.key === 'Escape' && !isHidden(topupModal)) closeTopupModal();
     });
   }
 
@@ -556,6 +600,8 @@
     bindEvents();
     setAuthMode('login');
     buyPackBtn.textContent = '购买加油包（+' + PACK_SIZE + '条）';
+    closeTopupModal();      // 保险：任何初始路径下弹层都处于关闭态
+    updateSendState();
 
     if (state.token) {
       // 已有 token：验证有效性，有效则直接进入主界面

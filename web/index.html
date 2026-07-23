@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="data:,">
-  <title>金融智能体</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <title>Fine</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
   <!-- ============ 未登录：登录 / 注册 ============ -->
   <div id="auth-view" class="auth-view" hidden>
     <div class="auth-card">
-      <h1 class="auth-app-name" id="auth-app-name">金融智能体</h1>
-      <p class="auth-subtitle">每日市场复盘与金融洞察助手</p>
+      <div class="auth-brand" id="auth-app-name">Fine</div>
+      <p class="auth-subtitle">金融智能体</p>
 
       <div class="auth-tabs" role="tablist">
         <button type="button" id="tab-login" class="auth-tab active" role="tab">登录</button>
@@ -33,7 +33,6 @@
         <button type="submit" id="auth-submit" class="btn btn-primary btn-block">登录</button>
       </form>
     </div>
-    <p class="auth-footer">登录后即可开始对话 · 每月赠送免费额度</p>
   </div>
 
   <!-- ============ 已登录：主界面 ============ -->
@@ -41,8 +40,10 @@
 
     <!-- 左侧边栏 -->
     <aside class="sidebar">
+      <div class="sidebar-brand">Fine</div>
+
       <div class="sidebar-top">
-        <button type="button" id="new-chat-btn" class="btn btn-primary btn-block">＋ 新对话</button>
+        <button type="button" id="new-chat-btn" class="btn btn-newchat btn-block">＋ 新对话</button>
       </div>
 
       <nav class="conv-list-wrap">
@@ -52,7 +53,6 @@
 
       <div class="user-bar">
         <div class="user-bar-row">
-          <span class="user-avatar" id="user-avatar">U</span>
           <span class="user-name" id="user-name">—</span>
           <button type="button" id="logout-btn" class="btn btn-ghost btn-sm" title="退出登录">退出</button>
         </div>
@@ -62,9 +62,7 @@
           </div>
           <span class="quota-text" id="quota-text">—</span>
         </div>
-        <div class="user-bar-actions">
-          <button type="button" id="topup-entry-btn" class="btn btn-outline btn-sm">加油包 <span id="pack-count"></span></button>
-        </div>
+        <button type="button" id="topup-entry-btn" class="btn btn-ghost btn-sm topup-entry">加油包 <span id="pack-count"></span></button>
       </div>
     </aside>
 
@@ -76,25 +74,30 @@
         <span class="quota-banner-reset" id="quota-banner-reset">次月1日自动重置</span>
       </div>
 
-      <div id="messages" class="messages">
-        <div id="welcome" class="welcome">
-          <h2 id="welcome-title">金融智能体</h2>
-          <p>输入你的问题，例如「帮我复盘今天的 A 股市场」。</p>
-        </div>
+      <div id="messages" class="messages"></div>
+
+      <!-- 空状态：居中问候 + 居中大输入卡片 -->
+      <div id="welcome" class="welcome" hidden>
+        <h2 class="welcome-title" id="welcome-title">你好，我是 Fine</h2>
+        <p class="welcome-sub">有什么可以帮你？</p>
+        <div id="composer-center-slot" class="composer-slot"></div>
       </div>
 
-      <div class="composer">
-        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-        <div class="composer-actions">
-          <button type="button" id="send-btn" class="btn btn-primary">发送</button>
-          <button type="button" id="stop-btn" class="btn btn-outline" hidden>停止</button>
+      <div id="composer-bottom-slot" class="composer-slot composer-slot-bottom">
+        <!-- 大输入卡片（Kimi 风格）：textarea + 右下角圆形发送键 -->
+        <div id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+          <div class="composer-actions">
+            <button type="button" id="stop-btn" class="icon-btn" hidden title="停止生成">■</button>
+            <button type="button" id="send-btn" class="icon-btn" title="发送" disabled>↑</button>
+          </div>
         </div>
       </div>
     </main>
   </div>
 
-  <!-- ============ 加油包弹层 ============ -->
-  <div id="topup-modal" class="modal-mask" hidden>
+  <!-- ============ 加油包弹层（默认隐藏） ============ -->
+  <div id="topup-modal" class="modal-mask hidden" hidden>
     <div class="modal">
       <h3 class="modal-title">购买加油包</h3>
       <p class="modal-desc">
@@ -109,7 +112,7 @@
     </div>
   </div>
 
-  <script src="/static/markdown.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="markdown.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
