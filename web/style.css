@@ -643,6 +643,21 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 /* ---------------- 生成中灵动小球 ---------------- */
 .gen-stage { padding: 6px 0; }
+.gen-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+.gen-label {
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1;
+}
+/* 首帧到达后：小球停动，文案变「思考已完成」 */
+.gen-status.done .gen-ball,
+.gen-status.done .gen-eye { animation: none; }
+.gen-content { min-height: 1em; }
 .gen-ball {
   display: inline-block;
   width: 26px;

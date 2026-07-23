@@ -23,11 +23,14 @@
       '/questions?offset=' + offset + '&limit=' + limit;
   }
 
-  /* 生成中占位小球（双眼高光，流式首帧到达后被 markdown 覆盖替换） */
+  /* 生成中占位：小球 + 状态文案（思考中→首帧到达变「思考已完成」，流结束移除） */
   var GEN_BALL_HTML =
+    '<span class="gen-status">' +
     '<span class="gen-ball">' +
     '<span class="gen-eye left"></span>' +
     '<span class="gen-eye right"></span>' +
+    '</span>' +
+    '<span class="gen-label">正在思考中</span>' +
     '</span>';
 
   /* ==================== DOM 引用 ==================== */
@@ -637,7 +640,7 @@
   /* ==================== 对话操作菜单 ==================== */
   function openConvMenu(conv, anchorBtn) {
     state.menuConvId = conv.id;
-    menuPin.textContent = conv.pinned ? '📌 取消置顶' : '📌 置顶';
+    menuPin.textContent = conv.pinned ? '取消置顶' : '置顶';
 
     var rect = anchorBtn.getBoundingClientRect();
     var menuW = 148, menuH = 120;
@@ -927,10 +930,21 @@
           var delta = json.choices && json.choices[0] && json.choices[0].delta;
           if (delta && typeof delta.content === 'string' && delta.content) {
             full += delta.content;
-            bubble.dataset.filled = '1';
-            bubble.classList.remove('gen-stage');
-            bubble.classList.add('md');
-            bubble.innerHTML = window.renderMarkdown(full);  // 覆盖生成中小球
+            if (!bubble.dataset.filled) {
+              // 首帧到达：状态从「正在思考中」切换为「思考已完成」，正文在下方流式渲染
+              bubble.dataset.filled = '1';
+              bubble.classList.remove('gen-stage');
+              bubble.classList.add('md');
+              var status = bubble.querySelector('.gen-status');
+              if (status) {
+                status.classList.add('done');
+                var label = status.querySelector('.gen-label');
+                if (label) label.textContent = '思考已完成';
+              }
+              bubble.appendChild(el('div', 'gen-content'));
+            }
+            var content = bubble.querySelector('.gen-content') || bubble;
+            content.innerHTML = window.renderMarkdown(full);
             scrollToBottom();
           }
         } catch (parseErr) { /* 忽略不完整/非 JSON 行 */ }
@@ -941,6 +955,10 @@
       bubble.classList.remove('gen-stage');
       bubble.classList.remove('md');
       bubble.textContent = '（未收到回复内容）';
+    } else {
+      // 流正常完成：移除「思考已完成」状态行，只留正文
+      var doneStatus = bubble.querySelector('.gen-status');
+      if (doneStatus) doneStatus.parentNode.removeChild(doneStatus);
     }
   }
 
