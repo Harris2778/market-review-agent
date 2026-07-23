@@ -150,8 +150,8 @@ SLIM_POST_KEYS = {"platform", "title", "metrics", "url",
 class TestSocialToolRegistry:
 
     def test_registry_total_32(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 54, (
-            f"TOOL_REGISTRY 应为 54 个工具（37 + 17 智研 MCP），"
+        assert len(tools_mod.TOOL_REGISTRY) == 55, (
+            f"TOOL_REGISTRY 应为 55 个工具（37 + 17 智研 MCP），"
             f"实际 {len(tools_mod.TOOL_REGISTRY)}"
         )
 
@@ -195,7 +195,7 @@ class TestSocialToolRegistry:
         catalog = tools_mod.get_tool_catalog()
         assert "get_social_hot" in catalog
         assert "search_social_media" in catalog
-        assert "共 54 个" in catalog
+        assert "共 55 个" in catalog
 
 
 # ════════════════════════════════════════════════════════════════

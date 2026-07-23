@@ -457,8 +457,11 @@ class TestFmtNewsTimeFallback:
     def test_valid_time_unaffected_by_fallback(self):
         assert orch_mod._fmt_news_time(f"{DAY0} 09:30:00") == "01-10 09:30"
         assert orch_mod._fmt_news_time(f"{DAY0} 09:30:00", fallback="X") == "01-10 09:30"
-        # 短日期（不足16字符）原样返回
-        assert orch_mod._fmt_news_time(DAY0, fallback="X") == DAY0
+
+    def test_date_only_time_rendered_as_mm_dd(self):
+        """仅日期（无时刻）统一显示为 MM-DD，与有时间条目同风格。"""
+        assert orch_mod._fmt_news_time(DAY0) == "01-10"
+        assert orch_mod._fmt_news_time(DAY0, fallback="X") == "01-10"
 
 
 class TestEmptyTimeRendering:
@@ -539,10 +542,11 @@ class TestNewsOnlyNoTimeItems:
             f"无时间条目未归入交易日分组:\n{content}"
         )
         assert f"--- {DAY1}（1条）---" in content
-        # 渲染时间位置为交易日兜底；条目格式为「[时间] 标题」，不再带【来源】标签
+        # 渲染时间位置为交易日兜底（MM-DD 短格式，与有时间条目同风格）；
+        # 条目格式为「[时间] 标题」，不再带【来源】标签
         line = next(l for l in content.splitlines() if self.NO_TIME_TITLE in l)
-        assert line == f"[{DAY0}] {self.NO_TIME_TITLE}", (
-            f"无时间条目渲染格式异常（应为 [时间] 标题、无来源标签）: {line}"
+        assert line == f"[{DAY0[5:]}] {self.NO_TIME_TITLE}", (
+            f"无时间条目渲染格式异常（应为 [MM-DD] 标题、无来源标签）: {line}"
         )
         # 头部总条数含无时间条目
         assert "共2条" in content
@@ -886,3 +890,179 @@ class TestNewsOnlyDefensiveDisplay:
             f"摘要展示不应超过 200 字上限（含省略号）: {len(text_part)} 字"
         )
         assert text_part.endswith("……")
+
+
+# ════════════════════════════════════════════════════════════════
+# 13. 展示时间线修复：截断后按时间倒序 + 无时刻条目格式与位置 + 头部跨度
+# ════════════════════════════════════════════════════════════════
+
+
+class TestFmtNewsSpan:
+    """_fmt_news_span：头部覆盖时间段统一 MM-DD HH:MM 格式。"""
+
+    def test_empty_returns_empty(self):
+        assert orch_mod._fmt_news_span([]) == ""
+        assert orch_mod._fmt_news_span(["", None]) == ""
+
+    def test_same_day_writes_date_once(self):
+        span = orch_mod._fmt_news_span(
+            [f"{DAY0} 09:30:00", f"{DAY0} 18:07:00"]
+        )
+        assert span == "覆盖01-10 09:30~18:07", f"同日跨度应只写一次日期: {span}"
+
+    def test_date_only_item_treated_as_that_day(self):
+        """无时刻（仅日期）条目参与 min/max 时按当日处理，
+        不输出「裸日期~时刻」混搭（生产实锤：覆盖2026-07-23~07-23 18:07）。"""
+        span = orch_mod._fmt_news_span(
+            [DAY0, f"{DAY0} 17:46:00", f"{DAY0} 18:07:00"]
+        )
+        assert span == "覆盖01-10 17:46~18:07", f"仅日期条目应按当日处理: {span}"
+        assert DAY0 not in span, f"跨度中不应出现完整 ISO 日期: {span}"
+
+    def test_multi_day_span(self):
+        span = orch_mod._fmt_news_span(
+            [f"{DAY1} 10:00:00", f"{DAY0} 09:30:00"]
+        )
+        assert span == "覆盖01-09 10:00~01-10 09:30", (
+            f"多日跨度应为 MM-DD HH:MM~MM-DD HH:MM: {span}"
+        )
+
+    def test_all_date_only(self):
+        assert orch_mod._fmt_news_span([DAY0]) == "覆盖01-10"
+        assert orch_mod._fmt_news_span([DAY0, DAY1]) == "覆盖01-09~01-10"
+
+
+class TestNewsOnlyDisplayTimeline:
+    """_news_only 展示时间线：截断只用于选择，展示一律按时间倒序；
+    无时刻条目显示 [MM-DD] 并排在该日分组最后；头部跨度格式统一。"""
+
+    def _run(self, pool, message="今天有什么新闻") -> str:
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "占位"}
+        )
+        with _mock_news_pool(pool):
+            return _run_message(agent, message)["content"]
+
+    def test_truncated_display_sorted_by_time_desc(self):
+        """40 条 → 截到 30 条：重要性只决定保留谁，展示顺序按时间倒序。"""
+        import re as _re
+
+        # 36 条普通快讯（时间 10:00~15:35），4 条高分新闻故意用早盘时间
+        fillers = [
+            _item(f"市场日常资金动态快讯第{i:02d}期",
+                  f"{DAY0} {10 + (i % 6):02d}:{i % 60:02d}:00", "智研")
+            for i in range(36)
+        ]
+        important = [
+            _item("A上市公司业绩预告净利润同比预增300%", f"{DAY0} 09:01:00", "智研"),
+            _item("证监会发布重磅政策稳定资本市场预期", f"{DAY0} 09:02:00", "智研"),
+            _item("B上市公司股价异动午后直线涨停", f"{DAY0} 09:03:00", "智研"),
+            _item("C上市公司公告拟回购股份不超过10亿元", f"{DAY0} 09:04:00", "智研"),
+        ]
+        pool = _empty_pool()
+        pool["mcp"] = fillers + important
+        content = self._run(pool)
+
+        # 高分新闻仍被保留（截断选择语义不变）
+        for it in important:
+            assert it["title"] in content, (
+                f"高分新闻 {it['title']!r} 应保留:\n{content[:500]}"
+            )
+        # 截断提示保留
+        assert "原始40条按重要性截断" in content, (
+            f"分组截断提示缺失:\n{content[:500]}"
+        )
+        assert "单日超30条已按重要性截断" in content, (
+            f"头部截断提示缺失:\n{content[:500]}"
+        )
+        # 展示顺序：条目行时间戳序列必须非递增（时间倒序）
+        stamps = _re.findall(r"^\[\d{2}-\d{2} (\d{2}:\d{2})\]", content, _re.M)
+        assert len(stamps) == 30, f"应展示 30 条，实际 {len(stamps)} 条"
+        assert stamps == sorted(stamps, reverse=True), (
+            f"截断后展示未按时间倒序: {stamps[:10]}..."
+        )
+        # 高分新闻（09:0x 早盘）应排在午后快讯（15:xx）之后，而非最前
+        assert content.index("证监会发布重磅政策稳定资本市场预期") > \
+            content.index("市场日常资金动态快讯第35期"), (
+            "展示顺序应按时间倒序，高分早盘新闻不应排在午后快讯之前"
+        )
+
+    def test_date_only_item_format_and_position(self):
+        """无时刻（仅日期）条目显示 [MM-DD]，并排在该日分组最后。"""
+        pool = _empty_pool()
+        pool["mcp"] = [
+            _item("早盘的定时新闻条目甲", f"{DAY0} 09:30:00", "智研"),
+            _item("仅日期无时刻的公告条目", DAY0, "智研"),
+            _item("上午的定时新闻条目乙", f"{DAY0} 10:00:00", "智研"),
+        ]
+        content = self._run(pool)
+
+        # 无时刻条目显示为 [MM-DD]，不再显示完整 [YYYY-MM-DD]
+        line = next(l for l in content.splitlines() if "仅日期无时刻的公告条目" in l)
+        assert line == "[01-10] 仅日期无时刻的公告条目", (
+            f"无时刻条目应显示 [MM-DD]: {line}"
+        )
+        assert f"[{DAY0}]" not in content, (
+            f"条目行不应出现完整 ISO 日期括号:\n{content}"
+        )
+        # 位置：排在该日分组所有定时条目之后（时间倒序，无时刻垫底）
+        assert content.index("仅日期无时刻的公告条目") > \
+            content.index("早盘的定时新闻条目甲")
+        assert content.index("仅日期无时刻的公告条目") > \
+            content.index("上午的定时新闻条目乙")
+        # 定时条目之间仍是时间倒序
+        assert content.index("上午的定时新闻条目乙") < \
+            content.index("早盘的定时新闻条目甲")
+
+    def test_header_span_same_day_format(self):
+        """头部覆盖时间段：同日只写一次日期，混有无时刻条目不混搭。"""
+        pool = _empty_pool()
+        pool["mcp"] = [
+            _item("早盘新闻条目内容甲", f"{DAY0} 09:30:00", "智研"),
+            _item("尾盘新闻条目内容乙", f"{DAY0} 18:07:00", "智研"),
+            _item("仅日期的公告条目丙", DAY0, "智研"),
+        ]
+        content = self._run(pool)
+        span_line = next(l for l in content.splitlines() if "覆盖" in l)
+        assert "覆盖01-10 09:30~18:07" in span_line, (
+            f"同日跨度应只写一次日期: {span_line}"
+        )
+        assert DAY0 not in span_line, (
+            f"跨度不应出现完整 ISO 日期（裸日期配时刻混搭）: {span_line}"
+        )
+
+    def test_header_span_multi_day_format(self):
+        pool = _empty_pool()
+        pool["mcp"] = [
+            _item("当天的新闻条目标题内容", f"{DAY0} 09:30:00", "智研"),
+            _item("前一天的新闻条目标题内容", f"{DAY1} 10:00:00", "智研"),
+        ]
+        content = self._run(pool)
+        span_line = next(l for l in content.splitlines() if "覆盖" in l)
+        assert "覆盖01-09 10:00~01-10 09:30" in span_line, (
+            f"多日跨度应为 MM-DD HH:MM~MM-DD HH:MM: {span_line}"
+        )
+
+    def test_sector_query_display_time_desc(self):
+        """行业查询（每天全量展示）同样按时间倒序，无时刻条目垫底。"""
+        pool = _empty_pool()
+        pool["mcp"] = [
+            _item("半导体早盘设备招标新闻", f"{DAY0} 09:30:00", "智研"),
+            _item("半导体午盘晶圆产能新闻", f"{DAY0} 13:30:00", "智研"),
+            _item("半导体仅日期公告条目", DAY0, "智研"),
+        ]
+        agent = _make_agent()
+        agent._call_llm = AsyncMock(
+            return_value={"role": "assistant", "content": "解读占位"}
+        )
+        with _mock_news_pool(pool):
+            content = _run_message(agent, "半导体新闻")["content"]
+        assert content.index("半导体午盘晶圆产能新闻") < \
+            content.index("半导体早盘设备招标新闻"), (
+            "行业查询展示应按时间倒序"
+        )
+        assert content.index("半导体仅日期公告条目") > \
+            content.index("半导体早盘设备招标新闻"), (
+            "行业查询无时刻条目应排在分组最后"
+        )

@@ -3507,14 +3507,14 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
     # ── 智研 7x24 快讯（newsFlashList 全量滚动，复盘背景材料）──
     flash = snapshot.news_items.get("flash", [])
     if flash:
-        lines.append(f"### 智研7x24快讯（共{len(flash)}条，背景材料，无需逐条列出）")
+        lines.append(f"### 智研7x24快讯（共{len(flash)}条；「四、核心要闻」从中挑选Top5，勿全量罗列）")
         for item in flash[:15]:
             lines.append(f"- [{item['time']}] {item['title']}")
 
     # ── 智研关键词新闻（多词搜索跨词去重合并）──
     mcp = snapshot.news_items.get("mcp", [])
     if mcp:
-        lines.append(f"\n### 智研财经新闻（多关键词去重，共{len(mcp)}条，背景材料，无需逐条列出）")
+        lines.append(f"\n### 智研财经新闻（多关键词去重，共{len(mcp)}条；「四、核心要闻」可从中挑选，勿全量罗列）")
         for item in mcp[:20]:
             lines.append(f"- [{item['time']}] {item['title']}")
             if item.get("content"):

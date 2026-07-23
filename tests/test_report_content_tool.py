@@ -306,12 +306,12 @@ class TestReportContentPrompt:
 
 class TestToolCatalog32:
     def test_catalog_32_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 54
+        assert len(tools_mod.TOOL_REGISTRY) == 55
         catalog = tools_mod.get_tool_catalog()
-        assert "共 54 个" in catalog
+        assert "共 55 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 54, (
-            f"目录应有 54 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 55, (
+            f"目录应有 55 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tool_in_short_desc_and_catalog(self):
@@ -357,6 +357,8 @@ class TestToolCatalog32:
             "get_fund_dividend", "get_forex_quote",
             "get_commodity_futures_list", "get_hk_special_ranking",
             "get_us_fund_flow_history",
+            # 全市场快讯工具（智研 7x24，复盘管线核心要闻数据源）
+            "get_market_news",
         }
 
         # v1 研报工具分发路径不变（仍走 report_library）

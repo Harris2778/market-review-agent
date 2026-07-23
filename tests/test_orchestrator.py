@@ -148,6 +148,37 @@ class TestDetectIntent:
         assert _extract_sector(f"看看{alias}") == sw_name
         assert SECTOR_NAME_MAP[alias] == sw_name
 
+    @pytest.mark.parametrize(
+        "message, expected",
+        [
+            # ── 新闻优先块：显式新闻诉求不被复盘关键词劫持（生产实锤）──
+            ("今天市场新闻", ("news_only", None)),
+            ("今天股市新闻", ("news_only", None)),
+            ("今天A股新闻", ("news_only", None)),
+            ("昨天市场新闻", ("news_only", None)),
+            ("今日大盘快讯", ("news_only", None)),
+            ("市场快讯", ("news_only", None)),
+            ("市场新闻汇总", ("news_only", None)),
+            ("板块新闻", ("news_only", None)),
+            # ── 板块新闻既有行为不变（带板块名）──
+            ("白酒新闻", ("news_only", "食品饮料")),
+            ("半导体板块新闻", ("news_only", "电子")),
+            # ── 纯行情/复盘诉求绝不改路由 ──
+            ("今天市场", ("market_review", None)),
+            ("今天市场怎么样", ("market_review", None)),
+            ("今天市场复盘", ("market_review", None)),
+            ("今日复盘", ("market_review", None)),
+            # ── 含『复盘』的消息一律不被新闻路由抢走 ──
+            ("复盘我的自选股", ("watchlist", None)),
+        ],
+    )
+    def test_news_priority_over_market_review(self, message, expected):
+        """含 新闻/快讯/资讯 且不含『复盘』的消息优先走 news_only；
+        纯行情/复盘/自选股诉求路由保持不变（含 sector=None 的精确断言）。"""
+        assert detect_intent(message) == expected, (
+            f"消息 {message!r} 期望 {expected}，实际 {detect_intent(message)}"
+        )
+
     def test_extract_sector_no_match(self):
         assert _extract_sector("给我讲个笑话") is None
 

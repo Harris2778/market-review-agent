@@ -325,6 +325,27 @@ TOOL_REGISTRY: list = [
     {
         "type": "function",
         "function": {
+            "name": "get_market_news",
+            "description": "获取全市场最新财经快讯列表（新浪智研 7x24 快讯，无需关键词）。"
+                           "市场复盘、今日要闻、盘面新闻总览时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 10,
+                        "description": "返回快讯条数，默认 10，最多 20。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_futures",
             "description": "获取期货行情（内盘商品/外盘商品/股指期货）。"
                            "分析大宗商品、黄金原油、期股联动时使用。",
@@ -1225,6 +1246,8 @@ _IMPL = {
     "search_news":          ("fetch_mcp_news",
                              lambda df, a: {"keyword": a["keyword"],
                                             "limit": _clamp_int(a.get("limit"), 15, 1, 20)}),
+    "get_market_news":      ("fetch_mcp_flash",
+                             lambda df, a: {"limit": _clamp_int(a.get("limit"), 10, 1, 20)}),
     "get_futures":          ("fetch_futures",
                              lambda df, a: {"market": a.get("market") or "gn",
                                             "symbol": a.get("symbol") or "AU0"}),
@@ -2329,6 +2352,7 @@ _SHORT_DESC = {
     "get_stock_kline": "个股近期日 K 线",
     "get_stock_news": "个股新闻搜索",
     "search_news": "财经新闻关键词搜索",
+    "get_market_news": "全市场快讯列表（智研 7x24）",
     "get_futures": "期货行情（内盘/外盘/股指）",
     "get_us_sectors": "美股板块涨幅排行",
     "get_hk_sectors": "港股领涨板块",

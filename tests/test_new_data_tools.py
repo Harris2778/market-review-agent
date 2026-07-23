@@ -315,6 +315,7 @@ _TOOL_ROUTE_CASES = [
     ("get_commodity_futures_list", {"market": "dce"}, None),
     ("get_hk_special_ranking", {"node": "gqg_hk"}, None),
     ("get_us_fund_flow_history", {"symbol": "AAPL"}, "symbol"),
+    ("get_market_news", {}, None),
 ]
 
 
@@ -415,7 +416,7 @@ NEW_TOOL_NAMES = [c[0] for c in _TOOL_ROUTE_CASES]
 
 def test_tool_registry_size_and_catalog():
     from agent.tools import TOOL_REGISTRY, get_tool_catalog
-    assert len(TOOL_REGISTRY) == 54
+    assert len(TOOL_REGISTRY) == 55
     catalog = get_tool_catalog()
     registered = {t["function"]["name"] for t in TOOL_REGISTRY}
     for name in NEW_TOOL_NAMES:

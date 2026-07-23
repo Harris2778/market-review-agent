@@ -277,3 +277,45 @@ class TestReportQACarveOut:
     def test_refusal_wording_itself_intact(self):
         """拒答话术本体不漂移（例外是新增条款，不改话术）。"""
         assert "我无法提供投资操作建议、股价预测及标的推荐" in COMPLIANCE_PROMPT
+
+
+# ─────────────────────────────────────────────
+# 8. 必出章节护栏：不得省略章节、无数据写「数据未覆盖」
+# ─────────────────────────────────────────────
+
+class TestMandatoryChapterGuardrail:
+    """复盘提示词「章节完整性红线」护栏（必出章节防省略修复）。
+
+    背景：生产实测模型在「四、核心要闻」写了「（用户未要求列出新闻，
+    此处省略）」——自作主张省略必出章节并编造理由。护栏要求四个章节
+    全部必出，数据缺失只写「数据未覆盖」，禁止编造省略理由。
+    """
+
+    def test_market_review_mandatory_chapters(self):
+        """四个章节全部为必出章节，不得省略/合并/以主观理由跳过。"""
+        assert "必出章节" in MARKET_REVIEW_PROMPT
+        assert "不得省略" in MARKET_REVIEW_PROMPT
+        assert "用户未要求" in MARKET_REVIEW_PROMPT
+
+    def test_market_review_news_chapter_guardrail(self):
+        """「四、核心要闻」：有数据逐条列Top5，无数据只写「核心要闻数据未覆盖」。"""
+        assert "核心要闻数据未覆盖" in MARKET_REVIEW_PROMPT
+        assert "禁止编造省略理由" in MARKET_REVIEW_PROMPT
+        assert "禁止编造新闻内容" in MARKET_REVIEW_PROMPT
+
+    def test_market_review_other_chapters_guardrail(self):
+        """其他章节同款护栏：数据缺失写「数据未覆盖」，禁止删节整个章节。"""
+        assert "数据未覆盖" in MARKET_REVIEW_PROMPT
+        assert "禁止以任何主观理由删节" in MARKET_REVIEW_PROMPT
+
+    def test_market_review_guardrail_effective_via_get_prompt(self):
+        """护栏文案随 get_system_prompt("market_review") 拼进最终提示词。"""
+        p = get_system_prompt("market_review")
+        assert "必出章节" in p
+        assert "核心要闻数据未覆盖" in p
+
+    def test_stock_analysis_news_chapter_guardrail(self):
+        """个股分析「四、近期重要消息」同款护栏：必出、无数据写数据未覆盖、禁编造。"""
+        assert "近期重要消息数据未覆盖" in STOCK_ANALYSIS_PROMPT
+        assert "必出章节" in STOCK_ANALYSIS_PROMPT
+        assert "禁止编造新闻内容" in STOCK_ANALYSIS_PROMPT

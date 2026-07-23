@@ -712,6 +712,34 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if re.search(pattern, msg):
                 return ("sector_deep_dive", sector)
 
+    # 新闻优先块：显式新闻诉求（含 新闻/快讯/资讯 且不含『复盘』）优先于
+    # 全市场复盘关键词判定——『今天市场新闻』『今日大盘快讯』『市场快讯』
+    # 是新闻诉求，不是行情复盘，不能被 MARKET_REVIEW_KEYWORDS 的
+    # 「今天市场/今天股市/今日大盘」等组合词劫持。板块名照常提取
+    # （无板块则 sector=None 走全市场新闻）。更高优先级的
+    # campus/social/海外/个股分析块顺序不动；含『复盘』的消息一律让位
+    # 既有复盘/自选股路由，新闻块绝不抢。
+    news_patterns = [
+        r".*(新闻|快讯|资讯).*(汇总|总结|盘点|梳理|报告)",
+        r"有什么.*新闻", r"新闻.*怎么样",
+        r".+板块.+新闻",  # "银行板块新闻"
+        r".+行业.+新闻",  # "银行行业新闻"
+        r"(板块|行业)(新闻|快讯|资讯)",  # "板块新闻"（无板块名 → 全市场）
+        # 时间 + 市场词 + 新闻词："今天市场新闻"、"今日大盘快讯"
+        r"(今天|今日|昨天|昨日).*(市场|大盘|A股|股市).*(新闻|快讯|资讯)",
+        # 市场词 + 新闻词："市场快讯"、"市场新闻"
+        r"(市场|大盘|股市|A股)(新闻|快讯|资讯)",
+        r"全市场.*新闻", r"新闻.*全市场",
+        r"^(新闻|快讯|资讯)$",
+        # 解读类新闻请求（如「解读一下今天的新闻」「这些新闻怎么看」）
+        r"(解读|分析|影响|怎么看|意味着什么|说明什么).{0,10}(新闻|快讯|资讯)",
+        r"(新闻|快讯|资讯).{0,10}(解读|怎么看|意味着什么|说明什么)",
+    ]
+    if "复盘" not in msg and any(w in msg for w in ("新闻", "快讯", "资讯")):
+        for pattern in news_patterns:
+            if re.search(pattern, msg):
+                return ("news_only", _extract_sector(msg))  # sector 为 None 时走全市场新闻
+
     # 全市场复盘
     # 简单数据查询 → MCP而非完整复盘
     simple_data_patterns = [
@@ -738,18 +766,9 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
             if sector:
                 return ("sector_deep_dive", sector)
 
-    # 新闻专属模式：用户明确要新闻（含板块名+新闻、全市场新闻）
-    news_patterns = [
-        r".*(新闻|快讯|资讯).*(汇总|总结|盘点|梳理|报告)",
-        r"有什么.*新闻", r"新闻.*怎么样",
-        r".+板块.+新闻",  # "银行板块新闻"
-        r".+行业.+新闻",  # "银行行业新闻"
-        r"全市场.*新闻", r"新闻.*全市场",
-        r"^(新闻|快讯|资讯)$",
-        # 解读类新闻请求（如「解读一下今天的新闻」「这些新闻怎么看」）
-        r"(解读|分析|影响|怎么看|意味着什么|说明什么).{0,10}(新闻|快讯|资讯)",
-        r"(新闻|快讯|资讯).{0,10}(解读|怎么看|意味着什么|说明什么)",
-    ]
+    # 新闻专属模式（含板块名+新闻、全市场新闻）已在上方新闻优先块处理，
+    # 此处保留兜底循环：能走到这里的消息要么含『复盘』，要么不含新闻词，
+    # 正常不会命中；保留仅为防御未来模式扩展。
     for pattern in news_patterns:
         if re.search(pattern, msg):
             sector = _extract_sector(msg)
@@ -1429,16 +1448,54 @@ def _news_importance(title: str) -> int:
 
 
 def _fmt_news_time(t: str, fallback: str = "") -> str:
-    """新闻时间统一显示为 MM-DD HH:mm；格式异常时原样截断返回。
+    """新闻时间统一显示为 MM-DD HH:mm；仅日期（无时刻）显示为 MM-DD。
 
     t 为空时返回 fallback（通常为所在日期分组的日期），避免出现空括号 []。
+    格式异常时原样截断返回。
     """
     t = (t or "").strip()
     if not t:
         return fallback
     if len(t) >= 16 and t[4] == "-" and t[7] == "-":
         return f"{t[5:10]} {t[11:16]}"
+    if len(t) == 10 and t[4] == "-" and t[7] == "-":
+        # 仅日期无时刻：统一显示 MM-DD，与有时间条目的 MM-DD HH:mm 同风格
+        return t[5:10]
     return t[:16]
+
+
+def _fmt_news_span(times) -> str:
+    """头部覆盖时间段：统一「覆盖MM-DD HH:MM~MM-DD HH:MM」。
+
+    - 同日只写一次日期（「覆盖MM-DD HH:MM~HH:MM」）；
+    - 仅日期的无时刻条目参与 min/max 时按当日处理，不输出
+      「裸日期~时刻」的混搭（如 2026-07-23~07-23 18:07）；
+    - 全部无时刻时退化为日期粒度；times 为空返回 ""。
+    """
+    vals = [t for t in times if t]
+    if not vals:
+        return ""
+    timed = sorted(
+        t for t in vals if len(t) >= 16 and t[4] == "-" and t[7] == "-"
+    )
+    dates = sorted(
+        t[:10] for t in vals if len(t) >= 10 and t[4] == "-" and t[7] == "-"
+    )
+    if not timed:
+        if not dates:
+            return ""
+        if dates[0] == dates[-1]:
+            return f"覆盖{dates[0][5:10]}"
+        return f"覆盖{dates[0][5:10]}~{dates[-1][5:10]}"
+    lo, hi = timed[0], timed[-1]
+    # 无时刻条目按当日处理：端点日期取并集，但端点展示只用有时刻的条目
+    lo_date = min([lo[:10]] + dates)
+    hi_date = max([hi[:10]] + dates)
+    if lo_date == hi_date:
+        return f"覆盖{lo[5:10]} {lo[11:16]}~{hi[11:16]}"
+    lo_txt = f"{lo[5:10]} {lo[11:16]}" if lo[:10] == lo_date else lo_date[5:10]
+    hi_txt = f"{hi[5:10]} {hi[11:16]}" if hi[:10] == hi_date else hi_date[5:10]
+    return f"覆盖{lo_txt}~{hi_txt}"
 
 
 # 摘要展示上限（字）：展示抓取层传入的 content/summary/brief 时使用
@@ -2129,7 +2186,7 @@ class MarketReviewAgent:
 
 {market_data}
 
-生成A股市场复盘。不列出新闻（如需新闻请说\"今天市场新闻\"）。31行业全部列出。数据缺失写「数据未覆盖」。{history_note}"""
+生成A股市场复盘。四、核心要闻为必出章节：从上方智研快讯/智研财经新闻数据块中挑选最重要的5条，逐条按【标题】核心内容摘要（≤50字）列出；仅当数据块中没有任何新闻数据时才写「核心要闻数据未覆盖」。31行业全部列出。其余数据缺失写「数据未覆盖」。{history_note}"""
 
         # 第四波：存档接入——流式走 _stream_response 结束回调，非流式在最终 content 产出后落档
         if stream:
@@ -2516,12 +2573,14 @@ class MarketReviewAgent:
                 items = by_date[d]
                 raw_cnt = len(items)
                 if day_cap and raw_cnt > day_cap:
-                    # 超限：按重要性评分排序截断（同分按时间倒序）
+                    # 超限：重要性评分只用于「选哪 N 条」（截断选择），
+                    # 选出后展示顺序一律按时间倒序，避免时间线乱序
                     items = sorted(
                         items,
                         key=lambda x: (_news_importance(x["title"]), x["time"]),
                         reverse=True,
                     )[:day_cap]
+                    items = sorted(items, key=lambda x: x["time"], reverse=True)
                     truncated = True
                 else:
                     items = sorted(items, key=lambda x: x["time"], reverse=True)
@@ -2541,14 +2600,16 @@ class MarketReviewAgent:
                         text = _truncate_at_sentence(summary)
                     # 展示行格式：[时间] 标题。条目不再带【来源】标签（省出字符给
                     # 新闻本身）；来源归属由头部「来源：xxxN条」统计行统一承载。
-                    block += f"[{_fmt_news_time(it['time'], fallback=d)}] {text}\n"
+                    # 无时间条目的兜底日期用 MM-DD 短格式，与有时间条目的
+                    # [MM-DD HH:MM] 同风格，不再显示完整 [YYYY-MM-DD]。
+                    block += f"[{_fmt_news_time(it['time'], fallback=d[5:10])}] {text}\n"
                 blocks.append(block)
 
-            # 头部：总条数、覆盖时间段、各源条数
+            # 头部：总条数、覆盖时间段、各源条数。覆盖时间段统一
+            # 「覆盖MM-DD HH:MM~MM-DD HH:MM」（同日只写一次日期），
+            # 无时刻条目按当日处理，不出现裸日期配时刻的混搭。
             all_times = [it["time"] for v in by_date.values() for it in v if it["time"]]
-            span = ""
-            if all_times:
-                span = f"覆盖{_fmt_news_time(min(all_times))}~{_fmt_news_time(max(all_times))}"
+            span = _fmt_news_span(all_times)
             src_stat = " / ".join(
                 f"{_NEWS_SOURCE_NAMES.get(s, s)}{source_counts[s]}条"
                 for s in source_counts
