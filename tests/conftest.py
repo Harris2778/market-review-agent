@@ -33,6 +33,11 @@ FAKE_ENV = {
     "ARCHIVE_DIR": "/tmp/market_review_agent_test_archive",
     "CHART_DIR": "/tmp/market_review_agent_test_charts",
     "REPORTS_DB_PATH": "/tmp/market_review_agent_test_reports.db",
+    # 测试环境把 IP 限流调到极大，避免全套件共享 testclient IP 互相干扰
+    # （限流中间件本身的行为由 tests/test_websec.py 单独覆盖）
+    "WEB_RATE_GLOBAL_PER_MIN": "1000000",
+    "WEB_RATE_LOGIN_PER_MIN": "1000000",
+    "WEB_RATE_REGISTER_PER_MIN": "1000000",
 }
 
 for _key, _value in FAKE_ENV.items():

@@ -34,8 +34,12 @@
 
 环境变量（可选 · 公开网站 /api/*）：
   WEB_DB_PATH         网站数据库路径（默认 ${DATA_DIR:-data}/webapp.db）
-  WEB_MONTHLY_QUOTA   每用户每月定额消息数（默认 100，每月 1 日重置）
-  WEB_PACK_SIZE       加油包每包消息数（默认 50，不过期可累积）
+  WEB_MONTHLY_QUOTA   每用户每周期定额消息数（默认 30；以用户注册日为锚的
+                      周年月重置，如 7/24 注册 → 8/24 重置）
+  ADMIN_USERNAMES     管理员用户名列表（默认 'yoozo'，逗号分隔；注册时命中
+                      自动置 is_admin，启动时幂等补齐存量用户）
+  DEVICE_MAX_ACCOUNTS 同一 device_id 可注册账号数上限（默认 2，超限 409）
+  IP_MAX_REGISTER_PER_DAY 同一 IP 24h 内注册数上限（默认 5，超限 429）
 """
 
 import os
@@ -106,6 +110,15 @@ except Exception:
     _webauth_error = traceback.format_exc()
     logger.error("网站认证模块 agent.webauth 加载失败，/api/* 将不可用", exc_info=True)
 
+# 网站安全模块（agent.websec）：纯标准库，安全头/IP限流/登录锁定/扫描路径拦截
+try:
+    from agent import websec as web_sec
+    _websec_loaded = True
+except Exception:
+    web_sec = None
+    _websec_loaded = False
+    logger.error("安全模块 agent.websec 加载失败，安全加固不可用", exc_info=True)
+
 # ── 配置 ──
 
 AGENT_API_KEY = os.getenv("AGENT_API_KEY")
@@ -159,7 +172,15 @@ async def _push_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """服务生命周期：启动时拉起定时推送后台任务，关闭时取消并等待退出。"""
+    """服务生命周期：启动时拉起定时推送后台任务、幂等标记管理员，关闭时取消并等待退出。"""
+    if _webauth_loaded:
+        try:
+            marked = web_auth.mark_admins()
+            if marked:
+                logger.info("管理员标记完成：新增标记 %d 个用户（ADMIN_USERNAMES=%s）",
+                            marked, ",".join(web_auth.admin_usernames()))
+        except Exception:
+            logger.error("管理员标记失败（不影响主服务）", exc_info=True)
     push_task = asyncio.create_task(_push_loop())
     try:
         yield
@@ -198,6 +219,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── 安全加固（agent.websec）：安全响应头 + IP 限流 + 扫描路径拦截 ──
+if _websec_loaded:
+    app.add_middleware(web_sec.SecurityHeadersMiddleware)
+    app.add_middleware(
+        web_sec.IPRateLimitMiddleware,
+        # 限额走环境变量，测试环境可调大避免干扰用例
+        global_limit=int(os.environ.get("WEB_RATE_GLOBAL_PER_MIN", "300")),
+        path_limits={
+            "/api/auth/login": int(os.environ.get("WEB_RATE_LOGIN_PER_MIN", "10")),
+            "/api/auth/register": int(os.environ.get("WEB_RATE_REGISTER_PER_MIN", "5")),
+        },
+    )
+    app.add_middleware(web_sec.BlockedPathsMiddleware)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """全站禁爬。"""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(web_sec.ROBOTS_TXT if _websec_loaded else "User-agent: *\nDisallow: /\n")
 
 
 # ── 鉴权 ──
@@ -724,12 +766,13 @@ async def _stream_chat_completion(agent, user_message: str, model: str, history:
 #
 # 与 /v1/* 的 verify_api_key（管理端点专用）完全隔离：/api/* 使用
 # agent.webauth 的 Bearer token（users/tokens 表），不参与限流与每日配额，
-# 额度走 webauth 的月度定额 + 加油包体系。
+# 额度走 webauth 的周年月定额体系（加油包已下线）。
 
 def get_web_user(request: Request) -> dict:
     """
     /api/* 的 Bearer token 鉴权依赖。
-    解析 Authorization: Bearer <token> → {"id", "username"}；无效/过期 → 401。
+    解析 Authorization: Bearer <token> → {"id", "username", "is_admin"}；
+    无效/过期 → 401。
     """
     if not _webauth_loaded:
         raise HTTPException(status_code=503, detail="网站认证模块不可用")
@@ -744,9 +787,36 @@ def get_web_user(request: Request) -> dict:
     return user
 
 
+def require_admin(user: dict = Depends(get_web_user)) -> dict:
+    """/api/admin/* 鉴权依赖：先过 Bearer token，再要求 is_admin，否则 403。"""
+    if not user.get("is_admin"):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "forbidden", "detail": "需要管理员权限"},
+        )
+    return user
+
+
+def _client_ip(request: Request) -> str:
+    """
+    取客户端 IP：优先 X-Forwarded-For 第一个地址（Railway 反代会追加真实 IP），
+    否则回落 request.client.host。
+    """
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff.strip():
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
 @app.post("/api/auth/register")
 async def web_register(request: Request):
-    """注册：{username, password} → 200 {token, user:{username}}；用户名重复 409。"""
+    """
+    注册：{username, password, device_id?} → 200 {token, user:{username}}。
+
+    - 用户名重复 → 409 "用户名已存在"
+    - 同一 device_id 注册账号数达上限 → 409 {error:'device_limit'}
+    - 同 IP 24h 注册数达上限 → 429 {error:'ip_limit'}
+    """
     if not _webauth_loaded:
         raise HTTPException(status_code=503, detail="网站认证模块不可用")
     try:
@@ -754,9 +824,18 @@ async def web_register(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
     try:
-        token = web_auth.register(body.get("username"), body.get("password"))
+        token = web_auth.register(
+            body.get("username"),
+            body.get("password"),
+            device_id=body.get("device_id"),
+            register_ip=_client_ip(request),
+        )
     except web_auth.UserExistsError:
         raise HTTPException(status_code=409, detail="用户名已存在")
+    except web_auth.DeviceLimitError:
+        return JSONResponse(status_code=409, content={"error": "device_limit"})
+    except web_auth.IpLimitError:
+        return JSONResponse(status_code=429, content={"error": "ip_limit"})
     except web_auth.ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
     user = web_auth.resolve_token(token)
@@ -772,15 +851,28 @@ async def web_login(request: Request):
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    username = body.get("username") or ""
+    # 登录锁定：连续 5 次密码错误锁 15 分钟（agent.websec）
+    if _websec_loaded:
+        locked_for = web_sec.is_locked(username)
+        if locked_for > 0:
+            raise HTTPException(
+                status_code=423,
+                detail={"error": "locked", "retry_after": locked_for},
+            )
     try:
         token = web_auth.login(body.get("username"), body.get("password"))
     except web_auth.AuthError:
+        if _websec_loaded:
+            web_sec.record_login_fail(username)
         raise HTTPException(
             status_code=401,
             detail={"error": "用户名或密码错误", "code": "invalid_credentials"},
         )
     except web_auth.ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if _websec_loaded:
+        web_sec.clear_login_fail(username)
     user = web_auth.resolve_token(token)
     return {"token": token, "user": {"username": user["username"]}}
 
@@ -798,9 +890,13 @@ async def web_logout(request: Request):
 
 @app.get("/api/me")
 async def web_me(user: dict = Depends(get_web_user)):
-    """当前用户信息 + 额度快照（月度定额 / 加油包 / 次月 1 日重置日）。"""
+    """
+    当前用户信息 + 额度快照：
+    {username, is_admin, quota_limit, quota_used, quota_remaining, reset_date}。
+    reset_date 为下一周年重置日 ISO（如 7/24 注册 → 8/24 重置）。
+    """
     quota = web_auth.get_quota(user["id"])
-    return {"username": user["username"], **quota}
+    return {"username": user["username"], "is_admin": user["is_admin"], **quota}
 
 
 @app.get("/api/conversations")
@@ -872,22 +968,12 @@ async def web_delete_conversation(conversation_id: str, user: dict = Depends(get
 
 
 @app.post("/api/topup")
-async def web_topup(request: Request, user: dict = Depends(get_web_user)):
-    """
-    加油包充值：{pack_count:1} → 200 {pack_credits, total_remaining}。
-    当前为 mock 支付直接到账。
-    # TODO(支付): 接真实支付渠道（ Stripe / 微信 / 支付宝 ），
-    #   此处改为创建支付订单，到账在支付回调中确认后调 web_auth.topup。
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
-    try:
-        quota = web_auth.topup(user["id"], body.get("pack_count", 1))
-    except web_auth.ValidationError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"pack_credits": quota["pack_credits"], "total_remaining": quota["total_remaining"]}
+async def web_topup():
+    """加油包功能已整体下线：端点保留返回 410 Gone，避免旧前端 404 困惑。"""
+    return JSONResponse(
+        status_code=410,
+        content={"error": "topup_removed", "detail": "加油包功能已下线"},
+    )
 
 
 async def _stream_web_chat(agent, user_message: str, history: list,
@@ -951,7 +1037,7 @@ async def web_chat(request: Request, user: dict = Depends(get_web_user)):
     """
     网站对话端点：{conversation_id, message} → SSE 流（text/event-stream）。
 
-    - 额度耗尽 → HTTP 429 JSON {error:"quota_exhausted", total_remaining:0, reset_date}
+    - 额度耗尽 → HTTP 429 JSON {error:"quota_exhausted", quota_remaining:0, reset_date}
     - 用户消息立即落库；助手回复在流正常完成后落库并扣 1 次额度
     - 对话不存在或不属于当前用户 → 404
     """
@@ -972,12 +1058,12 @@ async def web_chat(request: Request, user: dict = Depends(get_web_user)):
         raise HTTPException(status_code=404, detail="对话不存在")
 
     quota = web_auth.get_quota(user["id"])
-    if quota["total_remaining"] <= 0:
+    if quota["quota_remaining"] <= 0:
         return JSONResponse(
             status_code=429,
             content={
                 "error": "quota_exhausted",
-                "total_remaining": 0,
+                "quota_remaining": 0,
                 "reset_date": quota["reset_date"],
             },
         )
@@ -1002,6 +1088,64 @@ async def web_chat(request: Request, user: dict = Depends(get_web_user)):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── 管理员端点 /api/admin/*（require_admin：非管理员 403）──
+
+@app.get("/api/admin/users")
+async def admin_list_users(admin: dict = Depends(require_admin)):
+    """
+    全部用户列表（按注册先后升序）：
+    [{username, created_at, is_admin, quota_limit(生效值), quota_used,
+      quota_remaining, reset_date}]
+    """
+    return web_auth.admin_list_users()
+
+
+@app.patch("/api/admin/users/{username}/quota")
+async def admin_patch_user_quota(
+    username: str, request: Request, admin: dict = Depends(require_admin)
+):
+    """
+    调整某用户额度上限：{quota_limit: int 0-100000} → 200 更新后对象。
+    改的是 users.quota_limit override，实时生效（非空即优先于默认 30）；
+    传 0 合法（完全禁用该用户额度）。用户不存在 404，参数非法 400。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体须为 JSON 对象")
+    try:
+        result = web_auth.admin_set_quota_limit(username, body.get("quota_limit"))
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return result
+
+
+@app.get("/api/admin/users/{username}/questions")
+async def admin_user_questions(
+    username: str,
+    limit: int = 50,
+    offset: int = 0,
+    admin: dict = Depends(require_admin),
+):
+    """
+    某用户所有对话中 role=user 的消息（按时间倒序，分页）：
+    → 200 {total, items:[{content, created_at, conversation_title}]}。
+    用户不存在 404；limit 1-200、offset >=0，否则 400。
+    """
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=400, detail="limit 须在 1-200 之间")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不能为负数")
+    result = web_auth.admin_user_questions(username, limit=limit, offset=offset)
+    if result is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return result
 
 
 # ── 调试端点 ──

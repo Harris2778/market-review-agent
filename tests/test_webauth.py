@@ -3,16 +3,19 @@
 
 覆盖范围：
 1. webauth 单元层：注册/登录/重复注册/错误密码/token 过期/登出、
-   额度快照/扣减顺序（先月度后包）/加油包累加、对话 CRUD 与越权隔离
+   周年月额度（默认 30、跨周期重置、月末收敛、override 优先）、
+   注册防多号（device_limit / ip_limit）、管理员视图（列表/改额度/提问记录）、
+   对话 CRUD 与越权隔离
 2. 端点层（FastAPI TestClient）：
-   - POST /api/auth/register → 200 / 409 / 400
+   - POST /api/auth/register → 200 / 409（重名/device_limit）/ 429（ip_limit）/ 400
    - POST /api/auth/login → 200 / 401
    - POST /api/auth/logout → token 失效
-   - GET /api/me → 额度字段完整
+   - GET /api/me → 新字段形状（username/is_admin/quota_*）无加油包字段
    - 对话 CRUD：列表降序、详情带消息、越权 404、删除 200/404
-   - POST /api/topup → 包额度累加
+   - POST /api/topup → 410（加油包已下线）
    - POST /api/chat → SSE 流式（mock agent）、落库、成功才扣额度、
      额度耗尽 429、流失败不扣额度
+   - /api/admin/* → 非管理员 403、未登录 401、列表/改额度/提问记录
    - GET / → web/index.html 存在时 200，缺失时 503 占位
    - GET /api/root-info → 原根路由健康 JSON
 
@@ -153,63 +156,189 @@ class TestWebauthUnit:
         )
         assert webauth.resolve_token(token) is None
 
+    def test_register_admin_flag(self, db):
+        """注册时用户名命中 ADMIN_USERNAMES（默认 'yoozo'）自动置 is_admin。"""
+        admin = webauth.resolve_token(webauth.register("yoozo", "password1"))
+        assert admin["is_admin"] is True
+        normal = webauth.resolve_token(webauth.register("alice", "password1"))
+        assert normal["is_admin"] is False
+
+    def test_mark_admins_idempotent(self, db, monkeypatch):
+        """mark_admins 把存量用户幂等补齐 is_admin=1，重复执行安全。"""
+        monkeypatch.setenv("ADMIN_USERNAMES", "alice,carol")
+        webauth.register("alice", "password1")  # 注册时即命中
+        bob = webauth.resolve_token(webauth.register("bob", "password1"))
+        assert bob["is_admin"] is False
+        monkeypatch.setenv("ADMIN_USERNAMES", "alice,bob")
+        assert webauth.mark_admins() == 1  # alice 已是 admin，仅补 bob
+        assert webauth.mark_admins() == 0  # 幂等
+        token = webauth.login("bob", "password1")
+        assert webauth.resolve_token(token)["is_admin"] is True
+
     def test_quota_defaults(self, db):
         user = webauth.resolve_token(webauth.register("alice", "password1"))
         quota = webauth.get_quota(user["id"])
-        assert quota["monthly_quota"] == 100
-        assert quota["monthly_used"] == 0
-        assert quota["monthly_remaining"] == 100
-        assert quota["pack_credits"] == 0
-        assert quota["total_remaining"] == 100
-        # reset_date 为次月 1 日
+        assert quota["quota_limit"] == 30  # 新默认定额
+        assert quota["quota_used"] == 0
+        assert quota["quota_remaining"] == 30
+        # reset_date 为注册日下一周年日（今天注册 → 下月同日，月末收敛）
         today = datetime.now().date()
-        expected = (
-            f"{today.year + 1}-01-01" if today.month == 12
-            else f"{today.year}-{today.month + 1:02d}-01"
-        )
-        assert quota["reset_date"] == expected
+        period = webauth._period_start(today, today)
+        assert period == today
+        assert quota["reset_date"] == webauth._next_reset(today, today).isoformat()
+        # 加油包字段彻底移除
+        assert "pack_credits" not in quota
+        assert "total_remaining" not in quota
+        assert not hasattr(webauth, "topup")
+        assert not hasattr(webauth, "pack_size")
 
-    def test_consume_order_monthly_before_pack(self, db, monkeypatch):
-        """扣减顺序：先扣月度，月度用尽后再扣加油包。"""
+    def test_consume_up_to_limit_then_exhausted(self, db, monkeypatch):
+        """扣减只看周期内用量：用满 quota 后再扣返回 False，且不扣任何计数。"""
         monkeypatch.setenv("WEB_MONTHLY_QUOTA", "2")
-        monkeypatch.setenv("WEB_PACK_SIZE", "10")
-        user = webauth.resolve_token(webauth.register("alice", "password1"))
-        webauth.topup(user["id"], 1)  # +10 包额度
-
-        assert webauth.consume_quota(user["id"]) is True
-        q = webauth.get_quota(user["id"])
-        assert (q["monthly_used"], q["pack_credits"]) == (1, 10)
-
-        assert webauth.consume_quota(user["id"]) is True
-        q = webauth.get_quota(user["id"])
-        assert (q["monthly_used"], q["pack_credits"]) == (2, 10)  # 月度用尽，包未动
-
-        assert webauth.consume_quota(user["id"]) is True
-        q = webauth.get_quota(user["id"])
-        assert (q["monthly_used"], q["pack_credits"]) == (2, 9)  # 开始扣包
-
-    def test_consume_exhausted_returns_false(self, db, monkeypatch):
-        monkeypatch.setenv("WEB_MONTHLY_QUOTA", "1")
         user = webauth.resolve_token(webauth.register("alice", "password1"))
         assert webauth.consume_quota(user["id"]) is True
+        assert webauth.consume_quota(user["id"]) is True
+        q = webauth.get_quota(user["id"])
+        assert (q["quota_used"], q["quota_remaining"]) == (2, 0)
         assert webauth.consume_quota(user["id"]) is False
-        # 失败不扣任何计数
-        assert webauth.get_quota(user["id"])["total_remaining"] == 0
+        assert webauth.get_quota(user["id"])["quota_used"] == 2
 
-    def test_topup_accumulates(self, db, monkeypatch):
-        monkeypatch.setenv("WEB_PACK_SIZE", "50")
+    def test_anniversary_reset_cross_period(self, db, monkeypatch):
+        """周年月重置：注册 7/24，mock 时间 +31 天（8/24）即跨周期，用量归零。"""
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 7, 24, 10, 0, 0))
         user = webauth.resolve_token(webauth.register("alice", "password1"))
-        q1 = webauth.topup(user["id"], 1)
-        assert q1["pack_credits"] == 50
-        q2 = webauth.topup(user["id"], 2)
-        assert q2["pack_credits"] == 150
-        assert q2["total_remaining"] == 100 + 150
+        q = webauth.get_quota(user["id"])
+        assert q["reset_date"] == "2025-08-24"
 
-    def test_topup_invalid_pack_count(self, db):
+        assert webauth.consume_quota(user["id"]) is True
+        assert webauth.get_quota(user["id"])["quota_used"] == 1
+
+        # 8/23 23:59 仍未重置
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 8, 23, 23, 59, 0))
+        assert webauth.get_quota(user["id"])["quota_used"] == 1
+
+        # 注册日 +31 天 = 8/24，跨入新周期：用量归零，reset 推到 9/24
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 8, 24, 0, 0, 1))
+        q = webauth.get_quota(user["id"])
+        assert (q["quota_used"], q["quota_remaining"]) == (0, 30)
+        assert q["reset_date"] == "2025-09-24"
+        assert webauth.consume_quota(user["id"]) is True
+        assert webauth.get_quota(user["id"])["quota_used"] == 1
+
+    def test_anniversary_month_end_clamp(self, db, monkeypatch):
+        """月末边界：1/31 注册 → 2/28 重置（平年）；3/1 时周期锚收敛到 2/28。"""
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 1, 31, 10, 0, 0))
         user = webauth.resolve_token(webauth.register("alice", "password1"))
-        for bad in (0, -1, True, "1"):
+        assert webauth.get_quota(user["id"])["reset_date"] == "2025-02-28"
+        assert webauth.consume_quota(user["id"]) is True
+
+        # 2/27 仍是旧周期；2/28 重置；3/1 处于 2/28 起的新周期，3/31 再重置
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 2, 27, 12, 0, 0))
+        assert webauth.get_quota(user["id"])["quota_used"] == 1
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 2, 28, 0, 0, 0))
+        assert webauth.get_quota(user["id"])["quota_used"] == 0
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2025, 3, 1, 0, 0, 0))
+        q = webauth.get_quota(user["id"])
+        assert q["quota_used"] == 0
+        assert q["reset_date"] == "2025-03-31"
+
+        # 闰年：2024/1/31 注册 → 2024/2/29 重置
+        monkeypatch.setattr(webauth, "_now", lambda: datetime(2024, 1, 31, 10, 0, 0))
+        leap = webauth.resolve_token(webauth.register("leapuser", "password1"))
+        assert webauth.get_quota(leap["id"])["reset_date"] == "2024-02-29"
+
+    def test_quota_override_takes_priority(self, db):
+        """quota_limit override 非空优先于默认 30，改完实时生效；0 = 完全禁用。"""
+        user = webauth.resolve_token(webauth.register("alice", "password1"))
+        assert webauth.get_quota(user["id"])["quota_limit"] == 30
+
+        webauth.admin_set_quota_limit("alice", 2)
+        q = webauth.get_quota(user["id"])
+        assert q["quota_limit"] == 2
+        assert webauth.consume_quota(user["id"]) is True
+        assert webauth.consume_quota(user["id"]) is True
+        assert webauth.consume_quota(user["id"]) is False  # 按 override=2 计算
+
+        webauth.admin_set_quota_limit("alice", 0)
+        assert webauth.consume_quota(user["id"]) is False
+        assert webauth.get_quota(user["id"])["quota_remaining"] == 0
+
+    def test_admin_set_quota_limit_validation(self, db):
+        webauth.register("alice", "password1")
+        for bad in (-1, 100001, True, "10", None, 3.5):
             with pytest.raises(webauth.ValidationError):
-                webauth.topup(user["id"], bad)
+                webauth.admin_set_quota_limit("alice", bad)
+        assert webauth.admin_set_quota_limit("ghost", 10) is None
+
+    def test_admin_list_users(self, db):
+        webauth.register("yoozo", "password1")
+        webauth.register("alice", "password1")
+        webauth.consume_quota(webauth.resolve_token(webauth.login("alice", "password1"))["id"])
+        users = webauth.admin_list_users()
+        assert [u["username"] for u in users] == ["yoozo", "alice"]
+        assert users[0]["is_admin"] is True
+        assert users[1]["is_admin"] is False
+        assert users[1]["quota_used"] == 1
+        assert users[1]["quota_limit"] == 30
+        for key in ("username", "created_at", "is_admin", "quota_limit",
+                    "quota_used", "quota_remaining", "reset_date"):
+            assert key in users[0]
+
+    def test_admin_user_questions(self, db):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        c1 = webauth.create_conversation(alice["id"], "对话一")
+        c2 = webauth.create_conversation(alice["id"], "对话二")
+        webauth.add_message(c1["id"], "user", "问题1")
+        webauth.add_message(c1["id"], "assistant", "回答1")
+        webauth.add_message(c2["id"], "user", "问题2")
+
+        result = webauth.admin_user_questions("alice")
+        assert result["total"] == 2
+        assert {i["content"] for i in result["items"]} == {"问题1", "问题2"}
+        assert all("conversation_title" in i and "created_at" in i for i in result["items"])
+        # 倒序 + 分页
+        assert result["items"][0]["content"] == "问题2"
+        page = webauth.admin_user_questions("alice", limit=1, offset=1)
+        assert page["total"] == 2
+        assert len(page["items"]) == 1
+        assert page["items"][0]["content"] == "问题1"
+
+        assert webauth.admin_user_questions("ghost") is None
+
+    def test_device_limit(self, db, monkeypatch):
+        """同一 device_id 注册满 DEVICE_MAX_ACCOUNTS（默认 2）后再注册抛 DeviceLimitError。"""
+        monkeypatch.setenv("DEVICE_MAX_ACCOUNTS", "2")
+        webauth.register("alice", "password1", device_id="dev-1")
+        webauth.register("bob", "password1", device_id="dev-1")
+        with pytest.raises(webauth.DeviceLimitError):
+            webauth.register("carol", "password1", device_id="dev-1")
+        # 别的设备 / 不带 device_id 不受影响
+        webauth.register("dave", "password1", device_id="dev-2")
+        webauth.register("erin", "password1")
+
+    def test_device_id_validation(self, db):
+        with pytest.raises(webauth.ValidationError):
+            webauth.register("alice", "password1", device_id=123)
+        with pytest.raises(webauth.ValidationError):
+            webauth.register("alice", "password1", device_id="x" * 129)
+        # 空白 device_id 按未提供处理
+        assert webauth.resolve_token(
+            webauth.register("alice", "password1", device_id="   ")
+        )["username"] == "alice"
+
+    def test_ip_limit(self, db, monkeypatch):
+        """同 IP 24h 内注册满 IP_MAX_REGISTER_PER_DAY（默认 5）后再注册抛 IpLimitError。"""
+        monkeypatch.setenv("IP_MAX_REGISTER_PER_DAY", "5")
+        for i in range(5):
+            webauth.register(f"user{i:02d}", "password1", register_ip="1.2.3.4")
+        with pytest.raises(webauth.IpLimitError):
+            webauth.register("user99", "password1", register_ip="1.2.3.4")
+        # 别的 IP / 24h 前的注册不占名额
+        webauth.register("other1", "password1", register_ip="5.6.7.8")
+        monkeypatch.setattr(
+            webauth, "_now", lambda: datetime.now() + timedelta(hours=25)
+        )
+        webauth.register("other2", "password1", register_ip="1.2.3.4")
 
     def test_conversation_crud_and_isolation(self, db):
         alice = webauth.resolve_token(webauth.register("alice", "password1"))
@@ -306,9 +435,11 @@ class TestWebauthUnit:
 
 def test_migrate_old_db_without_pinned(tmp_path, monkeypatch):
     """
-    老库迁移兼容：手工建一个无 pinned 列的老结构库（模拟 Railway 线上存量库），
-    首次 _connect 时 ensure_schema(_SCHEMA)+_migrate 应无报错补齐 pinned 列，
-    且存量数据 pinned 默认为 False，改名/置顶功能正常；重复执行幂等。
+    老库迁移兼容：手工建一个无 pinned / is_admin / quota_limit / register_ip
+    列的老结构库（模拟 Railway 线上存量库），首次 _connect 时
+    ensure_schema(_SCHEMA)+_migrate 应无报错补齐全部后加列，
+    且存量数据 pinned 默认为 False、is_admin 默认为 False、额度按默认 30；
+    改名/置顶功能正常；重复执行幂等。
     """
     import sqlite3 as raw_sqlite3
 
@@ -322,6 +453,16 @@ def test_migrate_old_db_without_pinned(tmp_path, monkeypatch):
             password_hash TEXT NOT NULL,
             salt TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE monthly_usage (
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            month TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, month)
+        );
+        CREATE TABLE packs (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id),
+            credits INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE conversations (
             id TEXT PRIMARY KEY,
@@ -356,6 +497,15 @@ def test_migrate_old_db_without_pinned(tmp_path, monkeypatch):
     assert result["updated_at"] == "2024-01-01T00:00:00.000"  # pin 不动 updated_at
     # 迁移幂等：再次连接（列已存在，ALTER 抛错被吞）不报错
     assert webauth.list_conversations(1)[0]["pinned"] is True
+
+    # users 后加列迁移：存量用户按默认额度 30、非管理员；遗留 packs 表无害忽略
+    item = webauth.admin_list_users()[0]
+    assert item["username"] == "legacy"
+    assert item["is_admin"] is False
+    assert item["quota_limit"] == 30
+    quota = webauth.get_quota(1)
+    assert quota["quota_used"] == 0 and quota["quota_remaining"] == 30
+    assert webauth.consume_quota(1) is True
 
 
 # ════════════════════════════════════════════════════════════
@@ -415,13 +565,67 @@ class TestAuthEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert data["username"] == "testuser"
-        for key in (
-            "monthly_quota", "monthly_used", "monthly_remaining",
-            "pack_credits", "total_remaining", "reset_date",
-        ):
-            assert key in data
-        assert data["monthly_remaining"] == data["monthly_quota"] - data["monthly_used"]
-        assert data["total_remaining"] == data["monthly_remaining"] + data["pack_credits"]
+        assert data["is_admin"] is False
+        assert data["quota_limit"] == 30
+        assert data["quota_used"] == 0
+        assert data["quota_remaining"] == 30
+        assert "reset_date" in data
+        assert data["quota_remaining"] == data["quota_limit"] - data["quota_used"]
+        # 加油包字段彻底移除
+        for key in ("pack_credits", "total_remaining", "monthly_quota",
+                    "monthly_used", "monthly_remaining"):
+            assert key not in data
+
+    def test_me_admin_flag(self, client):
+        token = _register(client, username="yoozo").json()["token"]
+        data = client.get("/api/me", headers=_auth(token)).json()
+        assert data["is_admin"] is True
+
+
+# ════════════════════════════════════════════════════════════
+# 2.5) 注册防多号端点（device_limit / ip_limit）
+# ════════════════════════════════════════════════════════════
+
+class TestRegisterLimits:
+    def test_device_limit_409(self, client, monkeypatch):
+        monkeypatch.setenv("DEVICE_MAX_ACCOUNTS", "2")
+        payload = {"password": "secret123", "device_id": "dev-1"}
+        assert client.post("/api/auth/register", json={"username": "alice", **payload}).status_code == 200
+        assert client.post("/api/auth/register", json={"username": "bob", **payload}).status_code == 200
+        resp = client.post("/api/auth/register", json={"username": "carol", **payload})
+        assert resp.status_code == 409
+        assert resp.json() == {"error": "device_limit"}
+        # 不带 device_id / 换设备不受影响
+        assert client.post("/api/auth/register", json={"username": "dave", "password": "secret123"}).status_code == 200
+        assert client.post(
+            "/api/auth/register",
+            json={"username": "erin", "password": "secret123", "device_id": "dev-2"},
+        ).status_code == 200
+
+    def test_ip_limit_429(self, client, monkeypatch):
+        monkeypatch.setenv("IP_MAX_REGISTER_PER_DAY", "5")
+        headers = {"X-Forwarded-For": "9.9.9.9, 10.0.0.1"}  # 取第一个
+        for i in range(5):
+            resp = client.post(
+                "/api/auth/register",
+                json={"username": f"user{i:02d}", "password": "secret123"},
+                headers=headers,
+            )
+            assert resp.status_code == 200
+        resp = client.post(
+            "/api/auth/register",
+            json={"username": "user99", "password": "secret123"},
+            headers=headers,
+        )
+        assert resp.status_code == 429
+        assert resp.json() == {"error": "ip_limit"}
+        # 换个来源 IP 立即可注册（X-Forwarded-For 取第一个地址）
+        resp = client.post(
+            "/api/auth/register",
+            json={"username": "user98", "password": "secret123"},
+            headers={"X-Forwarded-For": "8.8.8.8"},
+        )
+        assert resp.status_code == 200
 
 
 # ════════════════════════════════════════════════════════════
@@ -620,21 +824,17 @@ class TestPatchConversationEndpoint:
 
 
 # ════════════════════════════════════════════════════════════
-# 4) 充值与 /api/chat
+# 4) 加油包下线与 /api/chat
 # ════════════════════════════════════════════════════════════
 
-class TestTopup:
-    def test_topup_accumulates(self, client, monkeypatch):
-        monkeypatch.setenv("WEB_PACK_SIZE", "50")
+class TestTopupRemoved:
+    def test_topup_returns_410(self, client):
+        """加油包功能整体下线：端点保留但一律 410，无需鉴权也 410。"""
         token = _register(client).json()["token"]
         resp = client.post("/api/topup", json={"pack_count": 1}, headers=_auth(token))
-        assert resp.status_code == 200
-        assert resp.json() == {"pack_credits": 50, "total_remaining": 100 + 50}
-        resp = client.post("/api/topup", json={"pack_count": 2}, headers=_auth(token))
-        assert resp.json()["pack_credits"] == 150
-
-    def test_topup_requires_auth(self, client):
-        assert client.post("/api/topup", json={"pack_count": 1}).status_code == 401
+        assert resp.status_code == 410
+        assert resp.json()["error"] == "topup_removed"
+        assert client.post("/api/topup", json={"pack_count": 1}).status_code == 410
 
 
 class TestWebChat:
@@ -674,8 +874,8 @@ class TestWebChat:
 
         # 流正常完成扣 1 次额度
         me = client.get("/api/me", headers=_auth(token)).json()
-        assert me["monthly_used"] == 1
-        assert me["total_remaining"] == me["monthly_quota"] - 1
+        assert me["quota_used"] == 1
+        assert me["quota_remaining"] == me["quota_limit"] - 1
 
     def test_stream_failure_no_quota_consumed(self, client):
         token, conv = self._setup(client)
@@ -692,7 +892,7 @@ class TestWebChat:
 
         # 流失败：不扣额度，助手消息不落库（用户消息仍在）
         me = client.get("/api/me", headers=_auth(token)).json()
-        assert me["monthly_used"] == 0
+        assert me["quota_used"] == 0
         detail = client.get(f"/api/conversations/{conv['id']}", headers=_auth(token)).json()
         assert [m["role"] for m in detail["messages"]] == ["user"]
 
@@ -716,7 +916,7 @@ class TestWebChat:
         assert resp.status_code == 429
         data = resp.json()
         assert data["error"] == "quota_exhausted"
-        assert data["total_remaining"] == 0
+        assert data["quota_remaining"] == 0
         assert "reset_date" in data
         # 429 的请求不落库
         detail = client.get(f"/api/conversations/{conv['id']}", headers=_auth(token)).json()
@@ -763,6 +963,137 @@ class TestWebChat:
             )
         history = fake.calls[0]["history"]
         assert [h["content"] for h in history] == ["旧问题", "旧回答"]
+
+
+# ════════════════════════════════════════════════════════════
+# 4.5) 管理员端点 /api/admin/*
+# ════════════════════════════════════════════════════════════
+
+class TestAdminEndpoints:
+    def _admin_token(self, client):
+        return _register(client, username="yoozo").json()["token"]
+
+    def test_non_admin_403(self, client):
+        token = _register(client).json()["token"]  # 普通用户
+        assert client.get("/api/admin/users", headers=_auth(token)).status_code == 403
+        assert client.patch(
+            "/api/admin/users/testuser/quota",
+            json={"quota_limit": 100}, headers=_auth(token),
+        ).status_code == 403
+        assert client.get(
+            "/api/admin/users/testuser/questions", headers=_auth(token)
+        ).status_code == 403
+
+    def test_unauthenticated_401(self, client):
+        assert client.get("/api/admin/users").status_code == 401
+        assert client.patch(
+            "/api/admin/users/x/quota", json={"quota_limit": 1}
+        ).status_code == 401
+        assert client.get("/api/admin/users/x/questions").status_code == 401
+
+    def test_list_users(self, client):
+        admin = self._admin_token(client)
+        _register(client, username="alice")
+        resp = client.get("/api/admin/users", headers=_auth(admin))
+        assert resp.status_code == 200
+        users = resp.json()
+        assert [u["username"] for u in users] == ["yoozo", "alice"]
+        assert users[0]["is_admin"] is True
+        assert users[1]["is_admin"] is False
+        for key in ("username", "created_at", "is_admin", "quota_limit",
+                    "quota_used", "quota_remaining", "reset_date"):
+            assert key in users[0]
+        assert users[1]["quota_limit"] == 30
+        assert users[1]["quota_used"] == 0
+        assert users[1]["quota_remaining"] == 30
+
+    def test_patch_quota_realtime(self, client):
+        admin = self._admin_token(client)
+        user_token = _register(client, username="alice").json()["token"]
+
+        resp = client.patch(
+            "/api/admin/users/alice/quota",
+            json={"quota_limit": 100}, headers=_auth(admin),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "alice"
+        assert data["quota_limit"] == 100
+        assert data["quota_remaining"] == 100
+
+        # 实时生效：用户侧 /api/me 立刻看到新上限
+        me = client.get("/api/me", headers=_auth(user_token)).json()
+        assert me["quota_limit"] == 100
+        assert me["quota_remaining"] == 100
+
+        # 0 合法：完全禁用
+        resp = client.patch(
+            "/api/admin/users/alice/quota",
+            json={"quota_limit": 0}, headers=_auth(admin),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["quota_limit"] == 0
+        assert client.get("/api/me", headers=_auth(user_token)).json()["quota_remaining"] == 0
+
+    def test_patch_quota_validation_and_404(self, client):
+        admin = self._admin_token(client)
+        _register(client, username="alice")
+        for bad in (-1, 100001, True, "10", None, 3.5):
+            resp = client.patch(
+                "/api/admin/users/alice/quota",
+                json={"quota_limit": bad}, headers=_auth(admin),
+            )
+            assert resp.status_code == 400, bad
+        # 边界值合法
+        assert client.patch(
+            "/api/admin/users/alice/quota",
+            json={"quota_limit": 100000}, headers=_auth(admin),
+        ).status_code == 200
+        # 用户不存在 404
+        assert client.patch(
+            "/api/admin/users/ghost/quota",
+            json={"quota_limit": 10}, headers=_auth(admin),
+        ).status_code == 404
+
+    def test_user_questions(self, client):
+        admin = self._admin_token(client)
+        user_token = _register(client, username="alice").json()["token"]
+        c1 = client.post(
+            "/api/conversations", json={"title": "对话一"}, headers=_auth(user_token)
+        ).json()
+        c2 = client.post(
+            "/api/conversations", json={"title": "对话二"}, headers=_auth(user_token)
+        ).json()
+        user = webauth.resolve_token(user_token)
+        webauth.add_message(c1["id"], "user", "问题1")
+        webauth.add_message(c1["id"], "assistant", "回答1")
+        webauth.add_message(c2["id"], "user", "问题2")
+
+        resp = client.get("/api/admin/users/alice/questions", headers=_auth(admin))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        assert [i["content"] for i in data["items"]] == ["问题2", "问题1"]  # 倒序
+        assert data["items"][0]["conversation_title"] == "对话二"
+        assert all("created_at" in i for i in data["items"])
+
+        # 分页
+        page = client.get(
+            "/api/admin/users/alice/questions?limit=1&offset=1", headers=_auth(admin)
+        ).json()
+        assert page["total"] == 2
+        assert [i["content"] for i in page["items"]] == ["问题1"]
+
+        # 用户不存在 404；分页参数非法 400
+        assert client.get(
+            "/api/admin/users/ghost/questions", headers=_auth(admin)
+        ).status_code == 404
+        assert client.get(
+            "/api/admin/users/alice/questions?limit=0", headers=_auth(admin)
+        ).status_code in (400, 422)
+        assert client.get(
+            "/api/admin/users/alice/questions?offset=-1", headers=_auth(admin)
+        ).status_code in (400, 422)
 
 
 # ════════════════════════════════════════════════════════════

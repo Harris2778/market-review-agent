@@ -7,10 +7,21 @@
 
   /* ==================== 可配置常量 ==================== */
   var APP_NAME = 'Fine';         // 品牌名 / 页面标题，改名只动这里
-  var PACK_SIZE = 50;            // 每个加油包条数（与后端 WEB_PACK_SIZE 默认一致）
   var STORAGE_TOKEN = 'fia_token';
   var STORAGE_USER = 'fia_username';
   var STORAGE_THEME = 'fia_theme';
+  var STORAGE_DEVICE = 'fia_device';
+  var QUESTIONS_PAGE_SIZE = 20;
+
+  /* 管理端点（后端契约） */
+  var ADMIN_USERS_API = '/api/admin/users';
+  function adminQuotaApi(username) {
+    return '/api/admin/users/' + encodeURIComponent(username) + '/quota';
+  }
+  function adminQuestionsApi(username, offset, limit) {
+    return '/api/admin/users/' + encodeURIComponent(username) +
+      '/questions?offset=' + offset + '&limit=' + limit;
+  }
 
   /* 生成中占位小球（双眼高光，流式首帧到达后被 markdown 覆盖替换） */
   var GEN_BALL_HTML =
@@ -37,15 +48,17 @@
   var userName = $('user-name');
   var logoutBtn = $('logout-btn');
   var themeToggle = $('theme-toggle');
+  var quotaRow = $('quota-row');
   var quotaFill = $('quota-fill');
   var quotaText = $('quota-text');
-  var topupEntryBtn = $('topup-entry-btn');
-  var packCount = $('pack-count');
+  var quotaResetInline = $('quota-reset-inline');
+  var adminEntryBtn = $('admin-entry-btn');
+  var menuToggle = $('menu-toggle');
+  var sidebarMask = $('sidebar-mask');
 
   var chatView = $('chat-view');
   var quotaBanner = $('quota-banner');
-  var quotaBannerBtn = $('quota-banner-btn');
-  var quotaBannerReset = $('quota-banner-reset');
+  var quotaBannerText = $('quota-banner-text');
   var messagesEl = $('messages');
   var welcomeEl = $('welcome');
   var composer = $('composer');
@@ -61,8 +74,18 @@
   var quotaBarFill = $('quota-bar-fill');
   var quotaBarText = $('quota-bar-text');
   var quotaResetNote = $('quota-reset-note');
-  var packBalance = $('pack-balance');
-  var buyPackBtn = $('buy-pack-btn');
+
+  var adminView = $('admin-view');
+  var adminBackBtn = $('admin-back-btn');
+  var adminTbody = $('admin-tbody');
+  var adminEmpty = $('admin-empty');
+  var adminUsersWrap = $('admin-users-wrap');
+  var adminQuestions = $('admin-questions');
+  var questionsBackBtn = $('questions-back-btn');
+  var questionsTitle = $('questions-title');
+  var questionsList = $('questions-list');
+  var questionsEmpty = $('questions-empty');
+  var questionsMore = $('questions-more');
 
   var convMenu = $('conv-menu');
   var menuRename = $('menu-rename');
@@ -79,8 +102,10 @@
     streaming: false,
     abortController: null,
     authMode: 'login',      // 'login' | 'register'
-    view: 'chat',           // 'chat' | 'quota'
-    menuConvId: null        // 当前打开操作菜单的对话 id
+    view: 'chat',           // 'chat' | 'quota' | 'admin'
+    menuConvId: null,       // 当前打开操作菜单的对话 id
+    adminUsers: [],
+    questions: { username: null, offset: 0, loading: false, hasMore: false }
   };
 
   /* ==================== 基础工具 ==================== */
@@ -161,6 +186,45 @@
     try { localStorage.setItem(STORAGE_THEME, t); } catch (e) { /* 忽略 */ }
   }
 
+  /* ==================== 设备指纹（注册防多号） ==================== */
+  function getDeviceId() {
+    try {
+      var id = localStorage.getItem(STORAGE_DEVICE);
+      if (!id) {
+        id = (window.crypto && typeof window.crypto.randomUUID === 'function')
+          ? window.crypto.randomUUID()
+          : 'dev-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+        localStorage.setItem(STORAGE_DEVICE, id);
+      }
+      return id;
+    } catch (e) {
+      return null; // localStorage 不可用时降级为不上报
+    }
+  }
+
+  /* ==================== 额度字段兼容解析 ====================
+     新契约：quota_used / quota_limit / reset_date / is_admin；
+     过渡期兼容旧字段 monthly_used / monthly_quota。 */
+  function meUsed(me) { return me.quota_used != null ? me.quota_used : (me.monthly_used || 0); }
+  function meLimit(me) { return me.quota_limit != null ? me.quota_limit : (me.monthly_quota || 0); }
+  function meRemaining(me) {
+    var r = meLimit(me) - meUsed(me);
+    return r > 0 ? r : 0;
+  }
+  function meExhausted(me) {
+    return !!me && meLimit(me) > 0 && meRemaining(me) <= 0;
+  }
+
+  /* ==================== 移动端抽屉侧边栏 ==================== */
+  function openSidebar() {
+    appView.classList.add('sidebar-open');
+    setHidden(sidebarMask, false);
+  }
+  function closeSidebar() {
+    appView.classList.remove('sidebar-open');
+    setHidden(sidebarMask, true);
+  }
+
   /* ==================== hero 视差 ====================
      mousemove 记录目标位移，rAF 循环 lerp 平滑；
      各层按 data-depth 系数以不同幅度跟随（--px/--py）。 */
@@ -235,12 +299,18 @@
 
     authSubmit.disabled = true;
     setHidden(authError, true);
-    var path = state.authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
+    var isRegister = state.authMode === 'register';
+    var path = isRegister ? '/api/auth/register' : '/api/auth/login';
+    var payload = { username: username, password: password };
+    if (isRegister) {
+      var deviceId = getDeviceId();
+      if (deviceId) payload.device_id = deviceId;   // 注册防多号：上报设备指纹
+    }
     try {
       var res = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username, password: password })
+        body: JSON.stringify(payload)
       });
       var data = await res.json().catch(function () { return {}; });
       if (res.ok) {
@@ -249,8 +319,12 @@
         localStorage.setItem(STORAGE_TOKEN, state.token);
         localStorage.setItem(STORAGE_USER, state.username);
         showApp();
+      } else if (res.status === 409 && data.error === 'device_limit') {
+        showAuthError('该设备注册账号数量已达上限');
       } else if (res.status === 409) {
         showAuthError('该用户名已被注册，请换一个或直接登录');
+      } else if (res.status === 429) {
+        showAuthError('当前网络注册过于频繁，请稍后再试');
       } else if (res.status === 401) {
         showAuthError('用户名或密码错误');
       } else {
@@ -284,12 +358,14 @@
       state.me = await res.json();
       renderUserBar();
       updateQuotaState();
+      setHidden(adminEntryBtn, !state.me.is_admin);   // 管理入口仅管理员可见
       if (state.view === 'quota') renderQuotaView();
     } catch (e) {
       if (e.message !== 'unauthorized') console.error(e);
     }
   }
 
+  /* 用户栏：额度进度条（已用/上限）+ 重置日期小字 */
   function renderUserBar() {
     userName.textContent = state.username || '—';
 
@@ -297,28 +373,26 @@
     if (!me) {
       quotaText.textContent = '—';
       quotaFill.style.width = '0%';
-      packCount.textContent = '';
+      quotaResetInline.textContent = '';
       return;
     }
-    var quota = me.monthly_quota || 0;
-    var used = me.monthly_used || 0;
-    var pct = quota > 0 ? Math.min(100, Math.round(used / quota * 100)) : 0;
+    var limit = meLimit(me);
+    var used = meUsed(me);
+    var pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
     quotaFill.style.width = pct + '%';
-    quotaFill.classList.toggle('low', (me.monthly_remaining || 0) <= 0 && quota > 0);
-    quotaText.textContent = '本月 ' + (me.monthly_remaining != null ? me.monthly_remaining : '—') + '/' + quota;
-    packCount.textContent = me.pack_credits ? '（余 ' + me.pack_credits + '）' : '';
+    quotaFill.classList.toggle('low', meExhausted(me));
+    quotaText.textContent = '已用 ' + used + '/' + limit;
+    quotaResetInline.textContent = me.reset_date ? formatDate(me.reset_date) + ' 重置' : '';
   }
 
-  /* 额度状态：控制提示条与输入禁用 */
+  /* 额度状态：控制提示条与输入禁用（提示条为纯说明，无购买引导） */
   function updateQuotaState() {
     var me = state.me;
-    var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
+    var exhausted = meExhausted(me);
     setQuotaBanner(!!exhausted);
     input.disabled = !!exhausted;
-    if (exhausted && me.reset_date) {
-      quotaBannerReset.textContent = '将于 ' + formatDate(me.reset_date) + ' 自动重置';
-    } else {
-      quotaBannerReset.textContent = '次月1日自动重置';
+    if (exhausted) {
+      quotaBannerText.textContent = '本月额度已用完，将于 ' + formatDate(me.reset_date) + ' 重置';
     }
     updateSendState();
   }
@@ -334,20 +408,36 @@
     return (d.getMonth() + 1) + '月' + d.getDate() + '日';
   }
 
-  /* ==================== 额度页（独立视图） ==================== */
-  function showQuotaView() {
-    state.view = 'quota';
+  function formatDateTime(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mm = String(d.getMinutes()).padStart(2, '0');
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + hh + ':' + mm;
+  }
+
+  /* ==================== 三视图切换（chat / quota / admin） ==================== */
+  function showView(name) {
+    state.view = name;
     closeConvMenu();
-    setHidden(chatView, true);
-    setHidden(quotaView, false);
+    setHidden(chatView, name !== 'chat');
+    setHidden(quotaView, name !== 'quota');
+    setHidden(adminView, name !== 'admin');
+  }
+
+  function showChatView() { showView('chat'); }
+
+  function showQuotaView() {
+    showView('quota');
     renderQuotaView();
     loadMe(); // 进入时拉取最新额度
   }
 
-  function showChatView() {
-    state.view = 'chat';
-    setHidden(quotaView, true);
-    setHidden(chatView, false);
+  function showAdminView() {
+    showView('admin');
+    showUsersPanel();
+    loadAdminUsers();
   }
 
   function renderQuotaView() {
@@ -357,39 +447,146 @@
       quotaBarFill.style.width = '0%';
       quotaBarText.textContent = '加载中…';
       quotaResetNote.textContent = '';
-      packBalance.textContent = '—';
       return;
     }
-    quotaBigNum.textContent = me.total_remaining != null ? me.total_remaining : '—';
-    var quota = me.monthly_quota || 0;
-    var used = me.monthly_used || 0;
-    var pct = quota > 0 ? Math.min(100, Math.round(used / quota * 100)) : 0;
+    var limit = meLimit(me);
+    var used = meUsed(me);
+    quotaBigNum.textContent = meRemaining(me);
+    var pct = limit > 0 ? Math.min(100, Math.round(used / limit * 100)) : 0;
     quotaBarFill.style.width = pct + '%';
-    quotaBarFill.classList.toggle('low', (me.monthly_remaining || 0) <= 0 && quota > 0);
-    quotaBarText.textContent = '已用 ' + used + ' / ' + quota + ' 条';
+    quotaBarFill.classList.toggle('low', meExhausted(me));
+    quotaBarText.textContent = '已用 ' + used + ' / ' + limit + ' 条';
     quotaResetNote.textContent = '月度额度将于 ' + formatDate(me.reset_date) + ' 重置';
-    packBalance.textContent = me.pack_credits != null ? me.pack_credits : 0;
   }
 
-  async function buyPack() {
-    buyPackBtn.disabled = true;
-    var oldText = buyPackBtn.textContent;
-    buyPackBtn.textContent = '到账中…';
+  /* ==================== 管理视图（仅 is_admin） ==================== */
+  function showUsersPanel() {
+    setHidden(adminUsersWrap, false);
+    setHidden(adminQuestions, true);
+  }
+
+  async function loadAdminUsers() {
     try {
-      var res = await api('/api/topup', { method: 'POST', body: { pack_count: 1 } });
+      var res = await api(ADMIN_USERS_API);
+      if (!res.ok) return;
+      var data = await res.json();
+      state.adminUsers = Array.isArray(data) ? data : (data.users || data.items || []);
+      renderAdminUsers();
+    } catch (e) {
+      if (e.message !== 'unauthorized') console.error(e);
+    }
+  }
+
+  function renderAdminUsers() {
+    adminTbody.innerHTML = '';
+    setHidden(adminEmpty, state.adminUsers.length > 0);
+    state.adminUsers.forEach(function (u) {
+      var used = u.quota_used != null ? u.quota_used : (u.monthly_used || 0);
+      var limit = u.quota_limit != null ? u.quota_limit : (u.monthly_quota || 0);
+      var tr = el('tr');
+
+      tr.appendChild(el('td', null, u.username)).dataset.label = '用户名';
+      tr.appendChild(el('td', null, formatDate(u.created_at))).dataset.label = '注册时间';
+      var usageTd = el('td', null, '已用 ' + used + ' / ' + limit);
+      usageTd.dataset.label = '本周期用量';
+      tr.appendChild(usageTd);
+      tr.appendChild(el('td', null, formatDate(u.reset_date))).dataset.label = '重置日期';
+
+      // 操作：额度上限就地编辑 + 保存；查看提问
+      var opsTd = el('td', 'admin-ops');
+      opsTd.dataset.label = '操作';
+      var quotaInput = document.createElement('input');
+      quotaInput.className = 'quota-edit-input';
+      quotaInput.type = 'number';
+      quotaInput.min = '0';
+      quotaInput.value = limit;
+      var saveBtn = el('button', 'btn btn-primary btn-sm', '保存');
+      var hint = el('span', 'row-saved-hint');
+      saveBtn.addEventListener('click', function () {
+        saveUserQuota(u, quotaInput, saveBtn, hint, usageTd);
+      });
+      var viewBtn = el('button', 'btn btn-ghost btn-sm', '查看提问');
+      viewBtn.addEventListener('click', function () { showQuestionsPanel(u.username); });
+      opsTd.appendChild(quotaInput);
+      opsTd.appendChild(saveBtn);
+      opsTd.appendChild(viewBtn);
+      opsTd.appendChild(hint);
+      tr.appendChild(opsTd);
+
+      adminTbody.appendChild(tr);
+    });
+  }
+
+  async function saveUserQuota(user, inputEl, btn, hint, usageTd) {
+    var n = parseInt(inputEl.value, 10);
+    if (isNaN(n) || n < 0) {
+      hint.textContent = '请输入非负整数';
+      return;
+    }
+    btn.disabled = true;
+    hint.textContent = '';
+    try {
+      var res = await api(adminQuotaApi(user.username), {
+        method: 'PATCH',
+        body: { quota_limit: n }
+      });
       if (res.ok) {
-        await loadMe();          // 刷新额度页与侧边栏
-        buyPackBtn.textContent = oldText;
+        user.quota_limit = n;   // 实时刷新该行
+        var used = user.quota_used != null ? user.quota_used : (user.monthly_used || 0);
+        usageTd.textContent = '已用 ' + used + ' / ' + n;
+        hint.textContent = '已保存';
+        setTimeout(function () { hint.textContent = ''; }, 2000);
       } else {
-        buyPackBtn.textContent = '充值失败，请重试';
-        setTimeout(function () { buyPackBtn.textContent = oldText; }, 1500);
+        hint.textContent = '保存失败';
       }
     } catch (e) {
-      buyPackBtn.textContent = '网络异常，请重试';
-      setTimeout(function () { buyPackBtn.textContent = oldText; }, 1500);
+      if (e.message !== 'unauthorized') hint.textContent = '网络异常';
     } finally {
-      buyPackBtn.disabled = false;
+      btn.disabled = false;
     }
+  }
+
+  /* ---- 查看提问：分页加载 ---- */
+  function showQuestionsPanel(username) {
+    state.questions = { username: username, offset: 0, loading: false, hasMore: false };
+    questionsTitle.textContent = '「' + username + '」的提问记录';
+    questionsList.innerHTML = '';
+    setHidden(adminUsersWrap, true);
+    setHidden(adminQuestions, false);
+    loadQuestions();
+  }
+
+  async function loadQuestions() {
+    var q = state.questions;
+    if (!q.username || q.loading) return;
+    q.loading = true;
+    questionsMore.disabled = true;
+    try {
+      var res = await api(adminQuestionsApi(q.username, q.offset, QUESTIONS_PAGE_SIZE));
+      if (!res.ok) return;
+      var data = await res.json();
+      var items = Array.isArray(data) ? data : (data.items || data.questions || []);
+      q.hasMore = Array.isArray(data) ? items.length === QUESTIONS_PAGE_SIZE
+        : (data.has_more != null ? !!data.has_more : items.length === QUESTIONS_PAGE_SIZE);
+      items.forEach(appendQuestionItem);
+      q.offset += items.length;
+      setHidden(questionsEmpty, questionsList.children.length > 0);
+      setHidden(questionsMore, !q.hasMore);
+    } catch (e) {
+      if (e.message !== 'unauthorized') console.error(e);
+    } finally {
+      q.loading = false;
+      questionsMore.disabled = false;
+    }
+  }
+
+  function appendQuestionItem(item) {
+    var li = el('li', 'question-item');
+    var time = formatDateTime(item.created_at || item.time);
+    var convTitle = item.conversation_title || item.title || '未命名对话';
+    li.appendChild(el('div', 'question-meta', time + ' · ' + convTitle));
+    li.appendChild(el('div', 'question-content', item.content || item.question || ''));
+    questionsList.appendChild(li);
   }
 
   /* ==================== 对话列表 ==================== */
@@ -528,6 +725,7 @@
       var conv = await res.json();
       state.activeConvId = conv.id;
       showChatView();
+      closeSidebar();                 // 移动端：选中对话后自动收起抽屉
       renderConvList();
       renderMessages(conv.messages || []);
       input.focus();
@@ -562,6 +760,7 @@
   function startNewChat() {
     state.activeConvId = null;
     showChatView();
+    closeSidebar();                   // 移动端：新对话后自动收起抽屉
     messagesEl.innerHTML = '';
     showWelcome(true);
     renderConvList();
@@ -602,15 +801,13 @@
 
   /* ==================== 发送与 SSE 流 ==================== */
   function updateSendState() {
-    var me = state.me;
-    var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
-    sendBtn.disabled = !!exhausted || !input.value.trim();
+    sendBtn.disabled = meExhausted(state.me) || !input.value.trim();
   }
 
   async function sendMessage() {
     var text = input.value.trim();
     if (!text || state.streaming) return;
-    if (state.me && typeof state.me.total_remaining === 'number' && state.me.total_remaining <= 0) {
+    if (meExhausted(state.me)) {
       updateQuotaState();
       return;
     }
@@ -648,13 +845,12 @@
         var note = el('p', 'stopped-note', '（已停止生成）');
         bubble.appendChild(note);
       } else if (e && e.quotaExhausted) {
-        // 429：服务端未落库，移除本地乐观气泡并恢复输入，跳转额度页
+        // 429：服务端未落库，移除本地乐观气泡并恢复输入；提示条说明重置日期
         removeLastTwoBubbles();
         input.value = text;
         autoResize();
         await loadMe();
         updateQuotaState();
-        showQuotaView();
       } else if (e && e.message === 'unauthorized') {
         // handleUnauthorized 已处理
       } else {
@@ -787,11 +983,20 @@
     input.addEventListener('keydown', handleKeydown);
     input.addEventListener('input', handleInput);
 
-    /* 额度页入口与返回 */
-    topupEntryBtn.addEventListener('click', showQuotaView);
-    quotaBannerBtn.addEventListener('click', showQuotaView);
+    /* 额度页入口（点击用户栏额度区）与返回；管理页入口与返回 */
+    quotaRow.addEventListener('click', showQuotaView);
     quotaBackBtn.addEventListener('click', showChatView);
-    buyPackBtn.addEventListener('click', buyPack);
+    adminEntryBtn.addEventListener('click', function () {
+      closeSidebar();
+      showAdminView();
+    });
+    adminBackBtn.addEventListener('click', showChatView);
+    questionsBackBtn.addEventListener('click', showUsersPanel);
+    questionsMore.addEventListener('click', loadQuestions);
+
+    /* 移动端抽屉：汉堡打开 / 遮罩与 Esc 关闭 */
+    menuToggle.addEventListener('click', openSidebar);
+    sidebarMask.addEventListener('click', closeSidebar);
 
     /* 对话操作菜单：三项动作 + 点击外部 / Esc 关闭 */
     menuRename.addEventListener('click', function (ev) {
@@ -815,7 +1020,10 @@
     convMenu.addEventListener('click', function (ev) { ev.stopPropagation(); });
     document.addEventListener('click', function () { closeConvMenu(); });
     document.addEventListener('keydown', function (ev) {
-      if (ev.key === 'Escape' && !isHidden(convMenu)) closeConvMenu();
+      if (ev.key === 'Escape') {
+        if (!isHidden(convMenu)) closeConvMenu();
+        closeSidebar();
+      }
     });
   }
 
@@ -825,8 +1033,8 @@
     initHero($('hero-auth'));
     initHero($('hero-welcome'));
     setAuthMode('login');
-    buyPackBtn.textContent = '充值 +' + PACK_SIZE + ' 条';
     closeConvMenu();
+    closeSidebar();
     updateSendState();
 
     if (state.token) {
