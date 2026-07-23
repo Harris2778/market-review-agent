@@ -74,6 +74,11 @@ class TestDetectIntent:
             # ── 板块聚焦 ──
             ("煤炭板块复盘", "sector_deep_dive", "煤炭"),
             ("电子行业怎么样", "sector_deep_dive", "电子"),
+            # ── 板块周报（周区间+板块 → sector_weekly；护栏词让位既有路由）──
+            ("上周白酒板块怎么样", "sector_weekly", "食品饮料"),
+            ("这周半导体周报", "sector_weekly", "电子"),
+            ("上周白酒板块新闻", "news_only", "食品饮料"),
+            ("上周市场怎么样", "market_review", None),
             # ── 个股查询（股票名称 / 代码）──
             ("茅台怎么样", "stock_query", None),
             ("分析AAPL", "us_hk_query", None),

@@ -142,6 +142,65 @@ def _get_latest_trade_date(ref_date: datetime) -> datetime:
         d = d - timedelta(days=1)
     return d
 
+
+# ── 残留1修复：中文相对时间引用解析（昨天/上周等 → 明确日期/周区间）──
+
+# 星期字 → weekday 索引（周一=0 … 周五=4；周末不纳入单日引用）
+_WEEKDAY_CN = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4}
+
+# 周区间相对时间词：本周类（本周一起算，截到今日）与上周类（完整上一周）
+_WEEK_REF_CURRENT_TERMS = ("这周以来", "本周以来", "近一周", "这周", "本周")
+_WEEK_REF_PREV_TERMS = ("上周", "上礼拜")
+
+
+def _resolve_time_reference(msg: str, now: datetime) -> tuple:
+    """解析消息中的中文相对时间引用。
+
+    返回：
+      - 单日类（今天/今日/昨天/昨日/前天/上周一~上周五/本周一~本周五）：
+        ("day", 目标日期 date)
+      - 周区间类（这周/本周/近一周/这周以来 → 本周一~今日；
+        上周/上礼拜 → 上周一~上周日）：
+        ("week", 周一起始 date, 结束 date)
+      - 无时间引用：("none", None)
+
+    判定顺序：『上周X/本周X』单日模式优先于『上周/本周』周区间模式
+    （『上周五』是单日不是周区间）。纯函数，任何异常按无引用处理，绝不抛出。
+    """
+    text = (msg or "").strip()
+    if not text:
+        return ("none", None)
+    try:
+        today = now.date() if isinstance(now, datetime) else now
+        monday_this = today - timedelta(days=today.weekday())
+        monday_prev = monday_this - timedelta(days=7)
+
+        # 1) 上周X / 本周X / 这周X（X=一~五）→ 单日（先于周区间判定）
+        m = re.search(r"(?:上周|上礼拜)([一二三四五])", text)
+        if m:
+            return ("day", monday_prev + timedelta(days=_WEEKDAY_CN[m.group(1)]))
+        m = re.search(r"(?:本周|这周)([一二三四五])", text)
+        if m:
+            return ("day", monday_this + timedelta(days=_WEEKDAY_CN[m.group(1)]))
+
+        # 2) 周区间
+        if any(t in text for t in _WEEK_REF_PREV_TERMS):
+            return ("week", monday_prev, monday_prev + timedelta(days=6))
+        if any(t in text for t in _WEEK_REF_CURRENT_TERMS):
+            return ("week", monday_this, min(monday_this + timedelta(days=6), today))
+
+        # 3) 单日相对词
+        if "前天" in text:
+            return ("day", today - timedelta(days=2))
+        if "昨天" in text or "昨日" in text:
+            return ("day", today - timedelta(days=1))
+        if "今天" in text or "今日" in text:
+            return ("day", today)
+        return ("none", None)
+    except Exception as e:
+        logger.warning("相对时间引用解析异常（按无引用处理）: %s", e, exc_info=True)
+        return ("none", None)
+
 # ── 第七波：自选股 / 行业知识库 / 以史为鉴 集成 ──
 
 # 自选股动作词（detect_intent 与 _watchlist handler 共用同一口径）
@@ -244,6 +303,9 @@ MARKET_REVIEW_PATTERNS = [
     r"(市场|大盘|行情|A股).{0,4}(日报|简报|概览|综述|总结|回顾)",
     r"^(复盘|市场|大盘|行情).*",
 ]
+
+# 板块周报路由护栏：含这些词的消息保持既有路由（新闻/基金/期货诉求不被周报抢走）
+_WEEKLY_INTENT_EXCLUSIONS = ("新闻", "快讯", "资讯", "基金", "ETF", "净值", "期货")
 
 SECTOR_KEYWORDS = [
     "聚焦", "深入看", "重点看", "只看", "重点关注",
@@ -590,6 +652,13 @@ def detect_intent(message: str) -> tuple[str, Optional[str]]:
 
     # 先提取行业名（如果有的话，优先判定为板块聚焦）
     sector = _extract_sector(msg)
+
+    # 板块周报意图：周区间时间引用（这周/本周/上周/近一周等）+ 板块 → sector_weekly。
+    # 此前『上周白酒板块』类问题只拿到单日数据；周报路径聚合当周行情/新闻/券商研报。
+    # 护栏：显式新闻/基金/期货诉求让位既有 news_only/fund_query/futures_query 路由，不抢。
+    if sector and not any(w in msg for w in _WEEKLY_INTENT_EXCLUSIONS):
+        if _resolve_time_reference(msg, datetime.now())[0] == "week":
+            return ("sector_weekly", sector)
 
     # 如果明确有聚焦关键词 + 行业 → 板块聚焦
     for sk in SECTOR_KEYWORDS:
@@ -1416,6 +1485,246 @@ _MCP_DATA_UNAVAILABLE = (
 )
 
 
+# ── 板块周报（周区间×板块新路径）：系统提示词与数据组装辅助 ──
+
+# 内联系统提示词：system_prompts.py 不在本工作线分工内，沿用
+# _DEFAULT_WATCHLIST_SYSTEM_PROMPT 的内联兜底模式
+_SECTOR_WEEKLY_SYSTEM_PROMPT = (
+    "你是严谨的板块周报分析师。基于提供的当周行情、成交、新闻与券商研报数据，"
+    "输出板块周报，固定五段结构：本周行情回顾 / 资金与成交 / 当周催化新闻 / "
+    "多家券商观点对比 / 下周关注。"
+    "仅使用上方提供的数据，数据缺失处写「数据未覆盖」，禁止编造；"
+    "券商观点必须严格来自提供的研报数据并注明券商名称，研报数据未覆盖时"
+    "如实写「券商研报数据未覆盖」，严禁虚构券商名称、评级、目标价或盈利预测；"
+    "纯文本输出，不使用 Markdown 表格；内容仅为客观数据整理，不构成投资建议。"
+)
+
+# 周报新闻展示上限（条）
+_SECTOR_WEEKLY_NEWS_CAP = 20
+# 券商研报检索回溯天数（覆盖当周+前一周，提高多家券商命中率）
+_SECTOR_WEEKLY_REPORT_DAYS = 14
+
+
+def _sector_news_keywords(sector: str) -> list:
+    """板块周报新闻检索关键词：申万一级名 + SECTOR_NAME_MAP 中映射到它的全部别名。"""
+    kws = [sector]
+    for kw, sw in SECTOR_NAME_MAP.items():
+        if sw == sector and kw not in kws:
+            kws.append(kw)
+    return kws
+
+
+def _collect_sector_weekly_quotes(sector: str, week_start, week_end, today) -> list:
+    """周度行情采集：当周每个工作日调 fetch_shenwan_sectors 取该板块行。
+
+    - 仅取周一~周五且不超过 today 的日期；
+    - 节假日对齐：fetch_shenwan_sectors(date) 返回 ≤date 最近交易日的数据，
+      假日调用的返回行与前一真实交易日相同——按 (close, pct_chg, amount)
+      签名去重，保证每个真实交易日只计一次（无需额外交易日历调用）；
+    - 单日异常只记 log 跳过，绝不抛出。
+    返回 [{'date','pct_chg','amount','vol','close'}...]，按日期升序。
+    """
+    try:
+        from agent.data_fetcher import fetch_shenwan_sectors
+    except ImportError as e:
+        logger.warning("fetch_shenwan_sectors 未就绪，周度行情整体降级: %s", e)
+        return []
+    daily = []
+    seen = set()
+    last = min(week_end, today)
+    d = week_start
+    while d <= last:
+        if d.weekday() < 5:
+            row = None
+            try:
+                rows = fetch_shenwan_sectors(d.strftime("%Y%m%d")) or []
+                row = next(
+                    (r for r in rows if isinstance(r, dict) and r.get("name") == sector),
+                    None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "周度行情单日获取失败（%s板块 %s，跳过）: %s", sector, d, e, exc_info=True
+                )
+            if row:
+                sig = (row.get("close"), row.get("pct_chg"), row.get("amount"))
+                if sig not in seen:
+                    seen.add(sig)
+                    daily.append({
+                        "date": d.strftime("%Y-%m-%d"),
+                        "pct_chg": row.get("pct_chg"),
+                        "amount": row.get("amount"),
+                        "vol": row.get("vol"),
+                        "close": row.get("close"),
+                    })
+        d += timedelta(days=1)
+    return daily
+
+
+def _format_sector_weekly_market_block(daily: list) -> str:
+    """周度行情块：逐日涨跌幅 + 复合周涨跌幅 + 成交额/量合计。空 → 数据未覆盖。"""
+    if not daily:
+        return "当周行情数据未覆盖（数据源未返回该板块当周日线）。"
+    lines = []
+    cum = 1.0
+    n = 0
+    amt_sum = 0.0
+    vol_sum = 0.0
+    for item in daily:
+        pct = item.get("pct_chg")
+        if isinstance(pct, (int, float)):
+            cum *= 1 + pct / 100
+            n += 1
+            lines.append(f"{item['date']} 涨跌幅 {pct:+.2f}%（收盘 {item.get('close', '?')}）")
+        else:
+            lines.append(f"{item['date']} 涨跌幅数据未覆盖")
+        amt = item.get("amount")
+        if isinstance(amt, (int, float)):
+            amt_sum += amt
+        vol = item.get("vol")
+        if isinstance(vol, (int, float)):
+            vol_sum += vol
+    if n:
+        lines.append(f"当周累计涨跌幅（{n}个交易日复合）：{(cum - 1) * 100:+.2f}%")
+    else:
+        lines.append("当周累计涨跌幅数据未覆盖")
+    if amt_sum:
+        lines.append(f"当周成交额合计约 {amt_sum:.2f} 亿元；成交量合计约 {vol_sum:.2f} 万手")
+    return "\n".join(lines)
+
+
+def _collect_sector_weekly_news(sector: str, week_start, week_end) -> list:
+    """当周新闻：智研双源新闻池（fetch_news_pool，键 mcp/flash），
+    按周区间过滤 + 板块关键词匹配 + 标题去重，按时间倒序，上限 _SECTOR_WEEKLY_NEWS_CAP。
+    模块未就绪/异常返回空列表，绝不抛出。"""
+    kws = _sector_news_keywords(sector)
+    try:
+        from agent.data_fetcher import fetch_news_pool
+    except ImportError as e:
+        logger.warning("fetch_news_pool 未就绪，周报新闻降级为空: %s", e)
+        return []
+    try:
+        pool = fetch_news_pool(sector_keywords=kws, days=7)
+    except Exception as e:
+        logger.warning("周报新闻池获取失败（%s板块）: %s", sector, e, exc_info=True)
+        return []
+    if not isinstance(pool, dict):
+        return []
+    start_s = week_start.strftime("%Y-%m-%d")
+    end_s = week_end.strftime("%Y-%m-%d")
+    items = []
+    seen = set()
+    for src in pool:
+        for it in pool.get(src) or []:
+            title = (it.get("title", "") or "").strip()
+            t = (it.get("time", "") or "")
+            day = t[:10]
+            if not title or len(title) < 4 or title in seen:
+                continue
+            # 无时间条目：智研快讯为滚动实时源，纳入当周（best-effort）
+            if day and not (start_s <= day <= end_s):
+                continue
+            match_text = (
+                title + (it.get("content", "") or "")
+                + (it.get("summary", "") or "") + (it.get("brief", "") or "")
+            )
+            if not any(kw in match_text for kw in kws):
+                continue
+            seen.add(title)
+            items.append({"title": title, "time": t})
+    items.sort(key=lambda x: x["time"], reverse=True)
+    return items[:_SECTOR_WEEKLY_NEWS_CAP]
+
+
+def _collect_sector_weekly_reports(sector: str, days: int = _SECTOR_WEEKLY_REPORT_DAYS) -> dict:
+    """当周券商研报：search_reports 按 industry 检索（只读调用）。
+
+    研报库行业名为申万风格（白酒Ⅱ/半导体等），通俗板块名（食品饮料）常无命中
+    并被静默回退为不限行业检索——QA 实锤『上周白酒周报』因此混入光模块/宏观
+    研报被 LLM 判未覆盖。此处按板块别名候选（申万一级名 + SECTOR_NAME_MAP
+    全部别名，如 食品饮料→白酒/食品/消费）逐个尝试，只接受真正行业命中的
+    结果（note 不含『回退』）；全部无命中时降级 query 标题检索并注明口径，
+    仍无则空结构。返回 {"total","reports","note"}；模块未就绪/异常 → 空结构，绝不抛出。"""
+    try:
+        from agent.report_library import search_reports
+    except ImportError as e:
+        logger.warning("report_library.search_reports 未就绪，周报券商观点降级: %s", e)
+        return {"total": 0, "reports": [], "note": ""}
+
+    def _hit(result) -> bool:
+        return (
+            isinstance(result, dict)
+            and (result.get("total", 0) or 0) > 0
+            and "回退" not in (result.get("note", "") or "")
+        )
+
+    try:
+        for cand in _sector_news_keywords(sector):
+            result = search_reports(industry=cand, days=days, limit=50)
+            if _hit(result):
+                note = result.get("note", "") or ""
+                if cand != sector:
+                    note = f"行业检索词：{cand}（板块别名命中）。" + note
+                return {
+                    "total": result.get("total", 0) or 0,
+                    "reports": result.get("reports") or [],
+                    "note": note,
+                }
+        # 行业词全部无命中：降级为标题关键词检索（口径注明，供 LLM 甄别相关性）
+        result = search_reports(query=sector, days=days, limit=50)
+        if isinstance(result, dict) and (result.get("total", 0) or 0) > 0:
+            return {
+                "total": result.get("total", 0) or 0,
+                "reports": result.get("reports") or [],
+                "note": "按研报标题关键词检索（行业字段无命中），命中条目与板块的相关性需甄别。",
+            }
+    except Exception as e:
+        logger.warning("周报券商研报检索失败（%s板块）: %s", sector, e, exc_info=True)
+    return {"total": 0, "reports": [], "note": ""}
+
+
+def _format_weekly_broker_block(report_result: dict) -> str:
+    """券商观点块：按券商分组，每家列出评级/评级变动/目标价/EPS/标题。
+    无覆盖时诚实声明『券商研报数据未覆盖』，绝不编造。"""
+    reports = report_result.get("reports") or []
+    by_org = {}
+    for r in reports:
+        if not isinstance(r, dict):
+            continue
+        org = (r.get("org") or "").strip() or "未知券商"
+        by_org.setdefault(org, []).append(r)
+    if not by_org:
+        return "券商研报数据未覆盖（研报库近两周无该板块券商研报记录）。"
+    lines = [
+        f"近两周券商研报共 {report_result.get('total', len(reports))} 篇，"
+        f"覆盖 {len(by_org)} 家券商："
+    ]
+    note = report_result.get("note")
+    if note:
+        lines.append(f"检索说明：{note}")
+    for org in sorted(by_org.keys()):
+        lines.append(f"【{org}】")
+        for r in by_org[org][:5]:
+            parts = []
+            if r.get("date"):
+                parts.append(str(r["date"])[:10])
+            if r.get("title"):
+                parts.append(r["title"])
+            rating = r.get("rating") or ""
+            rating_change = r.get("rating_change") or ""
+            if rating:
+                parts.append(f"评级：{rating}" + (f"（{rating_change}）" if rating_change else ""))
+            if r.get("target_price"):
+                parts.append(f"目标价：{r['target_price']}")
+            eps = r.get("eps_forecast")
+            if isinstance(eps, (int, float)):
+                parts.append(f"EPS预测：{eps}")
+            if r.get("stock_name"):
+                parts.append(f"标的：{r['stock_name']}")
+            lines.append("- " + " | ".join(parts))
+    return "\n".join(lines)
+
+
 # ── Agent ──
 
 class MarketReviewAgent:
@@ -1519,7 +1828,15 @@ class MarketReviewAgent:
             )
         elif intent == "market_review":
             return _ensure_disclaimer(
-                await self._market_review(stream, context_note=context_note), intent
+                await self._market_review(
+                    stream, context_note=context_note, message=user_message
+                ), intent
+            )
+        elif intent == "sector_weekly":
+            return _ensure_disclaimer(
+                await self._sector_weekly_review(
+                    sector, stream, message=user_message, context_note=context_note
+                ), intent
             )
         elif intent == "watchlist":
             result = await self._watchlist(user_message, stream)
@@ -1533,7 +1850,9 @@ class MarketReviewAgent:
             result = await self._fund_query(user_message, False)
         else:
             return _ensure_disclaimer(
-                await self._sector_deep_dive(sector, stream, context_note=context_note), intent
+                await self._sector_deep_dive(
+                    sector, stream, context_note=context_note, message=user_message
+                ), intent
             )
 
         # 简单查询返回dict → 流式模式包装为生成器
@@ -1723,18 +2042,28 @@ class MarketReviewAgent:
         system = self._watchlist_system_prompt()
         return await self._call_llm(system, user_prompt, stream)
 
-    async def _market_review(self, stream: bool, context_note: str = None):
-        """全市场复盘。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。"""
-        # 1. 确定有效的交易日期
+    async def _market_review(self, stream: bool, context_note: str = None, message: str = ""):
+        """全市场复盘。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。
+        message 非空时解析其中相对时间引用（昨天/前天/上周X 等）并对齐到对应交易日。"""
+        # 1. 确定有效的交易日期（残留1修复：相对时间引用对齐——
+        #    『昨天市场怎么样』必须用昨天的数据，目标日非交易日取之前最近交易日）
         today = datetime.now()
-        trade_date = _get_latest_trade_date(today)
+        time_ref = _resolve_time_reference(message, today)
+        if time_ref[0] == "day":
+            trade_date = _get_latest_trade_date(time_ref[1])
+        else:
+            trade_date = _get_latest_trade_date(today)
 
         date_str = trade_date.strftime("%Y%m%d")
         weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][trade_date.weekday()]
         date_display = trade_date.strftime("%Y年%m月%d日")
 
         is_today = trade_date.strftime("%Y%m%d") == today.strftime("%Y%m%d")
-        date_note = "今日" if is_today else f"（今日为{today.strftime('%Y年%m月%d日')}，最新可用交易日数据为{date_display}）"
+        if time_ref[0] == "day":
+            # 用户显式指定回看日：强约束表述，防止 LLM 被『今日为X日』带偏写错数据日期
+            date_note = f"（用户指定回看，以下全部为{date_display}{weekday}的真实数据，回答中引用的数据日期必须是{date_display}，禁止写成今日或其他日期）"
+        else:
+            date_note = "今日" if is_today else f"（今日为{today.strftime('%Y年%m月%d日')}，最新可用交易日数据为{date_display}）"
 
         # 2. 采集数据（带缓存：同一交易日只采集一次）
         cache_key = f"snapshot_{date_str}"
@@ -1749,9 +2078,16 @@ class MarketReviewAgent:
         system = get_system_prompt("market_review").replace("[日期]", date_display)
 
         note_line = f"{context_note}\n\n" if context_note else ""
+        # 残留1修复：含相对时间引用时显式声明数据对应日期，
+        # 让回答头部注明数据对应的交易日（『昨天』场景必须是昨天的数据）
+        ref_note = (
+            "用户问题含相对时间引用，数据已对齐到其对应交易日；"
+            "回答开头请注明数据对应的交易日期。\n"
+            if time_ref[0] == "day" else ""
+        )
         # 第七波：以史为鉴注入（fail-safe；模块自带头部，不加引导语）
         history_note = _history_note_block(sector=None, mode="market_review")
-        user_prompt = f"""{note_line}交易日：{date_display} {weekday}{date_note}
+        user_prompt = f"""{note_line}{ref_note}交易日：{date_display} {weekday}{date_note}
 
 {market_data}
 
@@ -1819,10 +2155,16 @@ class MarketReviewAgent:
         )
         return valuation, moneyflow, earnings
 
-    async def _sector_deep_dive(self, sector: str, stream: bool, context_note: str = None):
-        """单板块深度聚焦。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。"""
+    async def _sector_deep_dive(self, sector: str, stream: bool, context_note: str = None, message: str = ""):
+        """单板块深度聚焦。context_note 非空时（继承意图的追问）在 user prompt 开头加一行说明。
+        message 非空时解析其中相对时间引用（昨天/前天/上周X 等）并对齐到对应交易日。"""
+        # 残留1修复：相对时间引用对齐——『昨天白酒板块怎么样』必须用昨天的数据
         today = datetime.now()
-        trade_date = _get_latest_trade_date(today)
+        time_ref = _resolve_time_reference(message, today)
+        if time_ref[0] == "day":
+            trade_date = _get_latest_trade_date(time_ref[1])
+        else:
+            trade_date = _get_latest_trade_date(today)
         date_str = trade_date.strftime("%Y%m%d")
         weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][trade_date.weekday()]
         date_display = trade_date.strftime("%Y年%m月%d日")
@@ -1846,11 +2188,17 @@ class MarketReviewAgent:
         system = system.replace("[日期]", date_display).replace("[板块名]", sector)
 
         note_line = f"{context_note}\n\n" if context_note else ""
+        # 残留1修复：含相对时间引用时显式声明数据对应日期
+        ref_note = (
+            "用户问题含相对时间引用，数据已对齐到其对应交易日；"
+            "回答开头请注明数据对应的交易日期。\n"
+            if time_ref[0] == "day" else ""
+        )
         # 第七波：行业知识库注入（追加在【五、新闻与景气背景】之后；fail-safe）
         kb_block = _industry_kb_block(sector)
         # 第七波：以史为鉴注入（user_prompt 末尾；fail-safe；模块自带头部，不加引导语）
         history_note = _history_note_block(sector=sector, mode="sector_deep_dive")
-        user_prompt = f"""{note_line}交易日：{date_display} {weekday} | 行业：{sector}
+        user_prompt = f"""{note_line}{ref_note}交易日：{date_display} {weekday} | 行业：{sector}
 
 【一、行情与趋势数据】
 {market_data}
@@ -1896,6 +2244,105 @@ class MarketReviewAgent:
             )
         return result
 
+    async def _sector_weekly_review(
+        self, sector: str, stream: bool, message: str = "", context_note: str = None
+    ):
+        """板块周报：周区间（这周/上周等）×板块的周度综合复盘（新功能）。
+
+        数据组装（三路并行，单路失败各自降级，互不拖垮）：
+          a) 周度行情——fetch_shenwan_sectors 按当周各交易日逐日取数，
+             逐日涨跌幅复合成周涨跌幅，成交额/量合计（节假日重复行按签名去重）；
+          b) 当周新闻——fetch_news_pool(sector_keywords=板块别名全集)，
+             按周区间过滤 + 关键词匹配 + 标题去重；
+          c) 券商研报观点——search_reports(industry=板块, days=14) 只读检索，
+             按券商分组聚合（评级/评级变动/目标价/EPS），无覆盖时如实写
+             「券商研报数据未覆盖」，禁止编造券商观点；
+          d) 资金流向复用板块深挖的 _fetch_sector_extras（当周最后交易日）。
+        LLM 综合为五段周报（本周行情回顾/资金与成交/当周催化新闻/
+        多家券商观点对比/下周关注），数据缺失处写「数据未覆盖」。
+        """
+        today = datetime.now()
+        today_d = today.date()
+        time_ref = _resolve_time_reference(message, today)
+        if time_ref[0] == "week":
+            week_start, week_end = time_ref[1], time_ref[2]
+        else:
+            # 路由护栏：非周区间消息（直接调用/追问继承场景）按本周兜底
+            monday = today_d - timedelta(days=today_d.weekday())
+            week_start, week_end = monday, min(monday + timedelta(days=6), today_d)
+        monday_this = today_d - timedelta(days=today_d.weekday())
+        week_label = "本周" if week_start == monday_this else "上周"
+        range_display = (
+            f"{week_start.strftime('%Y年%m月%d日')}至{week_end.strftime('%Y年%m月%d日')}"
+        )
+
+        # 三路数据并行采集（同步取数函数放线程池，互不阻塞）
+        loop = asyncio.get_running_loop()
+        daily, news_items, report_result = await asyncio.gather(
+            loop.run_in_executor(
+                None, _collect_sector_weekly_quotes, sector, week_start, week_end, today_d
+            ),
+            loop.run_in_executor(
+                None, _collect_sector_weekly_news, sector, week_start, week_end
+            ),
+            loop.run_in_executor(None, _collect_sector_weekly_reports, sector),
+        )
+
+        market_block = _format_sector_weekly_market_block(daily)
+        broker_block = _format_weekly_broker_block(report_result)
+        if news_items:
+            news_block = "\n".join(
+                f"[{_fmt_news_time(it['time'], fallback='当周')}] {it['title']}"
+                for it in news_items
+            )
+        else:
+            news_block = "当周新闻数据未覆盖（智研新闻源以近1-2日滚动快讯为主，当周更早条目未收录）。"
+
+        # 资金流向：取当周最后一个有行情的交易日；无行情时按周末日期对齐最近交易日
+        if daily:
+            extras_date = daily[-1]["date"].replace("-", "")
+        else:
+            extras_date = _get_latest_trade_date(min(week_end, today_d)).strftime("%Y%m%d")
+        _, moneyflow, _ = await self._fetch_sector_extras(sector, extras_date)
+        moneyflow_block = _format_sector_moneyflow_block(moneyflow)
+
+        note_line = f"{context_note}\n\n" if context_note else ""
+        user_prompt = f"""{note_line}板块：{sector} | 统计区间：{range_display}（{week_label}） | 今日：{today.strftime('%Y年%m月%d日')}
+
+【一、当周行情（逐日涨跌幅 + 周度聚合成交）】
+{market_block}
+
+【二、资金（当周最后交易日 {extras_date}）】
+{moneyflow_block}
+
+【三、当周催化新闻】
+{news_block}
+
+【四、券商研报观点（按券商分组）】
+{broker_block}
+
+请按「本周行情回顾 / 资金与成交 / 当周催化新闻 / 多家券商观点对比 / 下周关注」五段结构输出{sector}板块周报，标题注明统计区间{range_display}。仅使用上方数据，数据缺失处写「数据未覆盖」；券商观点仅可使用上方研报块内容并注明券商名称，研报块标注未覆盖时如实写「券商研报数据未覆盖」，禁止编造任何券商名称、评级、目标价或盈利预测。"""
+
+        system = _SECTOR_WEEKLY_SYSTEM_PROMPT
+        if stream:
+            return await self._call_llm(
+                system, user_prompt, stream,
+                archive_callback=self._stream_archive_callback(
+                    "sector_weekly", sector, user_prompt, extras_date
+                ),
+            )
+        result = await self._call_llm(system, user_prompt, stream)
+        if isinstance(result, dict):
+            # 多 pass 自我审查修正（与板块深挖同口径）；数据上下文用完整 user_prompt
+            draft = result.get("content", "")
+            result["content"] = _clean_markdown(
+                await self._critique_and_revise(draft, user_prompt)
+            )
+            self._archive_safe(
+                "sector_weekly", sector, result.get("content", ""), user_prompt, extras_date
+            )
+        return result
+
     async def _news_only(self, sector: str, stream: bool, message: str = ""):
         """新闻专属模式：智研双源新闻池 + 行业关键词过滤，按实际覆盖尽量多展示。
 
@@ -1917,8 +2364,13 @@ class MarketReviewAgent:
           （解读/分析/影响/怎么看/意味着什么/说明什么）时走纯 LLM 分析，
           否则非流式直接透传原文，不经过 LLM 改写。
         """
+        # 残留1修复：相对时间引用对齐——『昨天的白酒新闻』头部日期对齐到昨天对应交易日
         today = datetime.now()
-        trade_date = _get_latest_trade_date(today)
+        time_ref = _resolve_time_reference(message, today)
+        if time_ref[0] == "day":
+            trade_date = _get_latest_trade_date(time_ref[1])
+        else:
+            trade_date = _get_latest_trade_date(today)
         date_display = trade_date.strftime("%Y年%m月%d日")
         weekday = ["周一","周二","周三","周四","周五","周六","周日"][trade_date.weekday()]
 

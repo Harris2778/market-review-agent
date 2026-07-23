@@ -35,6 +35,9 @@ class MarketSnapshot:
     fund_flows: dict = field(default_factory=dict)
     global_indices: dict = field(default_factory=dict)
     macro_data: dict = field(default_factory=dict)
+    # 新闻池 dict，键固定为：mcp（智研关键词搜索，多词并行去重合并）、
+    # flash（智研 7x24 快讯 newsFlashList）、cls_telegraph（财联社电报）、
+    # global（Finnhub 全球新闻）。渲染见 format_market_data_for_prompt。
     news_items: dict = field(default_factory=dict)
     calendar: list = field(default_factory=list)
 
@@ -547,7 +550,8 @@ def filter_news_by_sector(news_items: list, sector: str) -> list:
     direct, indirect = [], []
     for item in news_items:
         title = item.get("title", "")
-        summary = item.get("summary", "")
+        # summary（东财/Finnhub）、content（智研/Tushare）、brief（财联社）都算正文
+        summary = item.get("summary", "") or item.get("content", "") or item.get("brief", "")
         text = title + summary
         # 检查是否匹配该行业关键词
         matched = [kw for kw in keywords if kw in text]
@@ -3267,6 +3271,14 @@ def fetch_economic_calendar() -> list:
 # 综合采集 + 格式化
 # ═══════════════════════════════════════════
 
+# 复盘快照新闻关键词表（智研 MCP qNewsSearch 多词并行，出口 _dedup_news_fuzzy
+# 跨词去重）。8 词 × 每词 50 条 + 快讯 200 条，去重前理论上限 600 条，
+# 保证替换旧六源（em×3 + sina×2 + ts_news，约 400 条）后广度只多不少。
+_SNAPSHOT_NEWS_KEYWORDS = ("A股", "板块", "政策", "央行", "公司", "海外", "港股", "美股")
+_SNAPSHOT_NEWS_PER_KEYWORD = 50
+_SNAPSHOT_FLASH_LIMIT = 200  # newsFlashList 单页 20 条，内部翻 10 页
+
+
 async def collect_market_snapshot(
     date: Optional[str] = None,
     sector_focus: Optional[str] = None,
@@ -3279,11 +3291,6 @@ async def collect_market_snapshot(
     loop = asyncio.get_event_loop()
 
     snapshot = MarketSnapshot(date=date)
-
-    # 新浪历史日期
-    trade_dt = datetime.strptime(date, "%Y%m%d")
-    d1 = trade_dt.strftime("%Y-%m-%d")
-    d2 = (trade_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # 全部并行执行
     tasks = {
@@ -3298,11 +3305,7 @@ async def collect_market_snapshot(
         "toplist": loop.run_in_executor(None, fetch_top_list, date),
         "cn_macro": loop.run_in_executor(None, fetch_china_macro),
         "us_macro": loop.run_in_executor(None, fetch_us_macro),
-        "em_p1": loop.run_in_executor(None, fetch_eastmoney_news, 100),
-        "em_p2": loop.run_in_executor(None, fetch_eastmoney_news_page2, 100),
-        "em_p3": loop.run_in_executor(None, fetch_eastmoney_news_page3, 100),
-        "sina": loop.run_in_executor(None, fetch_sina_news, 30, d1),
-        "sina2": loop.run_in_executor(None, fetch_sina_news, 30, d2),
+        "mcp_flash": loop.run_in_executor(None, fetch_mcp_flash, _SNAPSHOT_FLASH_LIMIT),
         "fh_news": loop.run_in_executor(None, fetch_finnhub_news, 20),
         "calendar": loop.run_in_executor(None, fetch_economic_calendar),
         "breadth": loop.run_in_executor(None, fetch_market_breadth),
@@ -3321,9 +3324,12 @@ async def collect_market_snapshot(
         "north_flow": loop.run_in_executor(None, fetch_northbound_flow),
         "us_sec": loop.run_in_executor(None, fetch_us_sectors),
         "hk_sec": loop.run_in_executor(None, fetch_hk_sectors),
-        "ts_news": loop.run_in_executor(None, fetch_tushare_news, date),
         "cls_telegraph": loop.run_in_executor(None, fetch_cls_telegraph, 30),
     }
+    # 智研关键词搜索：一词一个 task，单词失败只降级该词为空，不影响其他 task
+    for kw in _SNAPSHOT_NEWS_KEYWORDS:
+        tasks[f"mcp_news_{kw}"] = loop.run_in_executor(
+            None, fetch_mcp_news, kw, _SNAPSHOT_NEWS_PER_KEYWORD)
     if sector_focus:
         tasks["stock"] = loop.run_in_executor(None, fetch_sector_stock_detail, sector_focus, date)
 
@@ -3367,26 +3373,24 @@ async def collect_market_snapshot(
         "china": safe(results_raw.get("cn_macro"), {}),
         "us": safe(results_raw.get("us_macro"), {}),
     }
-    # 去重（用标题前60字做key）
-    def _dedup(items):
-        seen = set()
-        out = []
-        for it in items:
-            key = it.get("title", "")[:60]
-            if key not in seen:
-                seen.add(key)
-                out.append(it)
-        return out
-
-    all_em = _dedup(safe(results_raw.get("em_p1"), []) + safe(results_raw.get("em_p2"), []) + safe(results_raw.get("em_p3"), []))
-    all_sina = _dedup(safe(results_raw.get("sina"), []) + safe(results_raw.get("sina2"), []))
+    # ── 新闻：智研 MCP 双源（关键词搜索 + 7x24 快讯），替代旧 em/sina/ts 六源 ──
+    # 多关键词结果合并后用 _dedup_news_fuzzy 跨词去重（剥栏目前缀/【】/标点），
+    # 快讯源再与关键词源跨源模糊去重；任一 task 失败已由 safe 降级为空列表。
+    all_mcp = _dedup_news_fuzzy(
+        [it for kw in _SNAPSHOT_NEWS_KEYWORDS
+         for it in safe(results_raw.get(f"mcp_news_{kw}"), [])])
     if sector_focus:
-        all_em = filter_news_by_sector(all_em, sector_focus)
-        # Sina已按日期过滤，不再按行业过滤，保留全部
+        all_mcp = filter_news_by_sector(all_mcp, sector_focus)
+    mcp_fkeys = {k for k in
+                 (_fuzzy_title_key(it.get("title", "")) for it in all_mcp) if k}
+    all_flash = [
+        it for it in _dedup_news_fuzzy(safe(results_raw.get("mcp_flash"), []))
+        if not _fuzzy_title_key(it.get("title", ""))
+        or _fuzzy_title_key(it.get("title", "")) not in mcp_fkeys
+    ]
     snapshot.news_items = {
-        "eastmoney": all_em,
-        "sina": all_sina,
-        "ts_news": safe(results_raw.get("ts_news"), []),
+        "mcp": all_mcp,
+        "flash": all_flash,
         "cls_telegraph": safe(results_raw.get("cls_telegraph"), []),
         "global": safe(results_raw.get("fh_news"), []),
     }
@@ -3479,25 +3483,18 @@ def format_market_data_for_prompt(snapshot: MarketSnapshot) -> str:
             lines.append(f"- 融资余额: {snapshot.fund_flows['margin_bal']:.2f}亿")
     lines.append("")
 
-    # ── 新浪历史新闻（放前面，覆盖48h）──
-    sina = snapshot.news_items.get("sina", [])
-    if sina:
-        lines.append(f"### 新浪财经历史新闻（交易日+前日，共{len(sina)}条，覆盖48小时）")
-        for item in sina[:10]:
+    # ── 智研 7x24 快讯（newsFlashList 全量滚动，复盘背景材料）──
+    flash = snapshot.news_items.get("flash", [])
+    if flash:
+        lines.append(f"### 智研7x24快讯（共{len(flash)}条，背景材料，无需逐条列出）")
+        for item in flash[:15]:
             lines.append(f"- [{item['time']}] {item['title']}")
 
-    # ── 东方财富实时（补充最新）──
-    em = snapshot.news_items.get("eastmoney", [])
-    if em:
-        lines.append(f"### 东方财富7x24实时快讯（共{len(em)}条）")
-        for item in em[:10]:
-            lines.append(f"- [{item['time']}] {item['title']}")
-
-    # ── Tushare 新闻 ──
-    ts_news = snapshot.news_items.get("ts_news", [])
-    if ts_news:
-        lines.append(f"\n### 财联社新闻（Tushare，共{len(ts_news)}条）")
-        for item in ts_news[:20]:
+    # ── 智研关键词新闻（多词搜索跨词去重合并）──
+    mcp = snapshot.news_items.get("mcp", [])
+    if mcp:
+        lines.append(f"\n### 智研财经新闻（多关键词去重，共{len(mcp)}条，背景材料，无需逐条列出）")
+        for item in mcp[:20]:
             lines.append(f"- [{item['time']}] {item['title']}")
             if item.get("content"):
                 lines.append(f"  {item['content'][:200]}")
