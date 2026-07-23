@@ -123,6 +123,9 @@ def _get_latest_trade_date(ref_date: datetime) -> datetime:
     token = os.getenv("TUSHARE_TOKEN", "")
     if token:
         try:
+            # 只读 HOME 容器（Railway /root 不可写）防 SDK 写 tk.csv 崩初始化
+            from agent.data_fetcher import _ensure_writable_home
+            _ensure_writable_home()
             import tushare as ts
             ts.set_token(token)
             pro = ts.pro_api()

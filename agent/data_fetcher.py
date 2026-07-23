@@ -44,11 +44,24 @@ class MarketSnapshot:
 
 # ── Tushare 连接 ──
 
+def _ensure_writable_home():
+    """Tushare SDK 初始化时要往 ~ 写 token 缓存（tk.csv）；
+    只读 HOME 的容器（Railway 实测 /root 不可写，PermissionError 崩初始化）
+    把 HOME 指到可写临时目录。HOME 可写时零副作用。"""
+    try:
+        home = os.path.expanduser("~")
+        if home and not os.access(home, os.W_OK):
+            os.environ["HOME"] = "/tmp"
+    except Exception:
+        os.environ["HOME"] = "/tmp"
+
+
 def _get_pro():
     token = _env("TUSHARE_TOKEN")
     if not token:
         return None
     try:
+        _ensure_writable_home()
         import tushare as ts
         ts.set_token(token)
         return ts.pro_api()

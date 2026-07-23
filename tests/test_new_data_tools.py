@@ -402,3 +402,39 @@ def test_tool_registry_size_and_catalog():
     for name in NEW_TOOL_NAMES:
         assert name in registered, f"{name} 不在 TOOL_REGISTRY"
         assert name in catalog, f"{name} 不在 get_tool_catalog 输出"
+
+
+class TestEnsureWritableHome:
+    """Railway 只读 /root 实锤：Tushare SDK 写 tk.csv 崩初始化（PermissionError）。
+    _ensure_writable_home 在 HOME 不可写时改指 /tmp，可写时零副作用。"""
+
+    def test_readonly_home_redirected_to_tmp(self, monkeypatch):
+        import agent.data_fetcher as df
+        monkeypatch.setenv("HOME", "/nonexistent_readonly_home")
+        monkeypatch.setattr(df.os.path, "expanduser", lambda p: "/nonexistent_readonly_home")
+        monkeypatch.setattr(df.os, "access", lambda p, m: False)
+        df._ensure_writable_home()
+        assert df.os.environ["HOME"] == "/tmp"
+
+    def test_writable_home_untouched(self, monkeypatch):
+        import agent.data_fetcher as df
+        monkeypatch.setenv("HOME", "/writable_home")
+        monkeypatch.setattr(df.os.path, "expanduser", lambda p: "/writable_home")
+        monkeypatch.setattr(df.os, "access", lambda p, m: True)
+        df._ensure_writable_home()
+        assert df.os.environ["HOME"] == "/writable_home"
+
+    def test_get_pro_calls_ensure_before_init(self, monkeypatch):
+        import agent.data_fetcher as df
+        calls = []
+        monkeypatch.setattr(df, "_ensure_writable_home", lambda: calls.append("ensure"))
+        monkeypatch.setattr(df, "_env", lambda k, d="": "fake_token")
+        import sys, types
+        fake_ts = types.SimpleNamespace(
+            set_token=lambda t: calls.append(("set_token", t)),
+            pro_api=lambda: "PRO",
+        )
+        monkeypatch.setitem(sys.modules, "tushare", fake_ts)
+        assert df._get_pro() == "PRO"
+        assert calls[0] == "ensure"
+        assert calls[1] == ("set_token", "fake_token")
