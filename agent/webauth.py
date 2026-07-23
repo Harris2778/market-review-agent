@@ -655,6 +655,26 @@ def admin_user_questions(username: str, limit: int = 50, offset: int = 0) -> Opt
         conn.close()
 
 
+def admin_impersonate(username: str) -> Optional[str]:
+    """
+    为某用户签发一个普通登录令牌（管理员免密码切换身份用）。
+    用户不存在返回 None（路由层 404）。是否管理员由路由层 require_admin 校验，
+    本函数不复查（与 admin_set_quota_limit 等同层函数保持一致的职责划分）。
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if row is None:
+            return None
+        token = _issue_token(conn, row["id"])
+        conn.commit()
+        return token
+    finally:
+        conn.close()
+
+
 # ── 对话 CRUD ──
 
 def create_conversation(user_id: int, title: str) -> dict:

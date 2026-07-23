@@ -1148,6 +1148,19 @@ async def admin_user_questions(
     return result
 
 
+@app.post("/api/admin/users/{username}/impersonate")
+async def admin_impersonate_user(username: str, admin: dict = Depends(require_admin)):
+    """
+    管理员免密码切换身份：为指定用户签发一个普通登录令牌
+    → 200 {token, user:{username}}；用户不存在 404。
+    前端拿到 token 后替换本地会话即可以该用户身份使用网站。
+    """
+    token = web_auth.admin_impersonate(username)
+    if token is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"token": token, "user": {"username": username}}
+
+
 # ── 调试端点 ──
 
 @app.get("/debug/mcp-test", dependencies=[Depends(verify_api_key)])

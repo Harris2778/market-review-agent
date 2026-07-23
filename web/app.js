@@ -11,6 +11,7 @@
   var STORAGE_USER = 'fia_username';
   var STORAGE_THEME = 'fia_theme';
   var STORAGE_DEVICE = 'fia_device';
+  var STORAGE_ADMIN_BACKUP = 'fia_admin_backup';  // 管理员切换身份前的会话备份
   var QUESTIONS_PAGE_SIZE = 20;
 
   /* 管理端点（后端契约） */
@@ -50,6 +51,7 @@
   var convEmpty = $('conv-empty');
   var userName = $('user-name');
   var logoutBtn = $('logout-btn');
+  var returnAdminBtn = $('return-admin-btn');
   var themeToggle = $('theme-toggle');
   var quotaRow = $('quota-row');
   var quotaFill = $('quota-fill');
@@ -169,6 +171,7 @@
     state.activeConvId = null;
     localStorage.removeItem(STORAGE_TOKEN);
     localStorage.removeItem(STORAGE_USER);
+    localStorage.removeItem(STORAGE_ADMIN_BACKUP);
   }
 
   function findConv(id) {
@@ -371,6 +374,8 @@
   /* 用户栏：额度进度条（已用/上限）+ 重置日期小字 */
   function renderUserBar() {
     userName.textContent = state.username || '—';
+    // 身份切换中：显示「↩ 管理员」返回按钮
+    setHidden(returnAdminBtn, !localStorage.getItem(STORAGE_ADMIN_BACKUP));
 
     var me = state.me;
     if (!me) {
@@ -510,9 +515,13 @@
       });
       var viewBtn = el('button', 'btn btn-ghost btn-sm', '查看提问');
       viewBtn.addEventListener('click', function () { showQuestionsPanel(u.username); });
+      var impBtn = el('button', 'btn btn-ghost btn-sm', '进入账号');
+      impBtn.title = '免密码以该用户身份使用网站';
+      impBtn.addEventListener('click', function () { impersonateUser(u.username); });
       opsTd.appendChild(quotaInput);
       opsTd.appendChild(saveBtn);
       opsTd.appendChild(viewBtn);
+      opsTd.appendChild(impBtn);
       opsTd.appendChild(hint);
       tr.appendChild(opsTd);
 
@@ -546,6 +555,40 @@
       if (e.message !== 'unauthorized') hint.textContent = '网络异常';
     } finally {
       btn.disabled = false;
+    }
+  }
+
+  /* ---- 管理员免密切换身份 ---- */
+  async function impersonateUser(username) {
+    if (!window.confirm('确定要以「' + username + '」的身份使用网站吗？\n当前管理员会话会保留，可随时点左下角「↩ 管理员」返回。')) return;
+    try {
+      var res = await api('/api/admin/users/' + encodeURIComponent(username) + '/impersonate', { method: 'POST' });
+      if (!res.ok) { window.alert('切换失败（' + res.status + '）'); return; }
+      var data = await res.json();
+      // 备份当前管理员会话，便于一键返回
+      localStorage.setItem(STORAGE_ADMIN_BACKUP, JSON.stringify({
+        token: state.token, username: state.username
+      }));
+      localStorage.setItem(STORAGE_TOKEN, data.token);
+      localStorage.setItem(STORAGE_USER, data.user.username);
+      location.reload();
+    } catch (e) {
+      if (e.message !== 'unauthorized') window.alert('网络异常，请稍后重试');
+    }
+  }
+
+  /* 结束身份切换，恢复管理员会话 */
+  function returnToAdmin() {
+    var raw = localStorage.getItem(STORAGE_ADMIN_BACKUP);
+    if (!raw) return;
+    try {
+      var backup = JSON.parse(raw);
+      localStorage.setItem(STORAGE_TOKEN, backup.token);
+      localStorage.setItem(STORAGE_USER, backup.username);
+      localStorage.removeItem(STORAGE_ADMIN_BACKUP);
+      location.reload();
+    } catch (e) {
+      localStorage.removeItem(STORAGE_ADMIN_BACKUP);
     }
   }
 
@@ -615,10 +658,9 @@
     convList.innerHTML = '';
     setHidden(convEmpty, state.conversations.length > 0);
     sortedConversations().forEach(function (conv) {
-      var li = el('li', 'conv-item' + (conv.id === state.activeConvId ? ' active' : ''));
+      var li = el('li', 'conv-item' + (conv.id === state.activeConvId ? ' active' : '') + (conv.pinned ? ' pinned' : ''));
       li.dataset.convId = conv.id;
 
-      if (conv.pinned) li.appendChild(el('span', 'conv-pin', '📌'));
       li.appendChild(el('span', 'conv-title', conv.title || '未命名对话'));
 
       var menuBtn = el('button', 'conv-menu-btn', '···');
@@ -955,11 +997,8 @@
       bubble.classList.remove('gen-stage');
       bubble.classList.remove('md');
       bubble.textContent = '（未收到回复内容）';
-    } else {
-      // 流正常完成：移除「思考已完成」状态行，只留正文
-      var doneStatus = bubble.querySelector('.gen-status');
-      if (doneStatus) doneStatus.parentNode.removeChild(doneStatus);
     }
+    // 有内容时状态行保留：小球 + 「思考已完成」常驻在正文上方
   }
 
   function stopStreaming() {
@@ -995,6 +1034,7 @@
     authForm.addEventListener('submit', handleAuthSubmit);
     logoutBtn.addEventListener('click', logout);
     themeToggle.addEventListener('click', toggleTheme);
+    returnAdminBtn.addEventListener('click', returnToAdmin);
     newChatBtn.addEventListener('click', function () { if (!state.streaming) startNewChat(); });
     sendBtn.addEventListener('click', sendMessage);
     stopBtn.addEventListener('click', stopStreaming);

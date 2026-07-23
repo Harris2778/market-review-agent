@@ -1095,6 +1095,25 @@ class TestAdminEndpoints:
             "/api/admin/users/alice/questions?offset=-1", headers=_auth(admin)
         ).status_code in (400, 422)
 
+    def test_impersonate(self, client):
+        admin = self._admin_token(client)
+        user_token = _register(client, username="alice").json()["token"]
+        # 管理员免密切换：拿到 alice 的普通令牌，且确实能以 alice 身份使用
+        resp = client.post("/api/admin/users/alice/impersonate", headers=_auth(admin))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["user"]["username"] == "alice" and body["token"]
+        me = client.get("/api/me", headers=_auth(body["token"])).json()
+        assert me["username"] == "alice" and me["is_admin"] is False
+        # 非管理员 403 / 未登录 401 / 用户不存在 404
+        assert client.post(
+            "/api/admin/users/alice/impersonate", headers=_auth(user_token)
+        ).status_code == 403
+        assert client.post("/api/admin/users/alice/impersonate").status_code == 401
+        assert client.post(
+            "/api/admin/users/ghost/impersonate", headers=_auth(admin)
+        ).status_code == 404
+
 
 # ════════════════════════════════════════════════════════════
 # 5) 静态站点与 /api/root-info

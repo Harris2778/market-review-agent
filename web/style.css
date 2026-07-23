@@ -443,6 +443,11 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   opacity: 0.75;
 }
 
+/* 置顶对话：标题加粗（替代原 📌 标记） */
+.conv-item.pinned .conv-title {
+  font-weight: 600;
+}
+
 .conv-title {
   flex: 1;
   overflow: hidden;
