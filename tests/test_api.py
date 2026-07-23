@@ -9,7 +9,7 @@ FastAPI 接口层测试（main.py）。
    返回结构化错误 JSON（含 error 字段，HTTP 502）而非裸 500 traceback
    —— 非流式兜底防回归
 5. /debug/futures 响应 JSON 不包含 token 相关字段（防 token 泄漏回归）
-6. 根端点 / 返回的 JSON 不包含 traceback / 服务器路径信息
+6. 服务信息端点 /api/root-info 返回的 JSON 不包含 traceback / 服务器路径信息
 
 所有外部调用（requests / tushare / data_fetcher / orchestrator）全部 mock，
 绝不发起真实网络请求。
@@ -271,10 +271,11 @@ def test_debug_futures_token_leak_regression_would_be_caught(client, valid_auth)
     assert "token_prefix" in all_keys
 
 
-# ── 6) 根端点 /：不泄露 traceback / 服务器路径 ──
+# ── 6) 服务信息端点 /api/root-info：不泄露 traceback / 服务器路径 ──
+# （网站上线后原根路由 / 的 JSON 挪到 /api/root-info，/ 改为静态站点首页）
 
-def test_root_no_traceback_or_server_path(client):
-    resp = client.get("/")
+def test_root_info_no_traceback_or_server_path(client):
+    resp = client.get("/api/root-info")
     assert resp.status_code == 200
     data = resp.json()
     assert data["service"] == main.AGENT_NAME
@@ -288,15 +289,15 @@ def test_root_no_traceback_or_server_path(client):
     assert "site-packages" not in body
 
 
-def test_root_agent_load_failure_still_safe(client):
+def test_root_info_agent_load_failure_still_safe(client):
     """
-    即使智能体加载失败，根端点也只返回通用错误文案，
+    即使智能体加载失败，/api/root-info 也只返回通用错误文案，
     不得把 _agent_error（含 traceback）写进响应体。
     """
     fake_tb = 'Traceback (most recent call last):\n  File "/Users/harriszhang/x.py", line 1'
     with patch.object(main, "_agent_loaded", False), \
          patch.object(main, "_agent_error", fake_tb):
-        resp = client.get("/")
+        resp = client.get("/api/root-info")
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "error"

@@ -273,6 +273,7 @@ def test_agent_version_bumped_to_1_3_0():
 
 
 def test_root_endpoint_reports_new_version(client):
-    resp = client.get("/")
+    # 网站上线后版本信息从 / 挪到 /api/root-info
+    resp = client.get("/api/root-info")
     assert resp.status_code == 200
     assert resp.json()["version"] == "1.3.0"

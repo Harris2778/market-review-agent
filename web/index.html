@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:,">
+  <title>金融智能体</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ============ 未登录：登录 / 注册 ============ -->
+  <div id="auth-view" class="auth-view" hidden>
+    <div class="auth-card">
+      <h1 class="auth-app-name" id="auth-app-name">金融智能体</h1>
+      <p class="auth-subtitle">每日市场复盘与金融洞察助手</p>
+
+      <div class="auth-tabs" role="tablist">
+        <button type="button" id="tab-login" class="auth-tab active" role="tab">登录</button>
+        <button type="button" id="tab-register" class="auth-tab" role="tab">注册</button>
+      </div>
+
+      <form id="auth-form" autocomplete="off">
+        <label class="field">
+          <span class="field-label">用户名</span>
+          <input type="text" id="auth-username" required maxlength="64" placeholder="请输入用户名">
+        </label>
+        <label class="field">
+          <span class="field-label">密码</span>
+          <input type="password" id="auth-password" required maxlength="128" placeholder="请输入密码">
+        </label>
+        <p id="auth-error" class="auth-error" hidden></p>
+        <button type="submit" id="auth-submit" class="btn btn-primary btn-block">登录</button>
+      </form>
+    </div>
+    <p class="auth-footer">登录后即可开始对话 · 每月赠送免费额度</p>
+  </div>
+
+  <!-- ============ 已登录：主界面 ============ -->
+  <div id="app-view" class="app-view" hidden>
+
+    <!-- 左侧边栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <button type="button" id="new-chat-btn" class="btn btn-primary btn-block">＋ 新对话</button>
+      </div>
+
+      <nav class="conv-list-wrap">
+        <ul id="conv-list" class="conv-list"></ul>
+        <p id="conv-empty" class="conv-empty" hidden>暂无对话</p>
+      </nav>
+
+      <div class="user-bar">
+        <div class="user-bar-row">
+          <span class="user-avatar" id="user-avatar">U</span>
+          <span class="user-name" id="user-name">—</span>
+          <button type="button" id="logout-btn" class="btn btn-ghost btn-sm" title="退出登录">退出</button>
+        </div>
+        <div class="quota-row">
+          <div class="quota-track" title="本月额度使用情况">
+            <div class="quota-fill" id="quota-fill"></div>
+          </div>
+          <span class="quota-text" id="quota-text">—</span>
+        </div>
+        <div class="user-bar-actions">
+          <button type="button" id="topup-entry-btn" class="btn btn-outline btn-sm">加油包 <span id="pack-count"></span></button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <main class="main">
+      <div id="quota-banner" class="quota-banner" hidden>
+        <span>本月额度已用完</span>
+        <button type="button" id="quota-banner-btn" class="btn btn-primary btn-sm">购买加油包</button>
+        <span class="quota-banner-reset" id="quota-banner-reset">次月1日自动重置</span>
+      </div>
+
+      <div id="messages" class="messages">
+        <div id="welcome" class="welcome">
+          <h2 id="welcome-title">金融智能体</h2>
+          <p>输入你的问题，例如「帮我复盘今天的 A 股市场」。</p>
+        </div>
+      </div>
+
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <div class="composer-actions">
+          <button type="button" id="send-btn" class="btn btn-primary">发送</button>
+          <button type="button" id="stop-btn" class="btn btn-outline" hidden>停止</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============ 加油包弹层 ============ -->
+  <div id="topup-modal" class="modal-mask" hidden>
+    <div class="modal">
+      <h3 class="modal-title">购买加油包</h3>
+      <p class="modal-desc">
+        本月免费额度已用完或即将用完。购买加油包可立即继续使用，加油包额度永久有效、可累积。
+      </p>
+      <div class="modal-pack">
+        <button type="button" id="buy-pack-btn" class="btn btn-primary btn-block">购买加油包（+50条）</button>
+        <p class="modal-note">当前为模拟支付，点击即时到账。</p>
+      </div>
+      <p class="modal-reset" id="modal-reset-date">月度额度将于次月1日自动重置。</p>
+      <button type="button" id="topup-close-btn" class="btn btn-ghost btn-block">暂不购买</button>
+    </div>
+  </div>
+
+  <script src="markdown.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

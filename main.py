@@ -31,6 +31,11 @@
   SOCIAL_DB_PATH      舆情快照库路径（默认 ${DATA_DIR:-data}/social.db，
                       /v1/admin/sentiment/snapshots 的落库位置）
   SNAPSHOT_BATCH_MAX  单次快照推送条数上限（默认 500，防爆）
+
+环境变量（可选 · 公开网站 /api/*）：
+  WEB_DB_PATH         网站数据库路径（默认 ${DATA_DIR:-data}/webapp.db）
+  WEB_MONTHLY_QUOTA   每用户每月定额消息数（默认 100，每月 1 日重置）
+  WEB_PACK_SIZE       加油包每包消息数（默认 50，不过期可累积）
 """
 
 import os
@@ -49,7 +54,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -88,6 +93,18 @@ except Exception:
         "舆情快照模块 agent.sentiment_aggregate 加载失败，快照接收端点将全量记 failed",
         exc_info=True,
     )
+
+# 公开网站认证/额度/对话模块（agent.webauth）：纯标准库实现，
+# import 失败只降级（/api/* 端点 503），不影响主服务
+try:
+    from agent import webauth as web_auth
+    _webauth_loaded = True
+    _webauth_error = None
+except Exception:
+    web_auth = None
+    _webauth_loaded = False
+    _webauth_error = traceback.format_exc()
+    logger.error("网站认证模块 agent.webauth 加载失败，/api/* 将不可用", exc_info=True)
 
 # ── 配置 ──
 
@@ -284,11 +301,39 @@ def _check_rate_and_quota() -> Optional[JSONResponse]:
     return None
 
 
+# ── 公开网站静态站点（web/ 目录由前端工程维护，后端只读）──
+
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+
+def _web_index_path() -> str:
+    """网站首页 index.html 路径。独立成函数便于测试 monkeypatch。"""
+    return os.path.join(WEB_DIR, "index.html")
+
+
+# check_dir=False：web/ 目录可能暂不存在（前端尚未部署），不让主服务启动崩溃
+app.mount("/static", StaticFiles(directory=WEB_DIR, check_dir=False), name="static")
+
 # ── OpenAI 兼容端点 ──
 
 @app.get("/")
-async def root():
-    """服务健康检查。"""
+async def web_index():
+    """
+    公开网站首页：web/index.html 存在时返回静态页面；
+    前端尚未部署（web/ 目录缺失）时返回 503 占位，不影响 API 可用性。
+    """
+    index_path = _web_index_path()
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    return JSONResponse(
+        status_code=503,
+        content={"error": "web_not_deployed", "detail": "网站前端尚未部署"},
+    )
+
+
+@app.get("/api/root-info")
+async def root_info():
+    """服务健康检查（原根路由 / 的 JSON 信息，网站上线后挪到此处）。"""
     result = {
         "service": AGENT_NAME,
         "version": AGENT_VERSION,
@@ -673,6 +718,258 @@ async def _stream_chat_completion(agent, user_message: str, model: str, history:
         }
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
+
+
+# ── 公开网站 /api/* 端点 ──
+#
+# 与 /v1/* 的 verify_api_key（管理端点专用）完全隔离：/api/* 使用
+# agent.webauth 的 Bearer token（users/tokens 表），不参与限流与每日配额，
+# 额度走 webauth 的月度定额 + 加油包体系。
+
+def get_web_user(request: Request) -> dict:
+    """
+    /api/* 的 Bearer token 鉴权依赖。
+    解析 Authorization: Bearer <token> → {"id", "username"}；无效/过期 → 401。
+    """
+    if not _webauth_loaded:
+        raise HTTPException(status_code=503, detail="网站认证模块不可用")
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    user = web_auth.resolve_token(token)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "未授权：token 无效或已过期", "code": "invalid_token"},
+        )
+    return user
+
+
+@app.post("/api/auth/register")
+async def web_register(request: Request):
+    """注册：{username, password} → 200 {token, user:{username}}；用户名重复 409。"""
+    if not _webauth_loaded:
+        raise HTTPException(status_code=503, detail="网站认证模块不可用")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    try:
+        token = web_auth.register(body.get("username"), body.get("password"))
+    except web_auth.UserExistsError:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    user = web_auth.resolve_token(token)
+    return {"token": token, "user": {"username": user["username"]}}
+
+
+@app.post("/api/auth/login")
+async def web_login(request: Request):
+    """登录：{username, password} → 200 {token, user:{username}}；失败 401。"""
+    if not _webauth_loaded:
+        raise HTTPException(status_code=503, detail="网站认证模块不可用")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    try:
+        token = web_auth.login(body.get("username"), body.get("password"))
+    except web_auth.AuthError:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "用户名或密码错误", "code": "invalid_credentials"},
+        )
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    user = web_auth.resolve_token(token)
+    return {"token": token, "user": {"username": user["username"]}}
+
+
+@app.post("/api/auth/logout")
+async def web_logout(request: Request):
+    """登出：删除 Bearer token（幂等）→ 200 {}。"""
+    if not _webauth_loaded:
+        raise HTTPException(status_code=503, detail="网站认证模块不可用")
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    web_auth.logout(token)
+    return {}
+
+
+@app.get("/api/me")
+async def web_me(user: dict = Depends(get_web_user)):
+    """当前用户信息 + 额度快照（月度定额 / 加油包 / 次月 1 日重置日）。"""
+    quota = web_auth.get_quota(user["id"])
+    return {"username": user["username"], **quota}
+
+
+@app.get("/api/conversations")
+async def web_list_conversations(user: dict = Depends(get_web_user)):
+    """对话列表，按 updated_at 降序。"""
+    return web_auth.list_conversations(user["id"])
+
+
+@app.post("/api/conversations")
+async def web_create_conversation(request: Request, user: dict = Depends(get_web_user)):
+    """新建对话：{title} → {id, title, created_at, updated_at}。"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    try:
+        return web_auth.create_conversation(user["id"], body.get("title"))
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def web_get_conversation(conversation_id: str, user: dict = Depends(get_web_user)):
+    """对话详情（含消息）；不存在或不属于当前用户一律 404。"""
+    conv = web_auth.get_conversation(user["id"], conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return conv
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def web_delete_conversation(conversation_id: str, user: dict = Depends(get_web_user)):
+    """删除对话；不存在或不属于当前用户一律 404。"""
+    if not web_auth.delete_conversation(user["id"], conversation_id):
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return {}
+
+
+@app.post("/api/topup")
+async def web_topup(request: Request, user: dict = Depends(get_web_user)):
+    """
+    加油包充值：{pack_count:1} → 200 {pack_credits, total_remaining}。
+    当前为 mock 支付直接到账。
+    # TODO(支付): 接真实支付渠道（ Stripe / 微信 / 支付宝 ），
+    #   此处改为创建支付订单，到账在支付回调中确认后调 web_auth.topup。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    try:
+        quota = web_auth.topup(user["id"], body.get("pack_count", 1))
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"pack_credits": quota["pack_credits"], "total_remaining": quota["total_remaining"]}
+
+
+async def _stream_web_chat(agent, user_message: str, history: list,
+                           conversation_id: str, user_id: int):
+    """
+    网站 SSE 流式输出（OpenAI chunk 格式），并在流正常完成后：
+    把助手完整回复落库到 messages 表 + 扣减 1 次额度。
+    流中途异常：只发 error chunk，不落库、不扣额度。
+    """
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    model = "market-review-agent"
+    full_content = ""
+
+    def _chunk(delta: dict, finish_reason=None) -> str:
+        data = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    try:
+        # 立即发送 role chunk，防止连接超时
+        yield _chunk({"role": "assistant"})
+
+        async for content_chunk in await agent.process_message(
+            user_message, stream=True, history=history
+        ):
+            if content_chunk:
+                full_content += content_chunk
+                yield _chunk({"content": content_chunk})
+
+        # 免责条款（与 /v1 流式行为一致，并入助手回复落库）
+        disclaimer = (
+            "\n\n风险提示：以上内容仅为客观数据整理与公开信息分析，"
+            "不构成任何投资建议。市场有风险，投资需谨慎。"
+        )
+        full_content += disclaimer
+        yield _chunk({"content": disclaimer})
+
+        # 流正常完成：先落库 + 扣额度，再发结束 chunk
+        web_auth.add_message(conversation_id, "assistant", full_content)
+        web_auth.consume_quota(user_id)
+
+        yield _chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        logger.error("网站流式对话失败 conversation=%s: %s", conversation_id, e, exc_info=True)
+        error_data = {
+            "error": {"message": str(e), "type": "internal_error", "code": "stream_error"}
+        }
+        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+@app.post("/api/chat")
+async def web_chat(request: Request, user: dict = Depends(get_web_user)):
+    """
+    网站对话端点：{conversation_id, message} → SSE 流（text/event-stream）。
+
+    - 额度耗尽 → HTTP 429 JSON {error:"quota_exhausted", total_remaining:0, reset_date}
+    - 用户消息立即落库；助手回复在流正常完成后落库并扣 1 次额度
+    - 对话不存在或不属于当前用户 → 404
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+
+    conversation_id = body.get("conversation_id")
+    message = body.get("message")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise HTTPException(status_code=400, detail="conversation_id 不能为空")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=400, detail="message 不能为空")
+
+    conv = web_auth.get_conversation(user["id"], conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    quota = web_auth.get_quota(user["id"])
+    if quota["total_remaining"] <= 0:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "quota_exhausted",
+                "total_remaining": 0,
+                "reset_date": quota["reset_date"],
+            },
+        )
+
+    if not _agent_loaded:
+        raise HTTPException(
+            status_code=503,
+            detail=f"智能体加载失败: {_agent_error[-200:] if _agent_error else 'unknown'}",
+        )
+
+    agent = get_agent()
+    history = web_auth.get_history(conversation_id)
+    # 用户消息先落库（即使后续流失败，用户提问也保留在对话里）
+    web_auth.add_message(conversation_id, "user", message.strip())
+
+    return StreamingResponse(
+        _stream_web_chat(agent, message.strip(), history, conversation_id, user["id"]),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── 调试端点 ──
