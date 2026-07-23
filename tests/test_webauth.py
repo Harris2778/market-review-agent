@@ -552,3 +552,15 @@ class TestStaticSite:
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "healthy"
+
+
+def test_index_html_assets_use_absolute_static_path():
+    """防回归：index.html 本地资源必须用 /static/ 绝对路径。
+    相对路径在根路由 / 下会被浏览器解析为 /style.css 等 → 404 → 空白页
+    （已发生两次：初版与 Kimi 风格重写各回退一次）。"""
+    import re
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent / "web" / "index.html").read_text(encoding="utf-8")
+    refs = re.findall(r'(?:src|href)="([^"]+)"', html)
+    local = [r for r in refs if not r.startswith(("http://", "https://", "data:", "/", "#"))]
+    assert local == [], f"发现相对路径资源引用: {local}"
