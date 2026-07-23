@@ -695,6 +695,41 @@ async def debug_mcp_test(tool: str = "cnMarketUpdownDistribution"):
     return {"tool": tool, "response": str(r2.json())[:1500]}
 
 
+@app.get("/debug/tushare", dependencies=[Depends(verify_api_key)])
+async def debug_tushare():
+    """Tushare 连通性诊断——暴露真实底层报错（token 掩码，仅显长度与首尾各4位）。"""
+    import os, traceback, requests
+    token = os.getenv("TUSHARE_TOKEN", "")
+    out = {
+        "token_set": bool(token),
+        "token_len": len(token),
+        "token_mask": f"{token[:4]}...{token[-4:]}" if len(token) >= 12 else "(too short)",
+    }
+    # 1) 裸 HTTP 直连 api.tushare.pro：区分 网络/IP封锁 vs token/权限问题
+    try:
+        r = requests.post(
+            "http://api.tushare.pro",
+            json={"api_name": "trade_cal", "token": token,
+                  "params": {"exchange": "SSE", "start_date": "20260720", "end_date": "20260723"},
+                  "fields": "cal_date,is_open"},
+            timeout=20,
+        )
+        out["raw_http_status"] = r.status_code
+        out["raw_http_body_head"] = r.text[:600]
+    except Exception:
+        out["raw_http_error"] = traceback.format_exc()[-800:]
+    # 2) SDK 路径（pro_api 初始化 + trade_cal 调用）的完整异常
+    try:
+        import tushare as ts
+        ts.set_token(token)
+        pro = ts.pro_api()
+        df = pro.trade_cal(exchange="SSE", start_date="20260720", end_date="20260723")
+        out["sdk"] = f"OK rows={0 if df is None else len(df)}"
+    except Exception:
+        out["sdk_error"] = traceback.format_exc()[-800:]
+    return out
+
+
 @app.get("/debug/hot", dependencies=[Depends(verify_api_key)])
 async def debug_hot():
     """热搜原始响应。"""
