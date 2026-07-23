@@ -805,7 +805,7 @@ async def web_me(user: dict = Depends(get_web_user)):
 
 @app.get("/api/conversations")
 async def web_list_conversations(user: dict = Depends(get_web_user)):
-    """对话列表，按 updated_at 降序。"""
+    """对话列表：置顶优先，同组内按 updated_at 降序，每项含 pinned 布尔字段。"""
     return web_auth.list_conversations(user["id"])
 
 
@@ -829,6 +829,38 @@ async def web_get_conversation(conversation_id: str, user: dict = Depends(get_we
     if conv is None:
         raise HTTPException(status_code=404, detail="对话不存在")
     return conv
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def web_update_conversation(
+    conversation_id: str, request: Request, user: dict = Depends(get_web_user)
+):
+    """
+    修改对话标题 / 置顶状态：{title?, pinned?}（至少其一）
+    → 200 {id, title, pinned, created_at, updated_at}。
+
+    - title 去空白后 1-60 字符，否则 400；两者都缺 400
+    - 不存在或不属于当前用户一律 404
+    - updated_at 仅在改 title 时刷新，单独 pin/unpin 不动
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体格式错误，需要 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体须为 JSON 对象")
+    try:
+        result = web_auth.update_conversation(
+            user["id"],
+            conversation_id,
+            title=body.get("title"),
+            pinned=body.get("pinned"),
+        )
+    except web_auth.ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return result
 
 
 @app.delete("/api/conversations/{conversation_id}")

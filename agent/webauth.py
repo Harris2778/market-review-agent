@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     user_id    INTEGER NOT NULL REFERENCES users(id),
     title      TEXT NOT NULL,
+    pinned     INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -145,6 +146,23 @@ CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id);
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    老库结构迁移（在 _SCHEMA 之后执行）。
+
+    conversations.pinned 为后加列：新库已由 _SCHEMA 建好带列结构；
+    Railway 上已存在的老库（CREATE TABLE IF NOT EXISTS 不会改已有表）
+    靠这里的 ALTER TABLE 补列。列已存在时 SQLite 抛 OperationalError，
+    捕获即幂等，重复执行/新旧库混跑都不报错。
+    """
+    try:
+        conn.execute(
+            "ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass  # 列已存在（新库或已迁移过的老库）
+
+
 def _connect() -> sqlite3.Connection:
     """新建一个数据库连接（每次调用独立连接，线程安全），并确保表结构存在。"""
     path = _db_path()
@@ -156,6 +174,7 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     with _lock:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
     return conn
 
 
@@ -431,15 +450,81 @@ def create_conversation(user_id: int, title: str) -> dict:
 
 
 def list_conversations(user_id: int) -> list:
-    """列出用户全部对话，按 updated_at 降序（同刻按 id 稳定次序）。"""
+    """
+    列出用户全部对话：置顶优先，同组内按 updated_at 降序（同刻按 id 稳定次序）。
+    每项含 pinned 布尔字段。
+    """
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT id, title, created_at, updated_at FROM conversations "
-            "WHERE user_id = ? ORDER BY updated_at DESC, id",
+            "SELECT id, title, pinned, created_at, updated_at FROM conversations "
+            "WHERE user_id = ? ORDER BY pinned DESC, updated_at DESC, id",
             (user_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r), "pinned": bool(r["pinned"])} for r in rows]
+    finally:
+        conn.close()
+
+
+def update_conversation(
+    user_id: int,
+    conversation_id: str,
+    title: Optional[str] = None,
+    pinned: Optional[bool] = None,
+) -> Optional[dict]:
+    """
+    修改对话标题 / 置顶状态。返回更新后的
+    {id, title, pinned, created_at, updated_at}（pinned 为布尔）。
+
+    - title 与 pinned 至少提供其一，否则 ValidationError（路由层 400）；
+    - title 去空白后须为 1-60 字符，否则 ValidationError；
+    - 对话不存在或不属于该用户返回 None（路由层 404，不暴露越权差异）；
+    - updated_at 仅在改 title 时刷新；单独 pin/unpin 不动 updated_at
+      （置顶由 pinned 列承担排序权重，不应扰乱同组内的时间排序）。
+    """
+    if title is None and pinned is None:
+        raise ValidationError("title 与 pinned 至少提供其一")
+    new_title: Optional[str] = None
+    if title is not None:
+        if not isinstance(title, str):
+            raise ValidationError("对话标题必须是字符串")
+        new_title = title.strip()
+        if not 1 <= len(new_title) <= 60:
+            raise ValidationError("对话标题须为 1-60 个字符")
+    if pinned is not None and not isinstance(pinned, bool):
+        raise ValidationError("pinned 须为布尔值")
+
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
+            (conversation_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+
+        sets, params = [], []
+        if new_title is not None:
+            sets.append("title = ?")
+            params.append(new_title)
+        if pinned is not None:
+            sets.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if new_title is not None:
+            sets.append("updated_at = ?")
+            params.append(_iso(_now()))
+        params.append(conversation_id)
+        conn.execute(
+            f"UPDATE conversations SET {', '.join(sets)} WHERE id = ?", params
+        )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT id, title, pinned, created_at, updated_at FROM conversations "
+            "WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return {**dict(row), "pinned": bool(row["pinned"])}
     finally:
         conn.close()
 

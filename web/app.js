@@ -10,6 +10,14 @@
   var PACK_SIZE = 50;            // 每个加油包条数（与后端 WEB_PACK_SIZE 默认一致）
   var STORAGE_TOKEN = 'fia_token';
   var STORAGE_USER = 'fia_username';
+  var STORAGE_THEME = 'fia_theme';
+
+  /* 生成中占位小球（双眼高光，流式首帧到达后被 markdown 覆盖替换） */
+  var GEN_BALL_HTML =
+    '<span class="gen-ball">' +
+    '<span class="gen-eye left"></span>' +
+    '<span class="gen-eye right"></span>' +
+    '</span>';
 
   /* ==================== DOM 引用 ==================== */
   var $ = function (id) { return document.getElementById(id); };
@@ -28,11 +36,13 @@
   var convEmpty = $('conv-empty');
   var userName = $('user-name');
   var logoutBtn = $('logout-btn');
+  var themeToggle = $('theme-toggle');
   var quotaFill = $('quota-fill');
   var quotaText = $('quota-text');
   var topupEntryBtn = $('topup-entry-btn');
   var packCount = $('pack-count');
 
+  var chatView = $('chat-view');
   var quotaBanner = $('quota-banner');
   var quotaBannerBtn = $('quota-banner-btn');
   var quotaBannerReset = $('quota-banner-reset');
@@ -45,10 +55,19 @@
   var sendBtn = $('send-btn');
   var stopBtn = $('stop-btn');
 
-  var topupModal = $('topup-modal');
+  var quotaView = $('quota-view');
+  var quotaBackBtn = $('quota-back-btn');
+  var quotaBigNum = $('quota-big-num');
+  var quotaBarFill = $('quota-bar-fill');
+  var quotaBarText = $('quota-bar-text');
+  var quotaResetNote = $('quota-reset-note');
+  var packBalance = $('pack-balance');
   var buyPackBtn = $('buy-pack-btn');
-  var topupCloseBtn = $('topup-close-btn');
-  var modalResetDate = $('modal-reset-date');
+
+  var convMenu = $('conv-menu');
+  var menuRename = $('menu-rename');
+  var menuPin = $('menu-pin');
+  var menuDelete = $('menu-delete');
 
   /* ==================== 状态 ==================== */
   var state = {
@@ -59,7 +78,9 @@
     activeConvId: null,
     streaming: false,
     abortController: null,
-    authMode: 'login'       // 'login' | 'register'
+    authMode: 'login',      // 'login' | 'register'
+    view: 'chat',           // 'chat' | 'quota'
+    menuConvId: null        // 当前打开操作菜单的对话 id
   };
 
   /* ==================== 基础工具 ==================== */
@@ -70,8 +91,7 @@
     return node;
   }
 
-  /* 隐藏统一走「hidden 属性 + .hidden 类」双保险，
-     CSS 侧 [hidden]/.hidden 均为 display:none !important */
+  /* 隐藏统一走「hidden 属性 + .hidden 类」双保险 */
   function setHidden(node, hidden) {
     if (hidden) {
       node.setAttribute('hidden', '');
@@ -123,12 +143,68 @@
     localStorage.removeItem(STORAGE_USER);
   }
 
+  function findConv(id) {
+    for (var i = 0; i < state.conversations.length; i++) {
+      if (state.conversations[i].id === id) return state.conversations[i];
+    }
+    return null;
+  }
+
+  /* ==================== 主题切换 ==================== */
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  }
+
+  function toggleTheme() {
+    var t = currentTheme() === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem(STORAGE_THEME, t); } catch (e) { /* 忽略 */ }
+  }
+
+  /* ==================== hero 视差 ====================
+     mousemove 记录目标位移，rAF 循环 lerp 平滑；
+     各层按 data-depth 系数以不同幅度跟随（--px/--py）。 */
+  function initHero(hero) {
+    if (!hero) return;
+    var layers = Array.prototype.slice.call(hero.querySelectorAll('[data-depth]'));
+    if (!layers.length) return;
+    var tx = 0, ty = 0, cx = 0, cy = 0, raf = null;
+
+    function loop() {
+      cx += (tx - cx) * 0.12;
+      cy += (ty - cy) * 0.12;
+      for (var i = 0; i < layers.length; i++) {
+        var d = parseFloat(layers[i].getAttribute('data-depth')) || 0;
+        layers[i].style.setProperty('--px', (cx * d).toFixed(2) + 'px');
+        layers[i].style.setProperty('--py', (cy * d).toFixed(2) + 'px');
+      }
+      if (Math.abs(tx - cx) > 0.05 || Math.abs(ty - cy) > 0.05) {
+        raf = requestAnimationFrame(loop);
+      } else {
+        raf = null;
+      }
+    }
+    function kick() { if (!raf) raf = requestAnimationFrame(loop); }
+
+    hero.addEventListener('mousemove', function (ev) {
+      var r = hero.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      tx = ((ev.clientX - r.left) / r.width - 0.5) * 18;
+      ty = ((ev.clientY - r.top) / r.height - 0.5) * 12;
+      kick();
+    });
+    hero.addEventListener('mouseleave', function () {
+      tx = 0; ty = 0;
+      kick();
+    });
+  }
+
   /* ==================== 视图切换 ==================== */
   function showAuth() {
     setHidden(appView, true);
     setHidden(authView, false);
     setQuotaBanner(false);
-    closeTopupModal();           // 回到登录页时绝不残留弹层
+    closeConvMenu();
     authPassword.value = '';
     authUsername.focus();
   }
@@ -208,6 +284,7 @@
       state.me = await res.json();
       renderUserBar();
       updateQuotaState();
+      if (state.view === 'quota') renderQuotaView();
     } catch (e) {
       if (e.message !== 'unauthorized') console.error(e);
     }
@@ -240,10 +317,8 @@
     input.disabled = !!exhausted;
     if (exhausted && me.reset_date) {
       quotaBannerReset.textContent = '将于 ' + formatDate(me.reset_date) + ' 自动重置';
-      modalResetDate.textContent = '月度额度将于 ' + formatDate(me.reset_date) + ' 自动重置。';
     } else {
       quotaBannerReset.textContent = '次月1日自动重置';
-      modalResetDate.textContent = '月度额度将于次月1日自动重置。';
     }
     updateSendState();
   }
@@ -259,27 +334,59 @@
     return (d.getMonth() + 1) + '月' + d.getDate() + '日';
   }
 
-  /* ==================== 加油包弹层 ====================
-     只在两处打开：用户点「加油包」入口 / 429 额度耗尽。
-     关闭路径：暂不购买按钮、遮罩点击、Esc 键。 */
-  function openTopupModal() { setHidden(topupModal, false); }
-  function closeTopupModal() { setHidden(topupModal, true); }
+  /* ==================== 额度页（独立视图） ==================== */
+  function showQuotaView() {
+    state.view = 'quota';
+    closeConvMenu();
+    setHidden(chatView, true);
+    setHidden(quotaView, false);
+    renderQuotaView();
+    loadMe(); // 进入时拉取最新额度
+  }
+
+  function showChatView() {
+    state.view = 'chat';
+    setHidden(quotaView, true);
+    setHidden(chatView, false);
+  }
+
+  function renderQuotaView() {
+    var me = state.me;
+    if (!me) {
+      quotaBigNum.textContent = '—';
+      quotaBarFill.style.width = '0%';
+      quotaBarText.textContent = '加载中…';
+      quotaResetNote.textContent = '';
+      packBalance.textContent = '—';
+      return;
+    }
+    quotaBigNum.textContent = me.total_remaining != null ? me.total_remaining : '—';
+    var quota = me.monthly_quota || 0;
+    var used = me.monthly_used || 0;
+    var pct = quota > 0 ? Math.min(100, Math.round(used / quota * 100)) : 0;
+    quotaBarFill.style.width = pct + '%';
+    quotaBarFill.classList.toggle('low', (me.monthly_remaining || 0) <= 0 && quota > 0);
+    quotaBarText.textContent = '已用 ' + used + ' / ' + quota + ' 条';
+    quotaResetNote.textContent = '月度额度将于 ' + formatDate(me.reset_date) + ' 重置';
+    packBalance.textContent = me.pack_credits != null ? me.pack_credits : 0;
+  }
 
   async function buyPack() {
     buyPackBtn.disabled = true;
+    var oldText = buyPackBtn.textContent;
     buyPackBtn.textContent = '到账中…';
     try {
       var res = await api('/api/topup', { method: 'POST', body: { pack_count: 1 } });
       if (res.ok) {
-        await loadMe();          // 刷新额度并解除禁用
-        closeTopupModal();
+        await loadMe();          // 刷新额度页与侧边栏
+        buyPackBtn.textContent = oldText;
       } else {
-        buyPackBtn.textContent = '购买失败，请重试';
-        setTimeout(function () { buyPackBtn.textContent = '购买加油包（+' + PACK_SIZE + '条）'; }, 1500);
+        buyPackBtn.textContent = '充值失败，请重试';
+        setTimeout(function () { buyPackBtn.textContent = oldText; }, 1500);
       }
     } catch (e) {
       buyPackBtn.textContent = '网络异常，请重试';
-      setTimeout(function () { buyPackBtn.textContent = '购买加油包（+' + PACK_SIZE + '条）'; }, 1500);
+      setTimeout(function () { buyPackBtn.textContent = oldText; }, 1500);
     } finally {
       buyPackBtn.disabled = false;
     }
@@ -297,22 +404,119 @@
     }
   }
 
+  /* 置顶优先，组内保持服务端 updated_at 降序（稳定排序） */
+  function sortedConversations() {
+    return state.conversations.slice().sort(function (a, b) {
+      return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
+    });
+  }
+
   function renderConvList() {
     convList.innerHTML = '';
     setHidden(convEmpty, state.conversations.length > 0);
-    state.conversations.forEach(function (conv) {
+    sortedConversations().forEach(function (conv) {
       var li = el('li', 'conv-item' + (conv.id === state.activeConvId ? ' active' : ''));
+      li.dataset.convId = conv.id;
+
+      if (conv.pinned) li.appendChild(el('span', 'conv-pin', '📌'));
       li.appendChild(el('span', 'conv-title', conv.title || '未命名对话'));
-      var del = el('button', 'conv-del', '✕');
-      del.title = '删除对话';
-      del.addEventListener('click', function (ev) {
+
+      var menuBtn = el('button', 'conv-menu-btn', '···');
+      menuBtn.title = '更多操作';
+      menuBtn.addEventListener('click', function (ev) {
         ev.stopPropagation();
-        deleteConversation(conv.id);
+        openConvMenu(conv, menuBtn);
       });
-      li.appendChild(del);
-      li.addEventListener('click', function () { openConversation(conv.id); });
+      li.appendChild(menuBtn);
+
+      li.addEventListener('click', function () {
+        if (li.querySelector('.conv-rename-input')) return; // 重命名中不切换
+        openConversation(conv.id);
+      });
       convList.appendChild(li);
     });
+  }
+
+  /* ==================== 对话操作菜单 ==================== */
+  function openConvMenu(conv, anchorBtn) {
+    state.menuConvId = conv.id;
+    menuPin.textContent = conv.pinned ? '📌 取消置顶' : '📌 置顶';
+
+    var rect = anchorBtn.getBoundingClientRect();
+    var menuW = 148, menuH = 120;
+    var left = Math.max(8, Math.min(rect.right - menuW, window.innerWidth - menuW - 8));
+    var top = rect.bottom + 4;
+    if (top + menuH > window.innerHeight - 8) top = Math.max(8, rect.top - menuH - 4);
+    convMenu.style.left = left + 'px';
+    convMenu.style.top = top + 'px';
+    setHidden(convMenu, false);
+  }
+
+  function closeConvMenu() {
+    setHidden(convMenu, true);
+    state.menuConvId = null;
+  }
+
+  function menuConvLi() {
+    return convList.querySelector('[data-conv-id="' + state.menuConvId + '"]');
+  }
+
+  /* 编辑标题：就地 input，Enter/blur 提交，Esc 取消 */
+  function startRename(conv) {
+    var li = menuConvLi();
+    if (!li || li.querySelector('.conv-rename-input')) return;
+    var titleEl = li.querySelector('.conv-title');
+    if (!titleEl) return;
+
+    var renameInput = document.createElement('input');
+    renameInput.className = 'conv-rename-input';
+    renameInput.value = conv.title || '';
+    renameInput.maxLength = 60;
+    titleEl.replaceWith(renameInput);
+    renameInput.focus();
+    renameInput.select();
+
+    var cancelled = false;
+    renameInput.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    renameInput.addEventListener('keydown', function (ev) {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { renameInput.blur(); }
+      else if (ev.key === 'Escape') { cancelled = true; renameInput.blur(); }
+    });
+    renameInput.addEventListener('blur', function () {
+      if (cancelled) { renderConvList(); return; }
+      commitRename(conv, renameInput.value.trim());
+    });
+  }
+
+  async function commitRename(conv, title) {
+    if (title && title !== conv.title) {
+      try {
+        var res = await api('/api/conversations/' + encodeURIComponent(conv.id), {
+          method: 'PATCH',
+          body: { title: title }
+        });
+        if (res.ok) conv.title = title;
+      } catch (e) {
+        if (e.message !== 'unauthorized') console.error(e);
+      }
+    }
+    renderConvList();
+  }
+
+  async function togglePin(conv) {
+    var next = !conv.pinned;
+    conv.pinned = next;               // 乐观更新
+    renderConvList();
+    try {
+      var res = await api('/api/conversations/' + encodeURIComponent(conv.id), {
+        method: 'PATCH',
+        body: { pinned: next }
+      });
+      if (!res.ok) { conv.pinned = !next; renderConvList(); }
+    } catch (e) {
+      if (e.message !== 'unauthorized') { conv.pinned = !next; renderConvList(); }
+    }
   }
 
   async function openConversation(id) {
@@ -323,6 +527,7 @@
       if (!res.ok) return;
       var conv = await res.json();
       state.activeConvId = conv.id;
+      showChatView();
       renderConvList();
       renderMessages(conv.messages || []);
       input.focus();
@@ -343,10 +548,7 @@
     }
   }
 
-  /* ==================== 空状态 / 对话状态布局 ====================
-     空状态：welcome 居中（问候语 + 居中输入卡片）；
-     对话状态：messages 滚动区 + 底部输入卡片。
-     同一个 #composer 节点在两个插槽之间移动。 */
+  /* ==================== 空状态 / 对话状态布局 ==================== */
   function showWelcome(show) {
     setHidden(welcomeEl, !show);
     setHidden(messagesEl, show);
@@ -359,6 +561,7 @@
 
   function startNewChat() {
     state.activeConvId = null;
+    showChatView();
     messagesEl.innerHTML = '';
     showWelcome(true);
     renderConvList();
@@ -401,7 +604,6 @@
   function updateSendState() {
     var me = state.me;
     var exhausted = me && typeof me.total_remaining === 'number' && me.total_remaining <= 0;
-    // 无内容 / 额度耗尽时发送键置灰；流式期间隐藏发送键改显停止键
     sendBtn.disabled = !!exhausted || !input.value.trim();
   }
 
@@ -417,8 +619,10 @@
     autoResize();
     appendMessage('user', text);
     var bubble = appendMessage('assistant', '');
-    bubble.classList.add('thinking');
-    bubble.textContent = '思考中…';
+    // 生成中占位：灵动小球（首帧内容到达后被 markdown 覆盖）
+    bubble.classList.remove('md');
+    bubble.classList.add('gen-stage');
+    bubble.innerHTML = GEN_BALL_HTML;
     setStreaming(true);
 
     try {
@@ -439,22 +643,22 @@
       await Promise.all([loadMe(), loadConversations()]);
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        bubble.classList.remove('thinking');
+        bubble.classList.remove('gen-stage');
         if (!bubble.dataset.filled) bubble.innerHTML = '';
         var note = el('p', 'stopped-note', '（已停止生成）');
         bubble.appendChild(note);
       } else if (e && e.quotaExhausted) {
-        // 429：服务端未落库，移除本地乐观气泡并恢复输入
+        // 429：服务端未落库，移除本地乐观气泡并恢复输入，跳转额度页
         removeLastTwoBubbles();
         input.value = text;
         autoResize();
         await loadMe();
         updateQuotaState();
-        openTopupModal();
+        showQuotaView();
       } else if (e && e.message === 'unauthorized') {
         // handleUnauthorized 已处理
       } else {
-        bubble.classList.remove('thinking');
+        bubble.classList.remove('gen-stage');
         bubble.classList.remove('md');
         bubble.textContent = '出错了，请稍后重试。';
       }
@@ -528,8 +732,9 @@
           if (delta && typeof delta.content === 'string' && delta.content) {
             full += delta.content;
             bubble.dataset.filled = '1';
-            bubble.classList.remove('thinking');
-            bubble.innerHTML = window.renderMarkdown(full);
+            bubble.classList.remove('gen-stage');
+            bubble.classList.add('md');
+            bubble.innerHTML = window.renderMarkdown(full);  // 覆盖生成中小球
             scrollToBottom();
           }
         } catch (parseErr) { /* 忽略不完整/非 JSON 行 */ }
@@ -537,7 +742,7 @@
     }
 
     if (!full) {
-      bubble.classList.remove('thinking');
+      bubble.classList.remove('gen-stage');
       bubble.classList.remove('md');
       bubble.textContent = '（未收到回复内容）';
     }
@@ -568,8 +773,6 @@
   /* ==================== 初始化 ==================== */
   function applyBranding() {
     document.title = APP_NAME;
-    $('auth-app-name').textContent = APP_NAME;
-    $('welcome-title').textContent = '你好，我是 ' + APP_NAME;
   }
 
   function bindEvents() {
@@ -577,30 +780,53 @@
     tabRegister.addEventListener('click', function () { setAuthMode('register'); });
     authForm.addEventListener('submit', handleAuthSubmit);
     logoutBtn.addEventListener('click', logout);
+    themeToggle.addEventListener('click', toggleTheme);
     newChatBtn.addEventListener('click', function () { if (!state.streaming) startNewChat(); });
     sendBtn.addEventListener('click', sendMessage);
     stopBtn.addEventListener('click', stopStreaming);
     input.addEventListener('keydown', handleKeydown);
     input.addEventListener('input', handleInput);
 
-    /* 加油包弹层：三个关闭路径 + 两个打开入口 */
-    topupEntryBtn.addEventListener('click', openTopupModal);      // 打开：用户主动
-    quotaBannerBtn.addEventListener('click', openTopupModal);     // 打开：额度提示条
-    topupCloseBtn.addEventListener('click', closeTopupModal);     // 关闭①：暂不购买
-    topupModal.addEventListener('click', function (ev) {          // 关闭②：点击遮罩
-      if (ev.target === topupModal) closeTopupModal();
+    /* 额度页入口与返回 */
+    topupEntryBtn.addEventListener('click', showQuotaView);
+    quotaBannerBtn.addEventListener('click', showQuotaView);
+    quotaBackBtn.addEventListener('click', showChatView);
+    buyPackBtn.addEventListener('click', buyPack);
+
+    /* 对话操作菜单：三项动作 + 点击外部 / Esc 关闭 */
+    menuRename.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var conv = findConv(state.menuConvId);
+      closeConvMenu();
+      if (conv) startRename(conv);
     });
-    document.addEventListener('keydown', function (ev) {          // 关闭③：Esc 键
-      if (ev.key === 'Escape' && !isHidden(topupModal)) closeTopupModal();
+    menuPin.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var conv = findConv(state.menuConvId);
+      closeConvMenu();
+      if (conv) togglePin(conv);
+    });
+    menuDelete.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      var id = state.menuConvId;
+      closeConvMenu();
+      if (id) deleteConversation(id);
+    });
+    convMenu.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    document.addEventListener('click', function () { closeConvMenu(); });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && !isHidden(convMenu)) closeConvMenu();
     });
   }
 
   async function init() {
     applyBranding();
     bindEvents();
+    initHero($('hero-auth'));
+    initHero($('hero-welcome'));
     setAuthMode('login');
-    buyPackBtn.textContent = '购买加油包（+' + PACK_SIZE + '条）';
-    closeTopupModal();      // 保险：任何初始路径下弹层都处于关闭态
+    buyPackBtn.textContent = '充值 +' + PACK_SIZE + ' 条';
+    closeConvMenu();
     updateSendState();
 
     if (state.token) {

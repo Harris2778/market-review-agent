@@ -1,42 +1,99 @@
 /* ============================================================
-   Fine —— 前端样式（Kimi 桌面版视觉）
-   中性浅色系 · 无彩色强调 · 无渐变 · 极克制
+   Fine —— 前端样式（Kimi 桌面版视觉 · 浅/深双主题）
+   中性色系 · 无渐变 · 极克制 · 零图片资源
    ============================================================ */
 
-/* ---------- 隐藏机制（修复弹层默认可见 bug 的核心） ----------
-   类选择器会覆盖 UA 的 [hidden] 规则，必须显式 !important */
+/* ---------- 隐藏机制（类选择器会覆盖 UA 的 [hidden]，必须 !important） ---------- */
 [hidden],
 .hidden {
   display: none !important;
 }
 
+/* ==================== 主题变量 ==================== */
 :root {
-  /* Kimi 式中性浅色 */
   --bg: #ffffff;              /* 主背景：近白 */
   --bg-sidebar: #f7f7f5;      /* 侧边栏：略深的浅灰米 */
   --bg-hover: #eeeeeb;
-  --bg-active: #e9e9e6;       /* 当前会话高亮浅灰 */
-  --bg-bubble-user: #f2f2ef;  /* 用户气泡浅灰 */
+  --bg-active: #e9e9e6;
+  --bg-bubble-user: #f2f2ef;
   --bg-code: #f4f4f1;
   --bg-input: #ffffff;
   --bg-banner: #f5f4f0;
   --bg-auth: #fafaf8;
+  --bg-menu: #ffffff;
 
   --text: #1c1c1a;            /* 近黑 */
   --text-secondary: #757571;
   --text-faint: #a8a8a2;
 
   --primary: #1f1f1d;         /* 主按钮近黑实心 */
+  --primary-text: #ffffff;
   --primary-hover: #000000;
-  --primary-ghost: #ededeb;   /* 次要按钮灰底 */
+  --primary-ghost: #ededeb;   /* 发送键置灰底 */
 
   --border: #e6e6e2;
-  --danger: #a8442e;          /* 克制的暗红，仅用于错误/额度告警 */
+  --danger: #a8442e;
+  --quota-fill: #9a9a94;
+
+  --mask: rgba(0, 0, 0, 0.28);
+  --menu-shadow: 0 6px 24px rgba(0, 0, 0, 0.10);
+
+  /* hero 元素 */
+  --ball: #2b2b28;            /* i 点小球 / 生成中小球（浅色主题用深色球） */
+  --ball-eye: #ffffff;
+  --gen-ball: #37415a;        /* 生成中小球：克制的微蓝深色 */
+  --pc-body: #2b2b28;
+  --pc-screen: #e9e7df;
+  --pc-eye: #2b2b28;
+  --pc-mouth: #2b2b28;
+  --pc-stand: #8f8f89;
+  --pc-kb: #d9d7cf;
+  --pc-key: #b9b7af;
 
   --radius: 12px;
-  --radius-lg: 22px;          /* 输入卡片圆角 16-24px */
+  --radius-lg: 22px;
   --sidebar-w: 260px;
-  --content-w: 760px;         /* 消息单列限宽 720-800px */
+  --content-w: 760px;
+}
+
+[data-theme="dark"] {
+  --bg: #161614;              /* 近黑背景 */
+  --bg-sidebar: #1b1b19;
+  --bg-hover: #262624;
+  --bg-active: #2b2b28;
+  --bg-bubble-user: #2b2b28;
+  --bg-code: #242422;
+  --bg-input: #1f1f1d;        /* 卡片/输入卡片 */
+  --bg-banner: #22221f;
+  --bg-auth: #121210;
+  --bg-menu: #242422;
+
+  --text: #ececea;            /* 近白 */
+  --text-secondary: #a3a39c;
+  --text-faint: #6f6f69;
+
+  --primary: #ececea;         /* 暗色主按钮反白 */
+  --primary-text: #161614;
+  --primary-hover: #ffffff;
+  --primary-ghost: #333330;
+
+  --border: #33332f;          /* 低亮度灰边框 */
+  --danger: #c96a52;
+  --quota-fill: #6f6f69;
+
+  --mask: rgba(0, 0, 0, 0.5);
+  --menu-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+
+  --ball: #ececea;
+  --ball-eye: #161614;
+  --gen-ball: #8fa3c8;        /* 暗色下小球调亮 */
+  --pc-body: #d9d7cf;
+  --pc-screen: #3a3a36;
+  --pc-eye: #d9d7cf;
+  --pc-mouth: #d9d7cf;
+  --pc-stand: #6f6f69;
+  --pc-kb: #3a3a36;
+  --pc-key: #555550;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -51,7 +108,7 @@ html, body {
   line-height: 1.7;
 }
 
-button { font-family: inherit; cursor: pointer; }
+button { font-family: inherit; cursor: pointer; color: inherit; }
 input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 /* ---------------- 按钮 ---------------- */
@@ -66,14 +123,17 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .btn-block { width: 100%; }
 .btn-sm { padding: 4px 12px; font-size: 13px; }
 
-.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary { background: var(--primary); color: var(--primary-text); }
 .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
 
 .btn-ghost { background: transparent; color: var(--text-secondary); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 
-/* 新对话：全宽浅色描边（Kimi 侧边栏风格） */
+/* 新对话：全宽浅色描边 + 气泡加号图标（Kimi 侧边栏风格） */
 .btn-newchat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   background: var(--bg);
   border-color: var(--border);
   color: var(--text);
@@ -81,6 +141,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   padding: 10px 14px;
 }
 .btn-newchat:hover:not(:disabled) { background: var(--bg-hover); }
+.newchat-icon { width: 16px; height: 16px; flex-shrink: 0; }
 
 /* 圆形发送 / 停止按钮（输入卡片右下角） */
 .icon-btn {
@@ -89,7 +150,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   border-radius: 50%;
   border: none;
   background: var(--primary);
-  color: #fff;
+  color: var(--primary-text);
   font-size: 15px;
   line-height: 1;
   display: flex;
@@ -106,8 +167,124 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 }
 #stop-btn { font-size: 11px; }
 
+/* 主题切换等小图标按钮 */
+.icon-text-btn {
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
+}
+.icon-text-btn:hover { background: var(--bg-hover); color: var(--text); }
+.icon-text-btn svg { width: 16px; height: 16px; }
+.theme-icon-sun { display: none; }
+[data-theme="dark"] .theme-icon-sun { display: block; }
+[data-theme="dark"] .theme-icon-moon { display: none; }
+
 /* ============================================================
-   登录 / 注册（Kimi 化：居中窄卡片、近黑主按钮、浅灰输入框）
+   品牌 hero：Fine 大字标 + 复古小电脑 + 视差层
+   ============================================================ */
+.hero {
+  display: flex;
+  justify-content: center;
+  user-select: none;
+  cursor: default;
+}
+.hero-stage {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--text);
+}
+.hero-auth .hero-stage { font-size: 84px; }
+.hero-welcome .hero-stage { font-size: 104px; }
+
+/* 视差层：位移由 JS 写入 --px/--py，rAF 平滑 */
+.hero-layer {
+  display: inline-block;
+  transform: translate(var(--px, 0px), var(--py, 0px));
+  will-change: transform;
+}
+
+/* 字母 i（ı 无点）上方悬浮的小球 */
+.hero-i { position: relative; }
+.hero-dot {
+  position: absolute;
+  left: 50%;
+  bottom: 1.04em;
+  transform: translateX(-50%) translate(var(--px, 0px), var(--py, 0px));
+  will-change: transform;
+}
+.hero-ball {
+  display: block;
+  width: 0.21em;
+  height: 0.21em;
+  border-radius: 50%;
+  background: var(--ball);
+  position: relative;
+  animation: heroBounce 3.4s ease-in-out infinite;
+}
+.hero-ball::before,
+.hero-ball::after {
+  content: "";
+  position: absolute;
+  top: 30%;
+  width: 18%;
+  height: 24%;
+  border-radius: 50%;
+  background: var(--ball-eye);
+  animation: heroBlink 4.2s ease-in-out infinite;
+}
+.hero-ball::before { left: 22%; }
+.hero-ball::after { right: 22%; }
+
+@keyframes heroBounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-0.05em); }
+}
+@keyframes heroBlink {
+  0%, 91%, 100% { transform: scaleY(1); }
+  94.5% { transform: scaleY(0.12); }
+}
+
+/* 复古小电脑 */
+.hero-pc svg {
+  width: 0.92em;
+  height: auto;
+  display: block;
+  margin: 0 0.06em;
+}
+.pc-body { fill: var(--pc-body); }
+.pc-screen { fill: var(--pc-screen); animation: pcFlicker 5s ease-in-out infinite; }
+.pc-eye {
+  fill: var(--pc-eye);
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: heroBlink 4.2s ease-in-out infinite;
+}
+.pc-mouth { fill: var(--pc-mouth); }
+.pc-stand { fill: var(--pc-stand); }
+.pc-kb { fill: var(--pc-kb); }
+.pc-key { fill: var(--pc-key); }
+
+@keyframes pcFlicker {
+  0%, 100% { opacity: 1; }
+  48% { opacity: 1; }
+  52% { opacity: 0.82; }
+  56% { opacity: 1; }
+}
+
+/* ============================================================
+   登录 / 注册
    ============================================================ */
 .auth-view {
   min-height: 100vh;
@@ -120,25 +297,19 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 .auth-card {
   width: 100%;
-  max-width: 360px;
+  max-width: 400px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 16px;
-  padding: 44px 36px 36px;
+  padding: 40px 36px 36px;
 }
 
-.auth-brand {
-  font-size: 40px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  text-align: center;
-  color: var(--text);
-}
+.hero-auth { margin-bottom: 10px; }
 .auth-subtitle {
   text-align: center;
   color: var(--text-secondary);
   font-size: 13px;
-  margin: 6px 0 30px;
+  margin: 0 0 28px;
 }
 
 .auth-tabs {
@@ -201,6 +372,14 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   overflow: hidden;
 }
 
+.chat-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
 /* ---------------- 侧边栏 ---------------- */
 .sidebar {
   width: var(--sidebar-w);
@@ -233,8 +412,9 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   position: relative;
   display: flex;
   align-items: center;
+  gap: 4px;
   border-radius: 8px;
-  padding: 8px 12px;
+  padding: 8px 10px;
   margin-bottom: 1px;
   cursor: pointer;
   color: var(--text-secondary);
@@ -246,6 +426,12 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   color: var(--text);
 }
 
+.conv-pin {
+  font-size: 11px;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
 .conv-title {
   flex: 1;
   overflow: hidden;
@@ -254,19 +440,34 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   font-size: 14px;
 }
 
-.conv-del {
+/* hover 显示的「···」按钮 */
+.conv-menu-btn {
   display: none;
   border: none;
   background: transparent;
   color: var(--text-faint);
-  font-size: 14px;
+  font-size: 13px;
+  letter-spacing: 1px;
   line-height: 1;
   padding: 4px 6px;
   border-radius: 6px;
   flex-shrink: 0;
 }
-.conv-item:hover .conv-del { display: block; }
-.conv-del:hover { color: var(--text); background: rgba(0, 0, 0, 0.06); }
+.conv-item:hover .conv-menu-btn { display: block; }
+.conv-menu-btn:hover { color: var(--text); background: var(--bg-active); }
+
+/* 就地重命名输入框 */
+.conv-rename-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  padding: 2px 6px;
+  border: 1px solid var(--text-faint);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+}
 
 .conv-empty {
   text-align: center;
@@ -274,6 +475,32 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   font-size: 13px;
   padding: 24px 0;
 }
+
+/* ---------------- 对话操作菜单浮层 ---------------- */
+.conv-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 148px;
+  background: var(--bg-menu);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--menu-shadow);
+  padding: 4px;
+}
+.conv-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+  transition: background 0.12s ease;
+}
+.conv-menu-item:hover { background: var(--bg-hover); }
+.conv-menu-item.danger { color: var(--danger); }
 
 /* ---------------- 底部用户区（低调） ---------------- */
 .user-bar {
@@ -284,7 +511,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .user-bar-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-bottom: 8px;
 }
 .user-name {
@@ -312,7 +539,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 .quota-fill {
   height: 100%;
   width: 0%;
-  background: #9a9a94;
+  background: var(--quota-fill);
   border-radius: 2px;
   transition: width 0.3s ease;
 }
@@ -325,14 +552,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 
 .topup-entry { padding-left: 0; }
 
-/* ---------------- 主区域 ---------------- */
-.main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
+/* ---------------- 额度提示条 ---------------- */
 .quota-banner {
   display: flex;
   align-items: center;
@@ -371,23 +591,50 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   word-wrap: break-word;
   overflow-wrap: anywhere;
 }
-/* 用户：浅灰圆角气泡靠右 */
 .msg-row.user .msg-bubble {
   background: var(--bg-bubble-user);
   border-radius: 18px;
   padding: 10px 16px;
   white-space: pre-wrap;
 }
-/* 助手：无气泡，纯净文本流直接排版（Kimi 风格） */
+/* 助手：无气泡，纯净文本流（Kimi 风格） */
 .msg-row.assistant .msg-bubble {
   max-width: 100%;
   width: 100%;
   padding: 2px 0;
 }
 
-.msg-bubble.thinking {
-  color: var(--text-faint);
-  font-style: italic;
+/* ---------------- 生成中灵动小球 ---------------- */
+.gen-stage { padding: 6px 0; }
+.gen-ball {
+  display: inline-block;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--gen-ball);
+  position: relative;
+  animation: genFloat 1.6s ease-in-out infinite;
+}
+.gen-eye {
+  position: absolute;
+  top: 30%;
+  width: 5px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ball-eye);
+  opacity: 0.95;
+  animation: genBlink 3s ease-in-out infinite;
+}
+.gen-eye.left { left: 6px; }
+.gen-eye.right { right: 6px; }
+
+@keyframes genFloat {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+@keyframes genBlink {
+  0%, 90%, 100% { transform: scaleY(1); }
+  93.5% { transform: scaleY(0.12); }
 }
 
 .stopped-note {
@@ -396,7 +643,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   margin-top: 6px;
 }
 
-/* ---------------- 空状态（居中问候 + 大输入卡片） ---------------- */
+/* ---------------- 空状态（hero + 问候 + 大输入卡片） ---------------- */
 .welcome {
   flex: 1;
   display: flex;
@@ -405,12 +652,7 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   justify-content: center;
   padding: 0 24px 8vh;
 }
-.welcome-title {
-  font-size: 28px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  margin-bottom: 8px;
-}
+.hero-welcome { margin-bottom: 26px; }
 .welcome-sub {
   color: var(--text-secondary);
   font-size: 15px;
@@ -459,42 +701,99 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 }
 
 /* ============================================================
-   加油包弹层（默认 [hidden]+.hidden 双保险，见文件顶部）
+   额度页（独立视图）
    ============================================================ */
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.28);
+.quota-view {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+.quota-page {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 32px 24px 48px;
+}
+.quota-head {
   display: flex;
   align-items: center;
-  justify-content: center;
-  z-index: 100;
-  padding: 24px;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.quota-title {
+  font-size: 20px;
+  font-weight: 600;
 }
 
-.modal {
-  background: var(--bg);
-  border-radius: 16px;
+.quota-card {
+  background: var(--bg-input);
   border: 1px solid var(--border);
-  width: 100%;
-  max-width: 380px;
-  padding: 30px 28px 22px;
+  border-radius: 16px;
+  padding: 24px 24px 20px;
+  margin-bottom: 16px;
+}
+.quota-card-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+.quota-big {
+  font-size: 46px;
+  font-weight: 700;
+  line-height: 1.1;
+  margin-bottom: 16px;
+}
+.quota-unit {
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-left: 6px;
 }
 
-.modal-title { font-size: 17px; font-weight: 600; margin-bottom: 10px; }
-.modal-desc { color: var(--text-secondary); font-size: 14px; margin-bottom: 20px; }
-.modal-pack { margin-bottom: 14px; }
-.modal-note {
-  text-align: center;
-  color: var(--text-faint);
-  font-size: 12px;
-  margin-top: 8px;
+.quota-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
 }
-.modal-reset {
-  text-align: center;
-  color: var(--text-secondary);
+.quota-bar {
+  flex: 1;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.quota-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--quota-fill);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+.quota-bar-fill.low { background: var(--danger); }
+.quota-bar-text {
   font-size: 13px;
-  margin-bottom: 14px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.quota-desc {
+  color: var(--text-secondary);
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+.quota-pack-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.quota-pack-balance { font-size: 14px; }
+.quota-pack-balance b { font-size: 18px; }
+
+.quota-note {
+  font-size: 12px;
+  color: var(--text-faint);
 }
 
 /* ============================================================
@@ -558,4 +857,6 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
 @media (max-width: 720px) {
   .sidebar { width: 216px; }
   .msg-bubble { max-width: 92%; }
+  .hero-auth .hero-stage { font-size: 64px; }
+  .hero-welcome .hero-stage { font-size: 76px; }
 }

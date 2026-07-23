@@ -5,6 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" href="data:,">
   <title>Fine</title>
+  <script>
+    /* 首帧前确定主题，避免闪烁：localStorage 优先，缺省跟随系统 */
+    (function () {
+      try {
+        var t = localStorage.getItem('fia_theme');
+        if (!t) {
+          t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+            ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) { /* 忽略，默认浅色 */ }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -12,7 +25,22 @@
   <!-- ============ 未登录：登录 / 注册 ============ -->
   <div id="auth-view" class="auth-view" hidden>
     <div class="auth-card">
-      <div class="auth-brand" id="auth-app-name">Fine</div>
+      <!-- 品牌 hero：Fine 大字标 + 复古小电脑 + 视差 -->
+      <div class="hero hero-auth" id="hero-auth" aria-hidden="true">
+        <div class="hero-stage">
+          <span class="hero-layer hero-ch" data-depth="0.35">F</span><span class="hero-layer hero-i" data-depth="0.35"><span class="hero-dot" data-depth="1.5"><span class="hero-ball"></span></span>ı</span><span class="hero-layer hero-pc" data-depth="0.9"><svg viewBox="0 0 96 80" role="img" aria-label="retro computer">
+              <rect class="pc-body" x="14" y="6" width="68" height="50" rx="7"/>
+              <rect class="pc-screen" x="22" y="14" width="52" height="34" rx="3"/>
+              <circle class="pc-eye" cx="41" cy="30" r="3.4"/>
+              <circle class="pc-eye" cx="55" cy="30" r="3.4"/>
+              <rect class="pc-mouth" x="44" y="38" width="8" height="2.4" rx="1.2"/>
+              <rect class="pc-stand" x="40" y="58" width="16" height="5" rx="2"/>
+              <rect class="pc-kb" x="8" y="66" width="80" height="9" rx="4.5"/>
+              <rect class="pc-key" x="20" y="69" width="24" height="3" rx="1.5"/>
+              <rect class="pc-key" x="52" y="69" width="24" height="3" rx="1.5"/>
+            </svg></span><span class="hero-layer hero-ch" data-depth="0.35">n</span><span class="hero-layer hero-ch" data-depth="0.35">e</span>
+        </div>
+      </div>
       <p class="auth-subtitle">金融智能体</p>
 
       <div class="auth-tabs" role="tablist">
@@ -43,7 +71,14 @@
       <div class="sidebar-brand">Fine</div>
 
       <div class="sidebar-top">
-        <button type="button" id="new-chat-btn" class="btn btn-newchat btn-block">＋ 新对话</button>
+        <button type="button" id="new-chat-btn" class="btn btn-newchat btn-block">
+          <svg class="newchat-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+               stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+            <path d="M8 13.2c3.2 0 5.8-2.1 5.8-4.7S11.2 3.8 8 3.8 2.2 5.9 2.2 8.5c0 1.1.5 2.2 1.3 3l-.6 1.7H8z"/>
+            <path d="M8 6.4v4.2M5.9 8.5h4.2"/>
+          </svg>
+          <span>新对话</span>
+        </button>
       </div>
 
       <nav class="conv-list-wrap">
@@ -54,6 +89,16 @@
       <div class="user-bar">
         <div class="user-bar-row">
           <span class="user-name" id="user-name">—</span>
+          <button type="button" id="theme-toggle" class="icon-text-btn" title="切换深浅色主题">
+            <svg class="theme-icon-moon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M13.4 9.7A5.6 5.6 0 0 1 6.3 2.6a5.6 5.6 0 1 0 7.1 7.1z"/>
+            </svg>
+            <svg class="theme-icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+                 stroke-width="1.4" stroke-linecap="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="3"/>
+              <path d="M8 1.4v1.6M8 13v1.6M1.4 8H3M13 8h1.6M3.3 3.3l1.2 1.2M11.5 11.5l1.2 1.2M12.7 3.3l-1.2 1.2M4.5 11.5l-1.2 1.2"/>
+            </svg>
+          </button>
           <button type="button" id="logout-btn" class="btn btn-ghost btn-sm" title="退出登录">退出</button>
         </div>
         <div class="quota-row">
@@ -68,48 +113,87 @@
 
     <!-- 主区域 -->
     <main class="main">
-      <div id="quota-banner" class="quota-banner" hidden>
-        <span>本月额度已用完</span>
-        <button type="button" id="quota-banner-btn" class="btn btn-primary btn-sm">购买加油包</button>
-        <span class="quota-banner-reset" id="quota-banner-reset">次月1日自动重置</span>
-      </div>
 
-      <div id="messages" class="messages"></div>
+      <!-- 聊天视图 -->
+      <div id="chat-view" class="chat-view">
+        <div id="quota-banner" class="quota-banner" hidden>
+          <span>本月额度已用完</span>
+          <button type="button" id="quota-banner-btn" class="btn btn-primary btn-sm">查看额度</button>
+          <span class="quota-banner-reset" id="quota-banner-reset">次月1日自动重置</span>
+        </div>
 
-      <!-- 空状态：居中问候 + 居中大输入卡片 -->
-      <div id="welcome" class="welcome" hidden>
-        <h2 class="welcome-title" id="welcome-title">你好，我是 Fine</h2>
-        <p class="welcome-sub">有什么可以帮你？</p>
-        <div id="composer-center-slot" class="composer-slot"></div>
-      </div>
+        <div id="messages" class="messages"></div>
 
-      <div id="composer-bottom-slot" class="composer-slot composer-slot-bottom">
-        <!-- 大输入卡片（Kimi 风格）：textarea + 右下角圆形发送键 -->
-        <div id="composer" class="composer">
-          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-          <div class="composer-actions">
-            <button type="button" id="stop-btn" class="icon-btn" hidden title="停止生成">■</button>
-            <button type="button" id="send-btn" class="icon-btn" title="发送" disabled>↑</button>
+        <!-- 空状态：hero 大字标 + 问候 + 居中大输入卡片 -->
+        <div id="welcome" class="welcome" hidden>
+          <div class="hero hero-welcome" id="hero-welcome" aria-hidden="true">
+            <div class="hero-stage">
+              <span class="hero-layer hero-ch" data-depth="0.35">F</span><span class="hero-layer hero-i" data-depth="0.35"><span class="hero-dot" data-depth="1.5"><span class="hero-ball"></span></span>ı</span><span class="hero-layer hero-pc" data-depth="0.9"><svg viewBox="0 0 96 80" role="img" aria-label="retro computer">
+                  <rect class="pc-body" x="14" y="6" width="68" height="50" rx="7"/>
+                  <rect class="pc-screen" x="22" y="14" width="52" height="34" rx="3"/>
+                  <circle class="pc-eye" cx="41" cy="30" r="3.4"/>
+                  <circle class="pc-eye" cx="55" cy="30" r="3.4"/>
+                  <rect class="pc-mouth" x="44" y="38" width="8" height="2.4" rx="1.2"/>
+                  <rect class="pc-stand" x="40" y="58" width="16" height="5" rx="2"/>
+                  <rect class="pc-kb" x="8" y="66" width="80" height="9" rx="4.5"/>
+                  <rect class="pc-key" x="20" y="69" width="24" height="3" rx="1.5"/>
+                  <rect class="pc-key" x="52" y="69" width="24" height="3" rx="1.5"/>
+                </svg></span><span class="hero-layer hero-ch" data-depth="0.35">n</span><span class="hero-layer hero-ch" data-depth="0.35">e</span>
+            </div>
+          </div>
+          <p class="welcome-sub">你好，我是 Fine，有什么可以帮你？</p>
+          <div id="composer-center-slot" class="composer-slot"></div>
+        </div>
+
+        <div id="composer-bottom-slot" class="composer-slot composer-slot-bottom">
+          <!-- 大输入卡片（Kimi 风格）：textarea + 右下角圆形发送键 -->
+          <div id="composer" class="composer">
+            <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+            <div class="composer-actions">
+              <button type="button" id="stop-btn" class="icon-btn" hidden title="停止生成">■</button>
+              <button type="button" id="send-btn" class="icon-btn" title="发送" disabled>↑</button>
+            </div>
           </div>
         </div>
       </div>
+
+      <!-- 额度视图（独立页面，替代原加油包弹窗） -->
+      <section id="quota-view" class="quota-view" hidden>
+        <div class="quota-page">
+          <div class="quota-head">
+            <button type="button" id="quota-back-btn" class="btn btn-ghost btn-sm">← 返回</button>
+            <h2 class="quota-title">我的额度</h2>
+          </div>
+
+          <div class="quota-card">
+            <div class="quota-card-label">月度额度</div>
+            <div class="quota-big"><span id="quota-big-num">—</span><span class="quota-unit">条</span></div>
+            <div class="quota-bar-row">
+              <div class="quota-bar"><div class="quota-bar-fill" id="quota-bar-fill"></div></div>
+              <span class="quota-bar-text" id="quota-bar-text">已用 0 / 100 条</span>
+            </div>
+            <p class="quota-note" id="quota-reset-note">月度额度将于次月1日重置</p>
+          </div>
+
+          <div class="quota-card">
+            <div class="quota-card-label">额度加油包</div>
+            <p class="quota-desc">月度额度用尽后自动从加油包扣减，加油包额度永久有效、可累积。</p>
+            <div class="quota-pack-row">
+              <span class="quota-pack-balance">当前余额 <b id="pack-balance">0</b> 条</span>
+              <button type="button" id="buy-pack-btn" class="btn btn-primary">充值 +50 条</button>
+            </div>
+            <p class="quota-note">当前为模拟支付，点击即时到账。</p>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
-  <!-- ============ 加油包弹层（默认隐藏） ============ -->
-  <div id="topup-modal" class="modal-mask hidden" hidden>
-    <div class="modal">
-      <h3 class="modal-title">购买加油包</h3>
-      <p class="modal-desc">
-        本月免费额度已用完或即将用完。购买加油包可立即继续使用，加油包额度永久有效、可累积。
-      </p>
-      <div class="modal-pack">
-        <button type="button" id="buy-pack-btn" class="btn btn-primary btn-block">购买加油包（+50条）</button>
-        <p class="modal-note">当前为模拟支付，点击即时到账。</p>
-      </div>
-      <p class="modal-reset" id="modal-reset-date">月度额度将于次月1日自动重置。</p>
-      <button type="button" id="topup-close-btn" class="btn btn-ghost btn-block">暂不购买</button>
-    </div>
+  <!-- ============ 对话条目操作菜单（全局浮层） ============ -->
+  <div id="conv-menu" class="conv-menu hidden" hidden>
+    <button type="button" id="menu-rename" class="conv-menu-item">✏️ 编辑标题</button>
+    <button type="button" id="menu-pin" class="conv-menu-item">📌 置顶</button>
+    <button type="button" id="menu-delete" class="conv-menu-item danger">🗑 删除</button>
   </div>
 
   <script src="/static/markdown.js"></script>

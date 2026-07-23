@@ -62,6 +62,22 @@ def _auth(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+def _tick_clock(monkeypatch):
+    """
+    把 webauth._now 换成逐次调用 +1 秒的假时钟。
+    updated_at 只到毫秒精度，快速连续建对话会打平，排序退化为按 id（uuid 随机序），
+    凡断言默认 updated_at 降序的测试都用它消除时序抖动。
+    """
+    real_now = webauth._now
+    state = {"n": 0}
+
+    def fake_now():
+        state["n"] += 1
+        return real_now() + timedelta(seconds=state["n"])
+
+    monkeypatch.setattr(webauth, "_now", fake_now)
+
+
 class _FakeAgent:
     """模拟流式 agent：process_message(stream=True) 返回异步迭代器。"""
 
@@ -225,6 +241,122 @@ class TestWebauthUnit:
         assert history[0]["content"] == "m5"   # 升序返回最近 20 条
         assert history[-1]["content"] == "m24"
 
+    def test_list_conversations_pinned_first(self, db, monkeypatch):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        # 假时钟逐次 +1s：同毫秒建两条对话会让 updated_at 打平，排序退化为按 id（uuid 随机序）
+        _tick_clock(monkeypatch)
+        c1 = webauth.create_conversation(alice["id"], "旧")
+        c2 = webauth.create_conversation(alice["id"], "新")
+        convs = webauth.list_conversations(alice["id"])
+        assert [c["id"] for c in convs] == [c2["id"], c1["id"]]  # 默认按 updated_at 降序
+        assert all(c["pinned"] is False for c in convs)
+
+        webauth.update_conversation(alice["id"], c1["id"], pinned=True)
+        convs = webauth.list_conversations(alice["id"])
+        assert convs[0]["id"] == c1["id"] and convs[0]["pinned"] is True
+
+        webauth.update_conversation(alice["id"], c1["id"], pinned=False)
+        convs = webauth.list_conversations(alice["id"])
+        assert [c["id"] for c in convs] == [c2["id"], c1["id"]]
+
+    def test_update_conversation_rename(self, db, monkeypatch):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        conv = webauth.create_conversation(alice["id"], "原名")
+        later = webauth._now() + timedelta(seconds=5)
+        monkeypatch.setattr(webauth, "_now", lambda: later)
+        result = webauth.update_conversation(alice["id"], conv["id"], title="  新名  ")
+        assert result["title"] == "新名"  # 去空白
+        assert result["pinned"] is False
+        assert result["created_at"] == conv["created_at"]
+        assert result["updated_at"] > conv["updated_at"]  # 改名刷新 updated_at
+
+    def test_update_conversation_pin_keeps_updated_at(self, db, monkeypatch):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        conv = webauth.create_conversation(alice["id"], "t")
+        later = webauth._now() + timedelta(seconds=5)
+        monkeypatch.setattr(webauth, "_now", lambda: later)
+        result = webauth.update_conversation(alice["id"], conv["id"], pinned=True)
+        assert result["pinned"] is True
+        assert result["updated_at"] == conv["updated_at"]  # pin 不动 updated_at
+
+    def test_update_conversation_validation(self, db):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        conv = webauth.create_conversation(alice["id"], "t")
+        # 两者都不给
+        with pytest.raises(webauth.ValidationError):
+            webauth.update_conversation(alice["id"], conv["id"])
+        # 空名 / 纯空白 / 超长 / 非字符串
+        for bad in ("", "   ", "x" * 61, 123):
+            with pytest.raises(webauth.ValidationError):
+                webauth.update_conversation(alice["id"], conv["id"], title=bad)
+        # pinned 非布尔
+        with pytest.raises(webauth.ValidationError):
+            webauth.update_conversation(alice["id"], conv["id"], pinned=1)
+
+    def test_update_conversation_cross_user_returns_none(self, db):
+        alice = webauth.resolve_token(webauth.register("alice", "password1"))
+        bob = webauth.resolve_token(webauth.register("bob", "password1"))
+        conv = webauth.create_conversation(alice["id"], "私有")
+        assert webauth.update_conversation(bob["id"], conv["id"], pinned=True) is None
+        assert webauth.update_conversation(bob["id"], conv["id"], title="劫持") is None
+        assert webauth.update_conversation(alice["id"], "nonexistent", pinned=True) is None
+        # alice 的对话未被改动
+        assert webauth.list_conversations(alice["id"])[0]["pinned"] is False
+
+
+def test_migrate_old_db_without_pinned(tmp_path, monkeypatch):
+    """
+    老库迁移兼容：手工建一个无 pinned 列的老结构库（模拟 Railway 线上存量库），
+    首次 _connect 时 ensure_schema(_SCHEMA)+_migrate 应无报错补齐 pinned 列，
+    且存量数据 pinned 默认为 False，改名/置顶功能正常；重复执行幂等。
+    """
+    import sqlite3 as raw_sqlite3
+
+    db_path = tmp_path / "old_webapp.db"
+    conn = raw_sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO users (username, password_hash, salt, created_at) VALUES (?,?,?,?)",
+        ("legacy", "x", "y", "2024-01-01T00:00:00.000"),
+    )
+    conn.execute(
+        "INSERT INTO conversations (id, user_id, title, created_at, updated_at) "
+        "VALUES (?,?,?,?,?)",
+        ("c1", 1, "老对话", "2024-01-01T00:00:00.000", "2024-01-01T00:00:00.000"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("WEB_DB_PATH", str(db_path))
+    # 第一次访问触发迁移：老数据 pinned 默认为 False
+    convs = webauth.list_conversations(1)
+    assert len(convs) == 1
+    assert convs[0]["pinned"] is False
+    assert convs[0]["title"] == "老对话"
+    # 置顶 / 改名在新列上正常工作
+    result = webauth.update_conversation(1, "c1", pinned=True)
+    assert result["pinned"] is True
+    assert result["updated_at"] == "2024-01-01T00:00:00.000"  # pin 不动 updated_at
+    # 迁移幂等：再次连接（列已存在，ALTER 抛错被吞）不报错
+    assert webauth.list_conversations(1)[0]["pinned"] is True
+
 
 # ════════════════════════════════════════════════════════════
 # 2) 认证端点
@@ -366,7 +498,125 @@ class TestConversationEndpoints:
         assert client.get("/api/conversations").status_code == 401
         assert client.post("/api/conversations", json={"title": "t"}).status_code == 401
         assert client.get("/api/conversations/whatever").status_code == 401
+        assert client.patch("/api/conversations/whatever", json={"pinned": True}).status_code == 401
         assert client.delete("/api/conversations/whatever").status_code == 401
+
+
+class TestPatchConversationEndpoint:
+    def _setup(self, client, username="testuser"):
+        token = _register(client, username).json()["token"]
+        return token
+
+    def _create(self, client, token, title):
+        return client.post(
+            "/api/conversations", json={"title": title}, headers=_auth(token)
+        ).json()
+
+    def test_pin_sorting_priority(self, client, monkeypatch):
+        _tick_clock(monkeypatch)
+        token = self._setup(client)
+        c1 = self._create(client, token, "旧对话")
+        c2 = self._create(client, token, "新对话")
+        convs = client.get("/api/conversations", headers=_auth(token)).json()
+        assert [c["id"] for c in convs] == [c2["id"], c1["id"]]  # 默认 updated_at 降序
+        assert all(c["pinned"] is False for c in convs)
+
+        resp = client.patch(
+            f"/api/conversations/{c1['id']}", json={"pinned": True}, headers=_auth(token)
+        )
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is True
+
+        convs = client.get("/api/conversations", headers=_auth(token)).json()
+        assert convs[0]["id"] == c1["id"]  # 置顶优先于 updated_at
+        assert convs[0]["pinned"] is True
+
+    def test_unpin_restores_order(self, client, monkeypatch):
+        _tick_clock(monkeypatch)
+        token = self._setup(client)
+        c1 = self._create(client, token, "旧对话")
+        c2 = self._create(client, token, "新对话")
+        client.patch(f"/api/conversations/{c1['id']}", json={"pinned": True}, headers=_auth(token))
+        resp = client.patch(
+            f"/api/conversations/{c1['id']}", json={"pinned": False}, headers=_auth(token)
+        )
+        assert resp.status_code == 200
+        assert resp.json()["pinned"] is False
+        convs = client.get("/api/conversations", headers=_auth(token)).json()
+        assert [c["id"] for c in convs] == [c2["id"], c1["id"]]
+
+    def test_rename_success(self, client, monkeypatch):
+        token = self._setup(client)
+        conv = self._create(client, token, "原名")
+        later = datetime.now() + timedelta(seconds=5)
+        monkeypatch.setattr(webauth, "_now", lambda: later)
+        resp = client.patch(
+            f"/api/conversations/{conv['id']}", json={"title": "  新名字  "}, headers=_auth(token)
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["title"] == "新名字"  # 去空白
+        assert data["pinned"] is False
+        assert data["created_at"] == conv["created_at"]
+        assert data["updated_at"] > conv["updated_at"]  # 改名刷新 updated_at
+        for key in ("id", "title", "pinned", "created_at", "updated_at"):
+            assert key in data
+
+    def test_rename_400_empty_and_too_long(self, client):
+        token = self._setup(client)
+        conv = self._create(client, token, "t")
+        for payload in (
+            {"title": ""},            # 空名
+            {"title": "   "},         # 纯空白
+            {"title": "x" * 61},      # 超长（上限 60）
+            {"title": 123},           # 非字符串
+            {},                       # title/pinned 都缺
+            {"pinned": "yes"},        # pinned 非布尔
+        ):
+            resp = client.patch(
+                f"/api/conversations/{conv['id']}", json=payload, headers=_auth(token)
+            )
+            assert resp.status_code == 400, payload
+        # 边界：恰好 60 字符合法
+        resp = client.patch(
+            f"/api/conversations/{conv['id']}", json={"title": "x" * 60}, headers=_auth(token)
+        )
+        assert resp.status_code == 200
+
+    def test_cross_user_404(self, client):
+        token_a = self._setup(client, "alice")
+        token_b = self._setup(client, "bob")
+        conv = self._create(client, token_a, "私有")
+        for payload in ({"pinned": True}, {"title": "劫持"}):
+            resp = client.patch(
+                f"/api/conversations/{conv['id']}", json=payload, headers=_auth(token_b)
+            )
+            assert resp.status_code == 404
+        # 不存在的对话对 owner 也 404
+        resp = client.patch(
+            "/api/conversations/nonexistent", json={"pinned": True}, headers=_auth(token_a)
+        )
+        assert resp.status_code == 404
+        # alice 的对话未被改动
+        convs = client.get("/api/conversations", headers=_auth(token_a)).json()
+        assert convs[0]["pinned"] is False
+        assert convs[0]["title"] == "私有"
+
+    def test_pin_does_not_change_updated_at(self, client, monkeypatch):
+        token = self._setup(client)
+        conv = self._create(client, token, "t")
+        later = datetime.now() + timedelta(seconds=5)
+        monkeypatch.setattr(webauth, "_now", lambda: later)
+        resp = client.patch(
+            f"/api/conversations/{conv['id']}", json={"pinned": True}, headers=_auth(token)
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pinned"] is True
+        assert data["updated_at"] == conv["updated_at"]  # pin 不动 updated_at
+        # 列表里的 updated_at 同样不变
+        convs = client.get("/api/conversations", headers=_auth(token)).json()
+        assert convs[0]["updated_at"] == conv["updated_at"]
 
 
 # ════════════════════════════════════════════════════════════
