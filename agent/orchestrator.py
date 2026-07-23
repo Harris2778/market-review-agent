@@ -48,6 +48,14 @@ except ImportError as e:
     logger.warning("agent/archive.py 未就绪，分析存档将整体降级跳过: %s", e)
     archive = None
 
+# 残留2修复：数据未覆盖结论确定性护栏（agent/output_guard.py 未就绪时直通，
+# 绝不因护栏缺失崩主流程）
+try:
+    from .output_guard import fix_uncovered_conclusions
+except ImportError as e:
+    logger.warning("agent/output_guard.py 未就绪，数据未覆盖结论护栏将降级直通: %s", e)
+    fix_uncovered_conclusions = None
+
 # 第七波：自选股（agent/watchlist.py 未就绪时自选股能力整体降级，不影响主流程）
 try:
     from . import watchlist
@@ -572,6 +580,22 @@ _FINANCE_CONTENT_SIGNALS = [
 ]
 
 
+def _apply_output_guard(text: str) -> str:
+    """残留2修复：数据未覆盖结论护栏的统一防御调用。
+
+    fix_uncovered_conclusions 契约为 (text: str) -> str 纯函数不抛异常，
+    这里仍按既有 fail-safe 惯例再兜一层：模块未就绪或执行异常时直通原文，
+    只记 log，绝不影响主流程。
+    """
+    if fix_uncovered_conclusions is None or not text:
+        return text or ""
+    try:
+        return fix_uncovered_conclusions(text)
+    except Exception as e:
+        logger.warning("数据未覆盖结论护栏执行异常，直通原文: %s", e, exc_info=True)
+        return text
+
+
 def _ensure_disclaimer(result, intent: str):
     """风险提示统一兜底（dict 出口，判重幂等）。
 
@@ -579,10 +603,21 @@ def _ensure_disclaimer(result, intent: str):
     - general_chat：仅当回答内容实际含金融信号时追加（闲聊不打扰）；
     - 其他金融意图：一律追加（已含『风险提示』的跳过）；
     - 非 dict（流式生成器）：原样透传。
+
+    残留2修复：本函数是 process_message 全部 dict 文本出口（market_review /
+    sector_deep_dive / sector_weekly / _agent_query 技术分析与人格路径 /
+    简单查询）的单一汇聚点，数据未覆盖结论护栏在此统一接线，先于一切
+    提前返回分支生效。流式生成器不做跨 chunk 包装（跨句矛盾检测需全文，
+    缓冲会破坏流式），仅非流式路径覆盖。
     """
     if not isinstance(result, dict):
         return result
     content = result.get("content") or ""
+    guarded = _apply_output_guard(content)
+    if guarded != content:
+        result = dict(result)
+        result["content"] = guarded
+        content = guarded
     if intent == "campus_kb" or "风险提示" in content:
         return result
     if intent != "general_chat" or any(w in content for w in _FINANCE_CONTENT_SIGNALS):
