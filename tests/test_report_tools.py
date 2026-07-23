@@ -364,12 +364,12 @@ class TestReportCitationPrompt:
 
 class TestToolCatalog:
     def test_catalog_32_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 32
+        assert len(tools_mod.TOOL_REGISTRY) == 37
         catalog = tools_mod.get_tool_catalog()
-        assert "共 32 个" in catalog
+        assert "共 37 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 32, (
-            f"目录应有 32 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
+        assert len(tool_lines) == 37, (
+            f"目录应有 37 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
     def test_new_tools_in_short_desc_and_catalog(self):

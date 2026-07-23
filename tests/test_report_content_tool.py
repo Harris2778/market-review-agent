@@ -306,11 +306,11 @@ class TestReportContentPrompt:
 
 class TestToolCatalog32:
     def test_catalog_32_lines(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 32
+        assert len(tools_mod.TOOL_REGISTRY) == 37
         catalog = tools_mod.get_tool_catalog()
-        assert "共 32 个" in catalog
+        assert "共 37 个" in catalog
         tool_lines = [l for l in catalog.splitlines() if l.startswith("- ")]
-        assert len(tool_lines) == 32, (
+        assert len(tool_lines) == 37, (
             f"目录应有 32 行工具条目，实际 {len(tool_lines)} 行：\n{catalog}"
         )
 
@@ -344,6 +344,9 @@ class TestToolCatalog32:
             "get_technical_analysis", "analyze_with_persona",
             "get_social_hot", "search_social_media",
             "search_campus_knowledge", "get_course_review_summary",
+            # 港美股数据源工具（新浪智研）
+            "get_hk_finance_report", "get_hk_fund_flow", "get_us_fund_flow",
+            "get_us_market_breadth", "get_stock_major_events",
         }
 
         # v1 研报工具分发路径不变（仍走 report_library）

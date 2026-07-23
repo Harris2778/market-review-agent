@@ -42,8 +42,9 @@ _MARKET_PARAM = {
 
 _SYMBOL_PARAM = {
     "type": "string",
-    "description": "股票代码，A股需带交易所前缀小写（如 sh600519、sz000002），"
-                   "港股如 hk00700，美股小写如 aapl。",
+    "description": "股票代码。A股需带交易所前缀小写（如 sh600519、sz000002）；"
+                   "港股为裸 5 位代码（如 00700，不要加 hk 前缀）；"
+                   "美股为裸 ticker（如 AAPL，大小写均可，不要加 us 前缀）。",
 }
 
 # ── 研报库工具共享片段 ──
@@ -359,6 +360,111 @@ TOOL_REGISTRY: list = [
             "description": "获取全球主要指数最新行情（标普500/道琼斯/纳斯达克/恒生/日经/富时100/欧元美元）。"
                            "分析隔夜外围市场表现时使用。",
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_hk_finance_report",
+            "description": "获取港股公司财报指标（净利润/营业收入等，智研港股财报库）。"
+                           "查询港股公司基本面、财报表现时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "港股裸 5 位代码（如 00700，不要加 hk 前缀）。",
+                    },
+                    "indicator": {
+                        "type": "string",
+                        "default": "净利润",
+                        "description": "财报指标名，如 净利润、营业收入、毛利率。默认 净利润。",
+                    },
+                    "years": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 1,
+                        "description": "回看年度数，默认 1。",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_hk_fund_flow",
+            "description": "获取港股个股主力资金流向历史（近 N 日净流入）。"
+                           "分析港股资金面时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "港股裸 5 位代码（如 00700，不要加 hk 前缀）。",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "minimum": 3,
+                        "maximum": 60,
+                        "default": 10,
+                        "description": "回看交易日数（3/5/10/20/60 档），默认 10。",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_us_fund_flow",
+            "description": "获取美股个股当日资金流向（超大单/大单/中单/小单净流入）。"
+                           "分析美股资金面时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "美股裸 ticker（如 AAPL，大小写均可，不要加 us 前缀）。",
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_us_market_breadth",
+            "description": "获取美股全市场涨跌分布（各涨跌幅区间股票数量）。"
+                           "回答美股大盘整体表现、市场热度时使用。",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_major_events",
+            "description": "获取上市公司重大事项（公告级事件：分红送转/并购重组/停复牌等）。"
+                           "查询公司最新公告、重大事件时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "market": _MARKET_PARAM,
+                    "symbol": _SYMBOL_PARAM,
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 10,
+                        "description": "返回事件条数，默认 10，最多 20。",
+                    },
+                },
+                "required": ["market", "symbol"],
+            },
         },
     },
     {
@@ -802,6 +908,19 @@ _IMPL = {
     "get_us_sectors":       ("fetch_us_sectors", lambda df, a: {}),
     "get_hk_sectors":       ("fetch_hk_sectors", lambda df, a: {}),
     "get_global_indices":   ("fetch_global_indices", lambda df, a: {}),
+    "get_hk_finance_report": ("fetch_hk_finance_report",
+                              lambda df, a: {"symbol": a["symbol"],
+                                             "indicator": a.get("indicator") or "净利润",
+                                             "years": _clamp_int(a.get("years"), 1, 1, 10)}),
+    "get_hk_fund_flow":     ("fetch_hk_fund_flow",
+                             lambda df, a: {"symbol": a["symbol"],
+                                            "days": _clamp_int(a.get("days"), 10, 3, 60)}),
+    "get_us_fund_flow":     ("fetch_us_fund_flow",
+                             lambda df, a: {"symbol": a["symbol"]}),
+    "get_us_market_breadth": ("fetch_us_market_breadth", lambda df, a: {}),
+    "get_stock_major_events": ("fetch_stock_major_events",
+                               lambda df, a: {"market": a["market"], "symbol": a["symbol"],
+                                              "limit": _clamp_int(a.get("limit"), 10, 1, 20)}),
     "get_china_macro":      ("fetch_china_macro", lambda df, a: {}),
     "get_us_macro":         ("fetch_us_macro", lambda df, a: {}),
 }
@@ -1851,6 +1970,11 @@ _SHORT_DESC = {
     "get_us_sectors": "美股板块涨幅排行",
     "get_hk_sectors": "港股领涨板块",
     "get_global_indices": "全球主要指数行情",
+    "get_hk_finance_report": "港股公司财报指标（智研港股财报库）",
+    "get_hk_fund_flow": "港股个股主力资金流向",
+    "get_us_fund_flow": "美股个股当日资金流向",
+    "get_us_market_breadth": "美股全市场涨跌分布",
+    "get_stock_major_events": "上市公司重大事项（沪深/港股/美股）",
     "get_china_macro": "中国宏观数据（CPI/PMI/M2 等）",
     "get_us_macro": "美国宏观数据（美债/VIX 等）",
     "search_research_reports": "券商研报检索（评级/目标价/盈利预测）",

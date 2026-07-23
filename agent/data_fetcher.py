@@ -1029,14 +1029,29 @@ def fetch_lian_ban() -> list:
 
 
 def fetch_us_fund_flow(symbol: str = "aapl") -> dict:
-    """美股今日资金流向。symbol小写如aapl"""
+    """美股今日资金流向。symbol 裸 ticker（aapl/AAPL 均可，us 前缀自动剥离）"""
+    symbol = _normalize_market_symbol("us", symbol)
     d = _mcp_call("usTradingFundFlow1Day", {"symbol": symbol.lower()})
     data = d.get("data",{}) or {}
     return {"超大单": data.get("r0","?"), "大单": data.get("r1","?"), "中单": data.get("r2","?"), "小单": data.get("r3","?"), "成交额": data.get("amount","?")}
 
 
+def _normalize_market_symbol(market: str, symbol: str) -> str:
+    """港美股代码归一：LLM 常按 A 股习惯给代码加市场前缀（hk00700/usAAPL），
+    智研接口只认裸代码（00700/AAPL），统一剥离（大小写不敏感）。"""
+    s = (symbol or "").strip()
+    m = (market or "").strip().lower()
+    if m == "hk" and s.lower().startswith("hk"):
+        s = s[2:]
+    elif m == "us" and s.lower().startswith("us") and not s.lower().startswith("usd"):
+        s = s[2:]
+    return s
+
+
 def fetch_stock_quote(market: str, symbol: str) -> dict:
-    """实时股票行情。market: cn/hk/us, symbol需带前缀如sh688001、sz000002"""
+    """实时股票行情。market: cn/hk/us，A股 symbol 需带前缀如sh688001；
+    港股裸代码如00700，美股裸ticker如AAPL（hk/us前缀自动剥离）。"""
+    symbol = _normalize_market_symbol(market, symbol)
     d = _mcp_call("globalStockQuoteRealtime", {"market": market, "symbol": symbol})
     data = d.get("data",{}) or {}
     return {"name": data.get("name",""), "price": data.get("price",""), "pct": data.get("percent",""),
@@ -1045,23 +1060,66 @@ def fetch_stock_quote(market: str, symbol: str) -> dict:
 
 
 def fetch_stock_kline(market: str, symbol: str, days: int = 10) -> list:
-    """股票日K线。market: cn/hk/us"""
+    """股票日K线。market: cn/hk/us。
+    A股返回 date 键，港美股返回 day 键（QA 实锤：date 取空导致 K线裸冒号），双键兜底。"""
+    symbol = _normalize_market_symbol(market, symbol)
     d = _mcp_call("globalStockKlineDaily", {"market": market, "symbol": symbol, "num": str(days)})
     data = d.get("data",[]) or []
     items = []
     for it in (data or [])[-days:]:
-        items.append({"date": it.get("date",""), "close": it.get("close",""), "pct": it.get("change_pct","")})
+        items.append({
+            "date": it.get("date") or it.get("day") or "",
+            "close": it.get("close",""),
+            "pct": it.get("change_pct") or it.get("pct") or it.get("changePct") or "",
+        })
     return items
 
 
 def fetch_stock_news(symbol: str, market: str = "cn", limit: int = 10) -> list:
-    """个股新闻搜索。symbol需带sh/sz前缀"""
+    """个股新闻搜索。A股 symbol 需带sh/sz前缀，港美股裸代码（前缀自动剥离）。"""
+    symbol = _normalize_market_symbol(market, symbol)
     d = _mcp_call("stockNewsSearch", {"market": market, "symbol": symbol, "num": str(min(20,limit)), "page": "1"})
     items = []
     data = d.get("result",{}).get("data",[]) or []
     for it in data[:limit]:
         items.append({"title": _sanitize_news_text(it.get("title","")), "url": it.get("url","")})
     return items
+
+
+def fetch_hk_finance_report(symbol: str, indicator: str = "净利润", years: int = 1) -> dict:
+    """港股财报指标（智研 hk_finance_all）。symbol 裸 5 位代码如 00700。"""
+    symbol = _normalize_market_symbol("hk", symbol)
+    d = _mcp_call("hk_finance_all", {
+        "symbol": symbol, "frType": indicator, "yearNum": str(years),
+    })
+    result = d.get("result") or {}
+    data = result.get("data") if isinstance(result, dict) else None
+    return {"symbol": symbol, "indicator": indicator, "data": data if data is not None else result}
+
+
+def fetch_hk_fund_flow(symbol: str, days: int = 10) -> dict:
+    """港股主力资金流向历史（智研 hkTradingMainFundsHistory）。symbol 裸代码。"""
+    symbol = _normalize_market_symbol("hk", symbol)
+    d = _mcp_call("hkTradingMainFundsHistory", {"symbol": symbol, "days": str(days)})
+    return d.get("data") or d.get("result") or {}
+
+
+def fetch_us_market_breadth() -> dict:
+    """美股市场涨跌分布（智研 usMarketStatisticsUpdown）。"""
+    d = _mcp_call("usMarketStatisticsUpdown", {})
+    return d.get("data") or d.get("result") or {}
+
+
+def fetch_stock_major_events(market: str, symbol: str, limit: int = 10) -> dict:
+    """上市公司重大事项（智研 globalStockMajorEvents）。
+    market: cn/hk/us（接口口径 0=沪深/1=港股/2=美股，此处做映射）。"""
+    code_map = {"cn": "0", "hk": "1", "us": "2"}
+    m = code_map.get((market or "").lower(), "0")
+    symbol = _normalize_market_symbol(market, symbol)
+    d = _mcp_call("globalStockMajorEvents", {
+        "market": m, "symbols": symbol, "pageSize": str(limit),
+    })
+    return d.get("data") or d.get("result") or {}
 
 
 def fetch_revenue_composition(paper_code: str, fr_date: str = "") -> dict:

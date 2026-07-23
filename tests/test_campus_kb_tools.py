@@ -99,8 +99,8 @@ def fake_rs(monkeypatch):
 
 class TestToolRegistry:
     def test_registry_has_32_tools_unique_names(self):
-        assert len(tools_mod.TOOL_REGISTRY) == 32, (
-            f"注册表应为 32 个工具（30→32），实际 {len(tools_mod.TOOL_REGISTRY)}"
+        assert len(tools_mod.TOOL_REGISTRY) == 37, (
+            f"注册表应为 37 个工具（32→37 港美股工具），实际 {len(tools_mod.TOOL_REGISTRY)}"
         )
         names = [t["function"]["name"] for t in tools_mod.TOOL_REGISTRY]
         assert len(names) == len(set(names)), f"工具名不得重复: {names}"
@@ -130,7 +130,7 @@ class TestToolRegistry:
 
     def test_tool_catalog_lists_new_tools(self):
         catalog = tools_mod.get_tool_catalog()
-        assert "共 32 个" in catalog
+        assert "共 37 个" in catalog
         assert "search_campus_knowledge" in catalog
         assert "get_course_review_summary" in catalog
 

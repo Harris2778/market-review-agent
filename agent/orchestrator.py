@@ -399,9 +399,16 @@ _AGENT_ROUTE_HINTS = {
         "或换同义关键词多次检索，不要一次检索无果就放弃。"
     ),
     "us_hk_query": (
-        "【本问题路由提示】用户在问美股/港股/海外市场问题，请优先使用对应市场的工具取数"
-        "（港股行情/财报用港股工具，美股行情/财报/新闻用美股工具，宏观数据用宏观工具）。"
-        "接口不可用或数据未覆盖时如实说明「数据未覆盖」，绝不凭训练记忆报行情数字；"
+        "【本问题路由提示】用户在问美股/港股/海外市场问题，数据源为新浪智研，"
+        "港美股数据覆盖齐全，务必优先调用工具取数："
+        "个股实时行情 get_stock_quote（market=hk/us，港股传裸 5 位代码如 00700、"
+        "美股传裸 ticker 如 AAPL，均不要加 hk/us 前缀）、"
+        "日K线 get_stock_kline、港股财报 get_hk_finance_report、"
+        "港股资金流 get_hk_fund_flow、美股资金流 get_us_fund_flow、"
+        "美股大盘涨跌分布 get_us_market_breadth、全球指数 get_global_indices、"
+        "个股新闻 get_stock_news（market=hk/us）、重大事项 get_stock_major_events、"
+        "公司公告/新闻检索 search_news。"
+        "接口返回空或数据未覆盖时如实说明「数据未覆盖」，绝不凭训练记忆报行情数字；"
         "客观数据查询不得套用合规拒答话术。"
     ),
     "agent_analyze": (
