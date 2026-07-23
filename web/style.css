@@ -372,6 +372,16 @@ input, textarea { font-family: inherit; font-size: inherit; color: inherit; }
   overflow: hidden;
 }
 
+/* 主区域：必须占满侧边栏以外的全部宽度（缺这条曾导致 .main 收缩为
+   内容宽 353px，欢迎区/输入卡片全部挤在左上角） */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .chat-view {
   flex: 1;
   display: flex;
